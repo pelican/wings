@@ -108,13 +108,16 @@ func (s *S3Backup) Restore(ctx context.Context, r io.Reader, callback RestoreCal
 		reader = ratelimit.Reader(r, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
 	}
 	if err := format.Extract(ctx, reader, func(ctx context.Context, f archives.FileInfo) error {
-		r, err := f.Open()
-		if err != nil {
-			return err
-		}
-		defer r.Close()
+	if f.LinkTarget != "" {
+		return callback(f.NameInArchive, f.FileInfo, f.LinkTarget, nil)
+	}
+	r, err := f.Open()
+	if err != nil {
+		return err
+	}
+	defer r.Close()
 
-		return callback(f.NameInArchive, f.FileInfo, r)
+	return callback(f.NameInArchive, f.FileInfo, "", r)
 	}); err != nil {
 		return err
 	}

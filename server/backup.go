@@ -4,6 +4,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"time"
 
 	"emperror.dev/errors"
@@ -151,12 +152,19 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	// Attempt to restore the backup to the server by running through each entry
 	// in the file one at a time and writing them to the disk.
 	s.Log().Debug("starting file writing process for backup restoration")
-	err = b.Restore(s.Context(), reader, func(file string, info fs.FileInfo, r io.ReadCloser) error {
-		defer r.Close()
+	err = b.Restore(s.Context(), reader, func(file string, info fs.FileInfo, linkTarget string, r io.ReadCloser) error {
+		if r != nil {
+			defer r.Close()
+		}
 		s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
-		// TODO: since this will be called a lot, it may be worth adding an optimized
-		// Write with Chtimes method to the UnixFS that is able to re-use the
-		// same dirfd and file name.
+
+		if info.Mode()&fs.ModeSymlink != 0 {
+			if err := s.Filesystem().CreateDirectory(filepath.Dir(file), ""); err != nil {
+				return err
+			}
+			return s.Filesystem().Symlink(linkTarget, file)
+		}
+
 		if err := s.Filesystem().Write(file, r, info.Size(), info.Mode()); err != nil {
 			return err
 		}

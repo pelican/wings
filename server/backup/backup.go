@@ -36,7 +36,7 @@ const (
 
 // RestoreCallback is a generic restoration callback that exists for both local
 // and remote backups allowing the files to be restored.
-type RestoreCallback func(file string, info fs.FileInfo, r io.ReadCloser) error
+type RestoreCallback func(file string, info fs.FileInfo, linkTarget string, r io.ReadCloser) error
 
 // noinspection GoNameStartsWithPackageName
 type BackupInterface interface {

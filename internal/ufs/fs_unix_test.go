@@ -610,6 +610,118 @@ func TestUnixFS_Lstat(t *testing.T) {
 	// TODO: implement
 }
 
+func TestUnixFS_Readlink(t *testing.T) {
+	t.Parallel()
+	fs, err := newTestUnixFS()
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	defer fs.Cleanup()
+
+	t.Run("reads a relative symlink target", func(t *testing.T) {
+		f, err := fs.Create("target_file")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_ = f.Close()
+
+		if err := fs.Symlink("target_file", filepath.Join(fs.Root, "relative_link")); err != nil {
+			t.Error(err)
+			return
+		}
+
+		target, err := fs.Readlink("relative_link")
+		if err != nil {
+			t.Errorf("expected no error, but got: %v", err)
+			return
+		}
+		if target != "target_file" {
+			t.Errorf("expected link target %q, got %q", "target_file", target)
+		}
+	})
+
+	t.Run("reads a symlink target pointing outside the base directory", func(t *testing.T) {
+		outsideTarget := filepath.Join(fs.TmpDir, "outside_file")
+		if err := os.WriteFile(outsideTarget, []byte("outside"), 0o644); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := fs.Symlink(outsideTarget, filepath.Join(fs.Root, "outside_link")); err != nil {
+			t.Error(err)
+			return
+		}
+
+		target, err := fs.Readlink("outside_link")
+		if err != nil {
+			t.Errorf("expected no error, but got: %v", err)
+			return
+		}
+		if target != outsideTarget {
+			t.Errorf("expected link target %q, got %q", outsideTarget, target)
+		}
+	})
+
+	t.Run("errors when the file is not a symlink", func(t *testing.T) {
+		f, err := fs.Create("not_a_link")
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		_ = f.Close()
+
+		if _, err := fs.Readlink("not_a_link"); err == nil {
+			t.Error("expected an error when reading a non-symlink as a link")
+		}
+	})
+
+	t.Run("errors when the file does not exist", func(t *testing.T) {
+		if _, err := fs.Readlink("does_not_exist"); err == nil {
+			t.Error("expected an error when reading a non-existent symlink")
+		}
+	})
+}
+
+func TestUnixFS_Readlinkat(t *testing.T) {
+	t.Parallel()
+	fs, err := newTestUnixFS()
+	if err != nil {
+		t.Fatal(err)
+		return
+	}
+	defer fs.Cleanup()
+
+	if err := fs.Mkdir("nested", 0o755); err != nil {
+		t.Error(err)
+		return
+	}
+	f, err := fs.Create("nested/target_file")
+	if err != nil {
+		t.Error(err)
+		return
+	}
+	_ = f.Close()
+	if err := fs.Symlink("target_file", filepath.Join(fs.Root, "nested/link")); err != nil {
+		t.Error(err)
+		return
+	}
+
+	dirfd, name, closeFd, err := fs.SafePath("nested/link")
+	defer closeFd()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	target, err := fs.Readlinkat(dirfd, name)
+	if err != nil {
+		t.Fatalf("expected no error, but got: %v", err)
+	}
+	if target != "target_file" {
+		t.Errorf("expected link target %q, got %q", "target_file", target)
+	}
+}
+
 func TestUnixFS_Symlink(t *testing.T) {
 	t.Parallel()
 	fs, err := newTestUnixFS()

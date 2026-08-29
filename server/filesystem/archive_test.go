@@ -1,7 +1,10 @@
 package filesystem
 
 import (
+	"archive/tar"
+	"compress/gzip"
 	"context"
+	"io"
 	iofs "io/fs"
 	"os"
 	"path/filepath"
@@ -84,6 +87,42 @@ func TestArchive_Stream(t *testing.T) {
 
 			g.Assert(files).Equal(expected)
 		})
+
+		g.It("includes symlinks in the archive instead of silently skipping them", func() {
+			r := strings.NewReader("hello, world!\n")
+			err := fs.Write("real_file.txt", r, r.Size(), 0o644)
+			g.Assert(err).IsNil()
+
+			g.Assert(fs.Symlink("real_file.txt", "link_to_file.txt")).IsNil()
+			g.Assert(fs.Symlink("/etc/passwd", "link_outside_root.txt")).IsNil()
+
+			a := &Archive{
+				Filesystem: fs,
+			}
+
+			archivePath := filepath.Join(rfs.root, "archive_symlinks.tar.gz")
+			g.Assert(a.Create(context.Background(), archivePath)).IsNil()
+
+			_, err = os.Stat(archivePath)
+			g.Assert(err).IsNil()
+
+			entries, err := readTarHeaders(archivePath)
+			g.Assert(err).IsNil()
+
+			link, ok := entries["link_to_file.txt"]
+			g.Assert(ok).IsTrue()
+			g.Assert(link.Typeflag).Equal(byte(tar.TypeSymlink))
+			g.Assert(link.Linkname).Equal("real_file.txt")
+
+			outside, ok := entries["link_outside_root.txt"]
+			g.Assert(ok).IsTrue()
+			g.Assert(outside.Typeflag).Equal(byte(tar.TypeSymlink))
+			g.Assert(outside.Linkname).Equal("/etc/passwd")
+
+			file, ok := entries["real_file.txt"]
+			g.Assert(ok).IsTrue()
+			g.Assert(file.Typeflag).Equal(byte(tar.TypeReg))
+		})
 	})
 }
 
@@ -119,4 +158,32 @@ func getFiles(f iofs.ReadDirFS, name string) ([]string, error) {
 	}
 
 	return v, nil
+}
+
+func readTarHeaders(path string) (map[string]*tar.Header, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	gz, err := gzip.NewReader(f)
+	if err != nil {
+		return nil, err
+	}
+	defer gz.Close()
+
+	tr := tar.NewReader(gz)
+	entries := make(map[string]*tar.Header)
+	for {
+		hdr, err := tr.Next()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		entries[hdr.Name] = hdr
+	}
+	return entries, nil
 }

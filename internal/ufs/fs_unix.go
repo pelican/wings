@@ -856,3 +856,29 @@ func (fs *UnixFS) unsafeIsPathInsideOfBase(path string) bool {
 		fs.basePath+"/",
 	)
 }
+// Readlink returns the destination of the named symbolic link.
+// If there is an error, it will be of type *PathError.
+func (fs *UnixFS) Readlink(name string) (string, error) {
+	dirfd, name, closeFd, err := fs.safePath(name)
+	defer closeFd()
+	if err != nil {
+		return "", err
+	}
+	return fs.Readlinkat(dirfd, name)
+}
+
+// Readlinkat is like Readlink but allows passing an existing directory file
+// descriptor rather than needing to resolve one.
+func (fs *UnixFS) Readlinkat(dirfd int, name string) (string, error) {
+	for size := 128; ; size *= 2 {
+		buf := make([]byte, size)
+		n, err := unix.Readlinkat(dirfd, name, buf)
+		if err != nil {
+			return "", ensurePathError(err, "readlinkat", name)
+		}
+		if n < size {
+			return string(buf[:n]), nil
+		}
+	}
+}
+
