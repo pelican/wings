@@ -4,6 +4,7 @@ import (
 	"time"
 
 	"github.com/pelican/wings/environment/docker"
+	"github.com/pelican/wings/environment/kubernetes"
 
 	"github.com/pelican/wings/environment"
 )
@@ -35,6 +36,14 @@ func (s *Server) SyncWithEnvironment() {
 	// and stop configuration.
 	if e, ok := s.Environment.(*docker.Environment); ok {
 		s.Log().Debug("syncing stop configuration with configured docker environment")
+		e.SetImage(cfg.Container.Image)
+		e.SetStopConfiguration(s.ProcessConfiguration().Stop)
+	}
+
+	// The Kubernetes environment likewise needs the configured image and stop
+	// configuration so command-based stops and image updates take effect.
+	if e, ok := s.Environment.(*kubernetes.Environment); ok {
+		s.Log().Debug("syncing stop configuration with configured kubernetes environment")
 		e.SetImage(cfg.Container.Image)
 		e.SetStopConfiguration(s.ProcessConfiguration().Stop)
 	}

@@ -1,0 +1,35 @@
+{{- if .Values.resourceQuota.enabled }}
+{{- if not (or .Values.resourceQuota.cpuLimit .Values.resourceQuota.memoryLimit .Values.resourceQuota.cpuRequest .Values.resourceQuota.memoryRequest .Values.resourceQuota.maxPods .Values.resourceQuota.maxPVCs .Values.resourceQuota.maxStorage) }}
+{{- fail "resourceQuota.enabled is true but no quota fields are set; configure at least one of cpuLimit, memoryLimit, cpuRequest, memoryRequest, maxPods, maxPVCs or maxStorage (an empty ResourceQuota would block all Pods from scheduling)." }}
+{{- end }}
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ include "pelican-wings.fullname" . }}
+  namespace: {{ .Values.gameNamespace }}
+  labels:
+    {{- include "pelican-wings.labels" . | nindent 4 }}
+spec:
+  hard:
+    {{- if .Values.resourceQuota.cpuLimit }}
+    limits.cpu: {{ .Values.resourceQuota.cpuLimit | quote }}
+    {{- end }}
+    {{- if .Values.resourceQuota.memoryLimit }}
+    limits.memory: {{ .Values.resourceQuota.memoryLimit | quote }}
+    {{- end }}
+    {{- if .Values.resourceQuota.cpuRequest }}
+    requests.cpu: {{ .Values.resourceQuota.cpuRequest | quote }}
+    {{- end }}
+    {{- if .Values.resourceQuota.memoryRequest }}
+    requests.memory: {{ .Values.resourceQuota.memoryRequest | quote }}
+    {{- end }}
+    {{- if .Values.resourceQuota.maxPods }}
+    pods: {{ .Values.resourceQuota.maxPods | quote }}
+    {{- end }}
+    {{- if .Values.resourceQuota.maxPVCs }}
+    persistentvolumeclaims: {{ .Values.resourceQuota.maxPVCs | quote }}
+    {{- end }}
+    {{- if .Values.resourceQuota.maxStorage }}
+    requests.storage: {{ .Values.resourceQuota.maxStorage | quote }}
+    {{- end }}
+{{- end }}

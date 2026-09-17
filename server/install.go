@@ -103,6 +103,12 @@ func (s *Server) internalInstall() error {
 	if err != nil {
 		return err
 	}
+
+	// Route to the Kubernetes-based installer when K8s is enabled.
+	if config.Get().Kubernetes.Enabled {
+		return s.internalInstallKubernetes(&script)
+	}
+
 	p, err := NewInstallationProcess(s, &script)
 	if err != nil {
 		return err

@@ -1,0 +1,42 @@
+{{- if .Values.limitRange.enabled }}
+{{- if not (or .Values.limitRange.defaultCPULimit .Values.limitRange.defaultMemoryLimit .Values.limitRange.defaultCPURequest .Values.limitRange.defaultMemoryRequest .Values.limitRange.maxCPU .Values.limitRange.maxMemory) }}
+{{- fail "limitRange.enabled is true but no limits are set; configure at least one of defaultCPULimit, defaultMemoryLimit, defaultCPURequest, defaultMemoryRequest, maxCPU or maxMemory (an empty LimitRange has no effect)." }}
+{{- end }}
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: {{ include "pelican-wings.fullname" . }}
+  namespace: {{ .Values.gameNamespace }}
+  labels:
+    {{- include "pelican-wings.labels" . | nindent 4 }}
+spec:
+  limits:
+    - type: Container
+      {{- if or .Values.limitRange.defaultCPULimit .Values.limitRange.defaultMemoryLimit }}
+      default:
+        {{- if .Values.limitRange.defaultCPULimit }}
+        cpu: {{ .Values.limitRange.defaultCPULimit | quote }}
+        {{- end }}
+        {{- if .Values.limitRange.defaultMemoryLimit }}
+        memory: {{ .Values.limitRange.defaultMemoryLimit | quote }}
+        {{- end }}
+      {{- end }}
+      {{- if or .Values.limitRange.defaultCPURequest .Values.limitRange.defaultMemoryRequest }}
+      defaultRequest:
+        {{- if .Values.limitRange.defaultCPURequest }}
+        cpu: {{ .Values.limitRange.defaultCPURequest | quote }}
+        {{- end }}
+        {{- if .Values.limitRange.defaultMemoryRequest }}
+        memory: {{ .Values.limitRange.defaultMemoryRequest | quote }}
+        {{- end }}
+      {{- end }}
+      {{- if or .Values.limitRange.maxCPU .Values.limitRange.maxMemory }}
+      max:
+        {{- if .Values.limitRange.maxCPU }}
+        cpu: {{ .Values.limitRange.maxCPU | quote }}
+        {{- end }}
+        {{- if .Values.limitRange.maxMemory }}
+        memory: {{ .Values.limitRange.maxMemory | quote }}
+        {{- end }}
+      {{- end }}
+{{- end }}

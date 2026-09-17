@@ -1,0 +1,23 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pelican-wings-metrics
+  labels:
+    app.kubernetes.io/managed-by: pelican-wings
+    app.kubernetes.io/component: wings
+rules:
+  # Read Pod metrics from the Kubernetes Metrics API (metrics.k8s.io/v1beta1).
+  # Required for CPU/memory usage reporting. If metrics-server is not installed,
+  # this ClusterRole is unused and Wings will gracefully degrade.
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get"]
+  # Read Node addresses for IP allocation endpoint. Required so Wings can
+  # report the node's external/internal IPs instead of the Pod's cluster IP.
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+  # NOTE: The kubelet stats/summary fallback (nodes/proxy) is intentionally NOT
+  # granted here because it is a broad, cluster-wide permission. If you do not
+  # run metrics-server and need that fallback, additionally apply
+  # clusterrole-metrics-kubelet.yaml.

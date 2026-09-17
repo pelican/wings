@@ -369,6 +369,11 @@ type Configuration struct {
 	System SystemConfiguration `json:"system" yaml:"system"`
 	Docker DockerConfiguration `json:"docker" yaml:"docker"`
 
+	// Kubernetes holds configuration for scheduling game server workloads as
+	// Kubernetes Pods. When Kubernetes.Enabled is true, all servers on this
+	// node are run in K8s instead of Docker.
+	Kubernetes KubernetesConfiguration `json:"kubernetes" yaml:"kubernetes"`
+
 	// Defines internal throttling configurations for server processes to prevent
 	// someone from running an endless loop that spams data to logs.
 	Throttles ConsoleThrottles

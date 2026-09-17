@@ -1,0 +1,8 @@
+{{- if .Values.createGameNamespace }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Values.gameNamespace }}
+  labels:
+    {{- include "pelican-wings.labels" . | nindent 4 }}
+{{- end }}

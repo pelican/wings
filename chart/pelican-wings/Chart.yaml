@@ -1,0 +1,16 @@
+apiVersion: v2
+name: pelican-wings
+description: Helm chart for Pelican Wings — the game server management daemon with Kubernetes support
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
+keywords:
+  - pelican
+  - wings
+  - game-server
+  - kubernetes
+maintainers:
+  - name: Exonical
+    url: https://github.com/Exonical
+sources:
+  - https://github.com/pelican/wings

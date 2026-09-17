@@ -1,0 +1,80 @@
+{{- if and .Values.wings.kubernetes.namespace (ne .Values.wings.kubernetes.namespace .Values.gameNamespace) }}
+{{- fail "wings.kubernetes.namespace must equal gameNamespace: the chart's namespaced RBAC is created in gameNamespace, so Wings must schedule game-server workloads there too. Leave wings.kubernetes.namespace empty or set it equal to gameNamespace." }}
+{{- end }}
+apiVersion: v1
+kind: Secret
+metadata:
+  name: {{ include "pelican-wings.fullname" . }}-config
+  namespace: {{ .Values.gameNamespace }}
+  labels:
+    {{- include "pelican-wings.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  config.yml: |
+    debug: false
+    app_name: pelican
+    uuid: {{ .Values.wings.uuid | quote }}
+    token_id: {{ .Values.wings.tokenId | quote }}
+    token: {{ .Values.wings.token | quote }}
+    remote: {{ .Values.wings.panelUrl | quote }}
+    api:
+      host: {{ .Values.wings.api.host | quote }}
+      port: {{ .Values.wings.api.port }}
+    sftp:
+      bind_addr: {{ .Values.wings.sftp.host | quote }}
+      bind_port: {{ .Values.wings.sftp.port }}
+    system:
+      root_directory: {{ .Values.wings.system.rootDirectory | quote }}
+      log_directory: {{ .Values.wings.system.logDirectory | quote }}
+      data: {{ .Values.wings.system.data | quote }}
+      tmp_directory: {{ .Values.wings.system.tmpDirectory | quote }}
+    kubernetes:
+      enabled: {{ .Values.wings.kubernetes.enabled }}
+      namespace: {{ .Values.gameNamespace | quote }}
+      network_mode: {{ .Values.wings.kubernetes.networkMode | quote }}
+      {{- if .Values.wings.kubernetes.lbAnnotations }}
+      lb_annotations:
+        {{- toYaml .Values.wings.kubernetes.lbAnnotations | nindent 8 }}
+      {{- end }}
+      {{- if .Values.wings.kubernetes.lbIPAnnotation }}
+      lb_ip_annotation: {{ .Values.wings.kubernetes.lbIPAnnotation | quote }}
+      {{- end }}
+      {{- if .Values.wings.kubernetes.lbSharingKey }}
+      lb_sharing_key: {{ .Values.wings.kubernetes.lbSharingKey | quote }}
+      {{- end }}
+      storage_mode: {{ .Values.wings.kubernetes.storageMode | quote }}
+      {{- if .Values.wings.kubernetes.storageClass }}
+      storage_class: {{ .Values.wings.kubernetes.storageClass | quote }}
+      {{- end }}
+      storage_size: {{ .Values.wings.kubernetes.storageSize | quote }}
+      storage_access_mode: {{ .Values.wings.kubernetes.storageAccessMode | quote }}
+      nodeport_preserve: {{ .Values.wings.kubernetes.nodeportPreserve }}
+      nodeport_range_min: {{ .Values.wings.kubernetes.nodeportRangeMin }}
+      nodeport_range_max: {{ .Values.wings.kubernetes.nodeportRangeMax }}
+      dns_policy: {{ .Values.wings.kubernetes.dnsPolicy | quote }}
+      {{- if .Values.wings.kubernetes.nodeName }}
+      node_name: {{ .Values.wings.kubernetes.nodeName | quote }}
+      {{- end }}
+      {{- if .Values.wings.kubernetes.systemIPs }}
+      system_ips:
+        {{- toYaml .Values.wings.kubernetes.systemIPs | nindent 8 }}
+      {{- end }}
+      {{- if .Values.persistence.enabled }}
+      data_pvc: {{ .Values.persistence.existingClaim | default (printf "%s-data" (include "pelican-wings.fullname" .)) | quote }}
+      {{- end }}
+      service_account: {{ include "pelican-wings.serviceAccountName" . | quote }}
+      {{- if .Values.wings.kubernetes.nodeSelector }}
+      node_selector:
+        {{- toYaml .Values.wings.kubernetes.nodeSelector | nindent 8 }}
+      {{- end }}
+      {{- if .Values.wings.kubernetes.tolerations }}
+      tolerations:
+        {{- toYaml .Values.wings.kubernetes.tolerations | nindent 8 }}
+      {{- end }}
+      {{- if .Values.wings.kubernetes.imagePullSecrets }}
+      image_pull_secrets:
+        {{- toYaml .Values.wings.kubernetes.imagePullSecrets | nindent 8 }}
+      {{- end }}
+      {{- if .Values.wings.kubernetes.imagePullPolicy }}
+      image_pull_policy: {{ .Values.wings.kubernetes.imagePullPolicy | quote }}
+      {{- end }}

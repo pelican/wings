@@ -12,6 +12,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/pelican/wings/config"
+	"github.com/pelican/wings/environment/kubernetes"
 	"github.com/pelican/wings/internal/diagnostics"
 	"github.com/pelican/wings/router/middleware"
 	"github.com/pelican/wings/router/tokens"
@@ -22,7 +23,7 @@ import (
 
 // Returns information about the system that wings is running on.
 func getSystemInformation(c *gin.Context) {
-	i, err := system.GetSystemInformation()
+	i, err := system.GetSystemInformationWithOptions(config.Get().Kubernetes.Enabled)
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
@@ -89,20 +90,61 @@ func getDiagnostics(c *gin.Context) {
 
 // Returns list of host machine IP addresses
 func getSystemIps(c *gin.Context) {
-	interfaces, err := system.GetSystemIps()
-	if err != nil {
-		middleware.CaptureAndAbort(c, err)
-		return
-	}
+	cfg := config.Get()
+	var interfaces []string
 
-	// Append config defined ips as well
-	for i := range config.Get().Docker.SystemIps {
-		targetIp := config.Get().Docker.SystemIps[i]
-		if slices.Contains(interfaces, targetIp) {
-			continue
+	if cfg.Kubernetes.Enabled {
+		ctx := c.Request.Context()
+
+		// In LoadBalancer mode, collect IPs from existing LB Services.
+		if cfg.Kubernetes.NetworkMode == config.KubeNetworkLoadBalancer {
+			lbIPs, err := kubernetes.GetLoadBalancerIPs(ctx)
+			if err != nil {
+				log.WithField("error", err).Warn("failed to query LoadBalancer IPs")
+			} else {
+				interfaces = append(interfaces, lbIPs...)
+			}
 		}
 
-		interfaces = append(interfaces, targetIp)
+		// Always try to get node IPs as a base (needed for NodePort, useful
+		// as fallback for LoadBalancer before any servers exist).
+		nodeIPs, err := kubernetes.GetNodeIPs(ctx)
+		if err != nil {
+			log.WithField("error", err).Warn("failed to query node IPs")
+		} else {
+			for _, ip := range nodeIPs {
+				if !slices.Contains(interfaces, ip) {
+					interfaces = append(interfaces, ip)
+				}
+			}
+		}
+
+		// Append user-configured static IPs.
+		for _, ip := range cfg.Kubernetes.SystemIPs {
+			if !slices.Contains(interfaces, ip) {
+				interfaces = append(interfaces, ip)
+			}
+		}
+
+		// If IP discovery failed across the board, surface an error instead of
+		// returning a misleading empty-but-successful response that the Panel
+		// would treat as "no assignable IPs".
+		if len(interfaces) == 0 {
+			middleware.CaptureAndAbort(c, errors.New("failed to discover any assignable IP addresses in kubernetes mode; check node/LoadBalancer RBAC or configure kubernetes.system_ips"))
+			return
+		}
+	} else {
+		ips, err := system.GetSystemIps()
+		if err != nil {
+			middleware.CaptureAndAbort(c, err)
+			return
+		}
+		interfaces = append(interfaces, ips...)
+		for _, ip := range cfg.Docker.SystemIps {
+			if !slices.Contains(interfaces, ip) {
+				interfaces = append(interfaces, ip)
+			}
+		}
 	}
 
 	c.JSON(http.StatusOK, &system.IpAddresses{IpAddresses: interfaces})

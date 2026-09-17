@@ -14,9 +14,11 @@ import (
 	"github.com/apex/log"
 	"github.com/gammazero/workerpool"
 	"github.com/goccy/go-json"
+
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
 	"github.com/pelican/wings/environment/docker"
+	"github.com/pelican/wings/environment/kubernetes"
 	"github.com/pelican/wings/remote"
 	"github.com/pelican/wings/server/filesystem"
 	"github.com/pelican/wings/server/filesystem/quotas"
@@ -208,9 +210,6 @@ func (m *Manager) InitServer(data remote.ServerConfigurationResponse) (*Server, 
 		}
 	}
 
-	// Right now we only support a Docker based environment, so I'm going to hard code
-	// this logic in. When we're ready to support other environment we'll need to make
-	// some modifications here, obviously.
 	settings := environment.Settings{
 		Mounts:      s.Mounts(),
 		Allocations: s.cfg.Allocations,
@@ -219,15 +218,30 @@ func (m *Manager) InitServer(data remote.ServerConfigurationResponse) (*Server, 
 	}
 
 	envCfg := environment.NewConfiguration(settings, s.GetEnvironmentVariables())
-	meta := docker.Metadata{
-		Image: s.Config().Container.Image,
-	}
 
-	if env, err := docker.New(s.ID(), &meta, envCfg); err != nil {
-		return nil, err
+	if config.Get().Kubernetes.Enabled {
+		meta := kubernetes.Metadata{
+			Image: s.Config().Container.Image,
+		}
+		if pc := s.ProcessConfiguration(); pc != nil {
+			meta.Stop = pc.Stop
+		}
+		if env, err := kubernetes.New(s.ID(), &meta, envCfg); err != nil {
+			return nil, err
+		} else {
+			s.Environment = env
+			s.StartEventListeners()
+		}
 	} else {
-		s.Environment = env
-		s.StartEventListeners()
+		meta := docker.Metadata{
+			Image: s.Config().Container.Image,
+		}
+		if env, err := docker.New(s.ID(), &meta, envCfg); err != nil {
+			return nil, err
+		} else {
+			s.Environment = env
+			s.StartEventListeners()
+		}
 	}
 
 	// If the server's data directory exists, force disk usage calculation.

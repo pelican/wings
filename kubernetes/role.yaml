@@ -1,0 +1,56 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: pelican-wings
+  namespace: pelican
+  labels:
+    app.kubernetes.io/managed-by: pelican-wings
+    app.kubernetes.io/component: wings
+rules:
+  # Game server Pod lifecycle: create, get (status checks), delete, list
+  # (installer pod lookup by label).
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "create", "delete", "list", "watch"]
+
+  # Stream console output from game server and installer Pods.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+
+  # Interactive console attach via SPDY (stdin/stdout/stderr).
+  - apiGroups: [""]
+    resources: ["pods/attach"]
+    verbs: ["create"]
+
+  # Service management for exposing game server ports (NodePort or LoadBalancer).
+  # List is needed for discovering LoadBalancer external IPs.
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "create", "update", "delete", "list"]
+
+  # Egg installation Jobs: create, get (poll status), delete (cleanup).
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "create", "delete"]
+
+  # ConfigMaps for install scripts and identity files: create, get, update, delete.
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "create", "update", "delete"]
+
+  # ResourceQuota management (when resource_quota.enabled: true).
+  - apiGroups: [""]
+    resources: ["resourcequotas"]
+    verbs: ["get", "create", "update"]
+
+  # LimitRange management (when limit_range.enabled: true).
+  - apiGroups: [""]
+    resources: ["limitranges"]
+    verbs: ["get", "create", "update"]
+
+  # PersistentVolumeClaim lifecycle (when storage_mode: pvc).
+  # Remove this rule if you only use storage_mode: hostpath.
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "create", "update", "delete", "list"]

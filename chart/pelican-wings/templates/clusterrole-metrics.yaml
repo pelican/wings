@@ -1,0 +1,23 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "pelican-wings.fullname" . }}-metrics
+  labels:
+    {{- include "pelican-wings.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["metrics.k8s.io"]
+    resources: ["pods"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get"]
+  {{- if .Values.rbac.kubeletMetricsFallback }}
+  # Proxy to kubelet stats/summary API for resource metrics when
+  # metrics-server is not installed. Opt-in: this is a broad cluster-scoped
+  # permission (rbac.kubeletMetricsFallback).
+  - apiGroups: [""]
+    resources: ["nodes/proxy"]
+    verbs: ["get"]
+  {{- end }}
+{{- end }}

@@ -1,0 +1,39 @@
+# OPTIONAL kubelet stats/summary fallback for resource metrics.
+#
+# Only apply this if you do NOT run metrics-server and want Wings to read CPU/
+# memory usage directly from the kubelet. nodes/proxy is a broad, cluster-wide
+# permission, so it is kept out of the default clusterrole-metrics.yaml and must
+# be opted into explicitly:
+#
+#   kubectl apply -f clusterrole-metrics-kubelet.yaml
+#
+# Adjust the ServiceAccount name/namespace below to match your install.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: pelican-wings-metrics-kubelet
+  labels:
+    app.kubernetes.io/managed-by: pelican-wings
+    app.kubernetes.io/component: wings
+rules:
+  # Proxy to the kubelet stats/summary API for resource metrics when
+  # metrics-server is not installed.
+  - apiGroups: [""]
+    resources: ["nodes/proxy"]
+    verbs: ["get"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pelican-wings-metrics-kubelet
+  labels:
+    app.kubernetes.io/managed-by: pelican-wings
+    app.kubernetes.io/component: wings
+subjects:
+  - kind: ServiceAccount
+    name: pelican-wings
+    namespace: pelican
+roleRef:
+  kind: ClusterRole
+  name: pelican-wings-metrics-kubelet
+  apiGroup: rbac.authorization.k8s.io

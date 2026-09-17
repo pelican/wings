@@ -1,0 +1,20 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "pelican-wings.fullname" . }}
+  namespace: {{ .Values.gameNamespace }}
+  labels:
+    {{- include "pelican-wings.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: api
+      protocol: TCP
+      name: api
+    - port: {{ .Values.service.sftpPort }}
+      targetPort: sftp
+      protocol: TCP
+      name: sftp
+  selector:
+    {{- include "pelican-wings.selectorLabels" . | nindent 4 }}

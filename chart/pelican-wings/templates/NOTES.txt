@@ -1,0 +1,22 @@
+Pelican Wings has been deployed!
+
+1. Get the Wings API URL:
+{{- if contains "NodePort" .Values.service.type }}
+  export NODE_PORT=$(kubectl get --namespace {{ .Values.gameNamespace }} -o jsonpath="{.spec.ports[0].nodePort}" services {{ include "pelican-wings.fullname" . }})
+  export NODE_IP=$(kubectl get nodes --namespace {{ .Values.gameNamespace }} -o jsonpath="{.items[0].status.addresses[0].address}")
+  echo "Wings API: http://$NODE_IP:$NODE_PORT"
+{{- else if contains "ClusterIP" .Values.service.type }}
+  kubectl port-forward --namespace {{ .Values.gameNamespace }} svc/{{ include "pelican-wings.fullname" . }} {{ .Values.service.port }}:{{ .Values.service.port }}
+  echo "Wings API: http://127.0.0.1:{{ .Values.service.port }}"
+{{- end }}
+
+2. Configure your Panel to connect to this Wings node using the URL above.
+
+3. Verify the deployment:
+  kubectl get pods --namespace {{ .Values.gameNamespace }} -l "{{ include "pelican-wings.selectorLabels" . | replace "\n" "," }}"
+
+Configuration:
+  - Game namespace: {{ .Values.gameNamespace }}
+  - Network mode: {{ .Values.wings.kubernetes.networkMode }}
+  - Storage mode: {{ .Values.wings.kubernetes.storageMode }}
+  - Panel URL: {{ .Values.wings.panelUrl }}

@@ -1,0 +1,15 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: pelican-wings-metrics
+  labels:
+    app.kubernetes.io/managed-by: pelican-wings
+    app.kubernetes.io/component: wings
+subjects:
+  - kind: ServiceAccount
+    name: pelican-wings
+    namespace: pelican
+roleRef:
+  kind: ClusterRole
+  name: pelican-wings-metrics
+  apiGroup: rbac.authorization.k8s.io

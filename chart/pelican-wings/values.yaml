@@ -1,0 +1,227 @@
+# Default values for pelican-wings.
+
+# -- Number of Wings replicas (typically 1 per node via DaemonSet, or 1 Deployment)
+replicaCount: 1
+
+image:
+  # -- Wings container image repository
+  repository: ghcr.io/pelican/wings
+  # -- Image pull policy
+  pullPolicy: IfNotPresent
+  # -- Overrides the image tag (defaults to chart appVersion)
+  tag: ""
+
+# -- Image pull secrets for private registries
+imagePullSecrets: []
+
+# -- Override the release name
+nameOverride: ""
+# -- Override the full release name
+fullnameOverride: ""
+
+serviceAccount:
+  # -- Whether to create the ServiceAccount
+  create: true
+  # -- Annotations to add to the ServiceAccount
+  annotations: {}
+  # -- Name of the ServiceAccount (generated if not set)
+  name: ""
+
+rbac:
+  # -- Whether to create RBAC resources (Role, RoleBinding, ClusterRole, ClusterRoleBinding)
+  create: true
+  # -- Grant the cluster-wide nodes/proxy permission so Wings can read resource
+  # metrics directly from the kubelet stats/summary API when metrics-server is
+  # not installed. This is a broad, cluster-scoped permission; leave it off and
+  # install metrics-server unless you specifically need the kubelet fallback.
+  kubeletMetricsFallback: false
+
+# -- Namespace for game server resources (Pods, Services, Jobs, PVCs)
+gameNamespace: pelican
+
+# -- Whether to create the game namespace
+createGameNamespace: true
+
+# Wings configuration
+wings:
+  # -- Panel URL that Wings connects to
+  panelUrl: "https://panel.example.com"
+  # -- Authentication token for the Panel API
+  token: ""
+  # -- Token ID for Panel authentication
+  tokenId: ""
+  # -- Node UUID assigned by the Panel
+  uuid: ""
+
+  api:
+    # -- Wings API listen address
+    host: "0.0.0.0"
+    # -- Wings API listen port
+    port: 8080
+
+  sftp:
+    # -- SFTP server listen address
+    host: "0.0.0.0"
+    # -- SFTP server listen port
+    port: 2022
+
+  system:
+    # -- Root data directory
+    rootDirectory: /var/lib/pelican
+    # -- Log directory
+    logDirectory: /var/log/pelican
+    # -- Server data directory
+    data: /var/lib/pelican/volumes
+    # -- Temp directory for installation scripts
+    tmpDirectory: /tmp/pelican
+
+  kubernetes:
+    # -- Enable Kubernetes mode (required for K8s game server scheduling)
+    enabled: true
+    # -- Namespace for game server Pods (should match gameNamespace)
+    namespace: pelican
+    # -- Network mode: "hostport", "nodeport", or "loadbalancer"
+    # hostport: binds directly on host (closest to Docker)
+    # nodeport: shared node IP, auto-assigned external ports (30000-32767)
+    # loadbalancer: dedicated external IP per server via LB provisioner (Cilium, MetalLB, cloud)
+    networkMode: nodeport
+    # -- Annotations applied to LoadBalancer Services (only used when networkMode=loadbalancer)
+    # Example for Cilium LB-IPAM:
+    #   lbAnnotations:
+    #     io.cilium/lb-ipam-pool: "game-servers"
+    lbAnnotations: {}
+    # -- Annotation key Wings sets to the server's allocation IP on each LB Service.
+    # This pins the LB to the IP selected in the Panel so multiple servers share one IP.
+    # Cilium: "lbipam.cilium.io/ips"  |  MetalLB: "metallb.universe.tf/loadBalancerIPs"
+    lbIPAnnotation: ""
+    # -- Annotation key for LB IP sharing. Wings sets the value to the allocation IP,
+    # grouping all servers on the same IP under one sharing key.
+    # Cilium: "lbipam.cilium.io/sharing-key"  |  MetalLB: "metallb.universe.tf/allow-shared-ip"
+    lbSharingKey: ""
+    # -- Storage mode: "hostpath" or "pvc"
+    storageMode: pvc
+    # -- StorageClass for PVCs (empty = cluster default)
+    storageClass: ""
+    # -- Default PVC size per server
+    storageSize: "10Gi"
+    # -- PVC access mode
+    storageAccessMode: ReadWriteOnce
+    # -- Preserve game port as NodePort when in range (nodeport mode only)
+    nodeportPreserve: false
+    # -- Lower bound of the Kubernetes NodePort range (nodeport mode only)
+    nodeportRangeMin: 30000
+    # -- Upper bound of the Kubernetes NodePort range (nodeport mode only)
+    nodeportRangeMax: 32767
+    # -- Kubernetes node name for IP discovery (auto-detected from NODE_NAME env var if empty)
+    nodeName: ""
+    # -- Additional IPs to advertise in the allocation endpoint (e.g. floating IPs, VIPs)
+    systemIPs: []
+    # -- DNS policy for game server Pods
+    dnsPolicy: ClusterFirst
+    # -- Node selector for game server Pods
+    nodeSelector: {}
+    # -- Tolerations for game server Pods
+    tolerations: []
+    # -- Image pull secrets for game server Pods
+    imagePullSecrets: []
+    # -- Override pull policy for game server Pods and install Jobs:
+    # "Always", "IfNotPresent", or "Never". Empty = remote images use Always
+    # (re-pull updated tags, matching Docker), ~-local images use IfNotPresent.
+    imagePullPolicy: ""
+
+# -- Pod-level security context for the Wings Deployment
+podSecurityContext: {}
+
+# -- Container-level security context for Wings
+securityContext: {}
+
+# Wings service configuration
+service:
+  # -- Service type for the Wings API
+  type: ClusterIP
+  # -- Wings API port
+  port: 8080
+  # -- SFTP port
+  sftpPort: 2022
+
+# -- Resource requests and limits for the Wings container
+resources: {}
+  # requests:
+  #   cpu: 100m
+  #   memory: 256Mi
+  # limits:
+  #   cpu: "1"
+  #   memory: 1Gi
+
+# -- Node selector for the Wings Pod itself
+nodeSelector: {}
+
+# -- Tolerations for the Wings Pod itself
+tolerations: []
+
+# -- Affinity rules for the Wings Pod
+affinity: {}
+
+# Persistence for the Wings root data directory (/var/lib/pelican).
+# This stores server volumes, backups, and Wings state. Without persistence,
+# all data is lost when the Wings pod restarts.
+persistence:
+  # -- Enable persistent storage for the Wings data directory
+  enabled: true
+  # -- StorageClass for the PVC (empty = cluster default)
+  storageClass: ""
+  # -- PVC size
+  size: 50Gi
+  # -- Access mode
+  accessMode: ReadWriteOnce
+  # -- Use an existing PVC instead of creating one (set to PVC name)
+  existingClaim: ""
+  # -- Annotations for the PVC
+  annotations: {}
+
+# -- Additional environment variables for the Wings container
+extraEnv: []
+
+# -- Additional volume mounts for the Wings container
+extraVolumeMounts: []
+
+# -- Additional volumes for the Wings Pod
+extraVolumes: []
+
+# Resource Quota for the game server namespace.
+# Caps aggregate resource usage across all game server Pods.
+resourceQuota:
+  # -- Whether to create a ResourceQuota in the game namespace
+  enabled: false
+  # -- Total CPU limit across all Pods (e.g. "16", "8000m")
+  cpuLimit: ""
+  # -- Total memory limit across all Pods (e.g. "32Gi")
+  memoryLimit: ""
+  # -- Total CPU request across all Pods (e.g. "8")
+  cpuRequest: ""
+  # -- Total memory request across all Pods (e.g. "16Gi")
+  memoryRequest: ""
+  # -- Maximum number of Pods
+  maxPods: ""
+  # -- Maximum number of PVCs
+  maxPVCs: ""
+  # -- Total storage across all PVCs (e.g. "500Gi")
+  maxStorage: ""
+
+# Limit Range for the game server namespace.
+# Sets default resource limits/requests for containers that don't specify their own.
+limitRange:
+  # -- Whether to create a LimitRange in the game namespace
+  enabled: false
+  # -- Default CPU limit per container (e.g. "2", "1000m")
+  defaultCPULimit: ""
+  # -- Default memory limit per container (e.g. "4Gi")
+  defaultMemoryLimit: ""
+  # -- Default CPU request per container (e.g. "500m")
+  defaultCPURequest: ""
+  # -- Default memory request per container (e.g. "1Gi")
+  defaultMemoryRequest: ""
+  # -- Maximum CPU any single container can use (e.g. "8")
+  maxCPU: ""
+  # -- Maximum memory any single container can use (e.g. "16Gi")
+  maxMemory: ""
