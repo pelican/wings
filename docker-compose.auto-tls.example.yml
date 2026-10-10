@@ -1,0 +1,72 @@
+# This opt-in example uses Wings' built-in ACME client to issue and renew a
+# Let's Encrypt certificate. The default Compose example remains unchanged.
+# It requires exclusive access to port 80 on the published host address. When
+# Panel or another reverse proxy shares that address, terminate TLS there and
+# proxy to Wings instead, or bind Wings to a separate public address.
+#
+# Before starting:
+#   1. Set WINGS_HOSTNAME to the node FQDN without a scheme or port.
+#   2. Set WINGS_API_PORT and WINGS_SFTP_PORT to the same ports configured in
+#      /etc/pelican/config.yml. Port 80 is reserved for the ACME HTTP-01 challenge.
+#   3. Create the Panel node with HTTPS enabled and matching daemon ports.
+#   4. Point the FQDN directly at this host. When using Cloudflare, keep the
+#      record DNS only because the configured SFTP port cannot use the proxy.
+#   5. Allow inbound TCP traffic on port 80 and both configured service ports.
+#      Every published A and AAAA address must reach this host on those ports.
+#
+# Example .env:
+#   WINGS_HOSTNAME=node.example.com
+#   WINGS_API_PORT=8080
+#   WINGS_SFTP_PORT=2022
+#
+# Validate the configured ports and start the stack through the included
+# wrapper. It rejects invalid, reserved, and conflicting service ports before
+# Docker Compose attempts to bind them:
+#   sh ./docker-compose.auto-tls.sh up -d
+#
+# The existing /var/lib/pelican volume persists the ACME account and certificate
+# cache at /var/lib/pelican/.tls-cache across container restarts.
+
+services:
+  wings:
+    image: ghcr.io/pelican/wings:latest
+    restart: always
+    command:
+      - /usr/bin/wings
+      - --config
+      - /etc/pelican/config.yml
+      - --auto-tls
+      - --tls-hostname
+      - "${WINGS_HOSTNAME:?Set WINGS_HOSTNAME to the node FQDN}"
+    networks:
+      - wings0
+    ports:
+      - "80:80"
+      - "${WINGS_API_PORT:?Set WINGS_API_PORT to the API port in config.yml}:${WINGS_API_PORT:?Set WINGS_API_PORT to the API port in config.yml}"
+      - "${WINGS_SFTP_PORT:?Set WINGS_SFTP_PORT to the SFTP port in config.yml}:${WINGS_SFTP_PORT:?Set WINGS_SFTP_PORT to the SFTP port in config.yml}"
+    tty: true
+    environment:
+      TZ: "UTC"
+      WINGS_UID: 988
+      WINGS_GID: 988
+      WINGS_USERNAME: pelican
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "/var/lib/docker/containers/:/var/lib/docker/containers/"
+      - "/etc/pelican/:/etc/pelican/"
+      - "/var/lib/pelican/:/var/lib/pelican/"
+      - "/var/log/pelican/:/var/log/pelican/"
+      - "/tmp/pelican/:/tmp/pelican/"
+      - "/etc/ssl/certs:/etc/ssl/certs:ro"
+      # You may need /srv/daemon-data when upgrading from an old daemon.
+      #- "/srv/daemon-data/:/srv/daemon-data/"
+
+networks:
+  wings0:
+    name: wings0
+    driver: bridge
+    ipam:
+      config:
+        - subnet: "172.21.0.0/16"
+    driver_opts:
+      com.docker.network.bridge.name: wings0
