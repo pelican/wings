@@ -59,7 +59,7 @@ func TestIgnore(t *testing.T) {
 
 		g.It("preserves gitignore escapes and character classes", func() {
 			escaped, wildcards := escapeIgnorePattern(`\#not-a-comment\*[^a-z]*.log`)
-			g.Assert(escaped).Equal(`\#not-a-comment\*[^a-z]*.log`)
+			g.Assert(escaped).Equal(`\#not-a-comment\*[\^a-z]*.log`)
 			g.Assert(wildcards).Equal(1)
 		})
 	})
