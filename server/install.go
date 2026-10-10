@@ -24,6 +24,7 @@ import (
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
+	"github.com/pelican/wings/environment/docker"
 	"github.com/pelican/wings/remote"
 	"github.com/pelican/wings/system"
 )
@@ -515,6 +516,8 @@ func (ip *InstallationProcess) Execute() (string, error) {
 	if err := ip.client.ContainerStart(ctx, r.ID, container.StartOptions{}); err != nil {
 		return "", err
 	}
+
+	docker.SetCpuBurst(ctx, ip.client, r.ID, hostConf.Resources.CPUQuota)
 
 	// Process the install event in the background by listening to the stream output until the
 	// container has stopped, at which point we'll disconnect from it.

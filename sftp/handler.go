@@ -23,6 +23,7 @@ const (
 	PermissionFileCreate      = "file.create"
 	PermissionFileUpdate      = "file.update"
 	PermissionFileDelete      = "file.delete"
+	sftpAttributeExtended     = 1 << 31
 )
 
 type Handler struct {
@@ -105,7 +106,7 @@ func (h *Handler) Fileread(request *sftp.Request) (io.ReaderAt, error) {
 	defer h.mu.Unlock()
 	if err := h.fs.IsIgnored(request.Filepath); err != nil {
 		return nil, err
-	}	
+	}
 	f, _, err := h.fs.File(request.Filepath)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
@@ -134,7 +135,7 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 
 	if err := h.fs.IsIgnored(request.Filepath); err != nil {
 		return nil, err
-	}	
+	}
 	// The specific permission required to perform this action. If the file exists on the
 	// system already it only needs to be an update, otherwise we'll check for a create.
 	permission := PermissionFileUpdate
@@ -168,6 +169,29 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 	return quotaWriterAt{WriterAt: f, server: h.server}, nil
 }
 
+func setstatMode(request *sftp.Request) (os.FileMode, error) {
+	// pkg/sftp allocates the client-provided extended attribute count before
+	// validating the remaining packet length. Reject it before parsing to avoid
+	// allowing a small packet to request an effectively unbounded allocation.
+	if request.Flags&sftpAttributeExtended != 0 {
+		return 0, sftp.ErrSSHFxBadMessage
+	}
+	attrs := request.Attributes()
+	if attrs == nil {
+		return 0, sftp.ErrSSHFxBadMessage
+	}
+	mode := attrs.FileMode().Perm()
+	// If the client passes an invalid FileMode just use the default 0644.
+	if mode == 0o000 {
+		mode = os.FileMode(0o644)
+	}
+	// Force directories to be 0755.
+	if attrs.FileMode().IsDir() {
+		mode = 0o755
+	}
+	return mode, nil
+}
+
 // Filecmd hander for basic SFTP system calls related to files, but not anything to do with reading
 // or writing to those files.
 func (h *Handler) Filecmd(request *sftp.Request) error {
@@ -178,10 +202,6 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 	if request.Target != "" {
 		l = l.WithField("target", request.Target)
 	}
-	
-	if err := h.fs.IsIgnored(request.Filepath); err != nil {
-		return err
-	}	
 
 	switch request.Method {
 	// Allows a user to make changes to the permissions of a given file or directory
@@ -190,14 +210,9 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		if !h.can(PermissionFileUpdate) {
 			return sftp.ErrSSHFxPermissionDenied
 		}
-		mode := request.Attributes().FileMode().Perm()
-		// If the client passes an invalid FileMode just use the default 0644.
-		if mode == 0o000 {
-			mode = os.FileMode(0o644)
-		}
-		// Force directories to be 0755.
-		if request.Attributes().FileMode().IsDir() {
-			mode = 0o755
+		mode, err := setstatMode(request)
+		if err != nil {
+			return err
 		}
 		if err := h.fs.Chmod(request.Filepath, mode); err != nil {
 			if errors.Is(err, os.ErrNotExist) {

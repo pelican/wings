@@ -35,6 +35,28 @@ func TestRequest(t *testing.T) {
 	assert.NotNil(t, r)
 }
 
+func TestSetCredentials(t *testing.T) {
+	var authorization []string
+	c, server := createTestClient(func(rw http.ResponseWriter, r *http.Request) {
+		authorization = append(authorization, r.Header.Get("Authorization"))
+		rw.WriteHeader(http.StatusOK)
+	})
+	defer server.Close()
+
+	if _, err := c.requestOnce(context.Background(), http.MethodGet, "/test", nil); err != nil {
+		t.Fatal(err)
+	}
+	c.SetCredentials("rotated-id", "rotated-token")
+	if _, err := c.requestOnce(context.Background(), http.MethodGet, "/test", nil); err != nil {
+		t.Fatal(err)
+	}
+
+	assert.Equal(t, []string{
+		"Bearer testid.testtoken",
+		"Bearer rotated-id.rotated-token",
+	}, authorization)
+}
+
 func TestRequestRetry(t *testing.T) {
 	// Test if the client attempts failed requests
 	i := 0

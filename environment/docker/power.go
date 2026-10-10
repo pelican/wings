@@ -75,6 +75,7 @@ func (e *Environment) Start(ctx context.Context) error {
 		// If the server is running update our internal state and continue on with the attach.
 		if c.State.Running {
 			e.SetState(environment.ProcessRunningState)
+			e.applyCpuBurst(ctx)
 
 			return e.Attach(ctx)
 		}
@@ -121,7 +122,8 @@ func (e *Environment) Start(ctx context.Context) error {
 	if err := e.client.ContainerStart(actx, e.Id, container.StartOptions{}); err != nil {
 		return errors.WrapIf(err, "environment/docker: failed to start container")
 	}
-
+	e.applyCpuBurst(actx)
+	
 	// No errors, good to continue through.
 	sawError = false
 	return nil

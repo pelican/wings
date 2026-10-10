@@ -133,7 +133,7 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 	defer wg.Wait()
 
 	for ch := range chans {
-		// If not a session channel we just move on because it's not something we
+		// If its not a session channel we just move on because its not something we
 		// know how to handle at this point.
 		if ch.ChannelType() != "session" {
 			_ = ch.Reject(ssh.UnknownChannelType, "unknown channel type")
@@ -176,6 +176,7 @@ func (c *SFTPServer) AcceptInbound(conn net.Conn, config *ssh.ServerConfig) erro
 			}
 		}(channel)
 	}
+
 	return nil
 }
 
@@ -261,7 +262,7 @@ func (c *SFTPServer) makeCredentialsRequest(conn ssh.ConnMetadata, t remote.Sftp
 		logger.Warn("failed to validate user credentials (password authentication is disabled; only SSH keys are allowed)")
 		return nil, &remote.SftpKeyOnlyError{}
 	}
-
+	
 	resp, err := c.manager.Client().ValidateSftpCredentials(context.Background(), request)
 	if err != nil {
 		if _, ok := err.(*remote.SftpInvalidCredentialsError); ok {

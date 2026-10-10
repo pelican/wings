@@ -128,9 +128,11 @@ func (l Limits) AsContainerResources() container.Resources {
 	//
 	// @see https://github.com/pterodactyl/panel/issues/3988
 	if l.CpuLimit > 0 {
-		resources.CPUQuota = l.CpuLimit * 1_000
-		resources.CPUPeriod = 100_000
-		resources.CPUShares = 1024
+		cfg := config.Get().Docker
+		period := cfg.CpuPeriodMicroseconds()
+		resources.CPUQuota = l.CpuLimit * period / 100
+		resources.CPUPeriod = period
+		resources.CPUShares = cfg.CpuShares
 	}
 
 	// Similar to above, don't set the specific assigned CPUs if we didn't actually limit

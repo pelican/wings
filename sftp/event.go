@@ -35,7 +35,6 @@ func (eh *eventHandler) Log(e models.Event, fa FileAction) error {
 		metadata = map[string]interface{}{
 			"from": fa.Entity,
 			"to": fa.Target,
-		}
 	}
 
 	a := models.Activity{

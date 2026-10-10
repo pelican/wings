@@ -108,7 +108,8 @@ func (e *Environment) InSituUpdate() error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 
-	if _, err := e.ContainerInspect(ctx); err != nil {
+	c, err := e.ContainerInspect(ctx)
+	if err != nil {
 		// If the container doesn't exist for some reason there really isn't anything
 		// we can do to fix that in this process (it doesn't make sense at least). In those
 		// cases just return without doing anything since we still want to save the configuration
@@ -121,6 +122,12 @@ func (e *Environment) InSituUpdate() error {
 		return errors.Wrap(err, "environment/docker: could not inspect container")
 	}
 
+	// The kernel rejects a CFS quota lower than the current burst, so remove the
+	// burst before updating the limits and re-apply it afterwards.
+	if c.State != nil {
+		e.clearCpuBurst(c.State.Pid)
+	}
+
 	// CPU pinning cannot be removed once it is applied to a container. The same is true
 	// for removing memory limits, a container must be re-created.
 	//
@@ -130,6 +137,8 @@ func (e *Environment) InSituUpdate() error {
 	}); err != nil {
 		return errors.Wrap(err, "environment/docker: could not update container")
 	}
+	
+	e.applyCpuBurst(ctx)
 	return nil
 }
 
