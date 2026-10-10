@@ -491,6 +491,15 @@ func GetJwtAlgorithm() *jwt.HMACSHA {
 // and will only allow one write at a time. Additional calls while writing are
 // queued up.
 func WriteToDisk(c *Configuration) error {
+
+	// If the environment variable is set, skip actual writes. Useful for containers
+	// or managed environments where you want Wings to never modify files.
+	if os.Getenv("WINGS_NO_CONFIG_WRITE") == "1" {
+		// Note: use your logger package as appropriate; using apex/log.Logger in this file
+		// may require importing it. For clarity we keep this a simple no-op.
+		return nil
+	}
+
 	_writeLock.Lock()
 	defer _writeLock.Unlock()
 
