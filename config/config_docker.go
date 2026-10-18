@@ -106,9 +106,23 @@ func (c DockerConfiguration) ContainerLogConfig() container.LogConfig {
 		return container.LogConfig{}
 	}
 
+	// Filter config options based on the logging driver type
+	// The "local" driver has specific options that aren't compatible with other drivers
+	config := make(map[string]string)
+	for k, v := range c.LogConfig.Config {
+		// Only include these options if using the "local" driver
+		if c.LogConfig.Type != "local" {
+			// Exclude local-specific options for non-local drivers like fluentd, json-file, etc.
+			if k == "max-size" || k == "max-file" || k == "compress" || k == "mode" {
+				continue
+			}
+		}
+		config[k] = v
+	}
+
 	return container.LogConfig{
 		Type:   c.LogConfig.Type,
-		Config: c.LogConfig.Config,
+		Config: config,
 	}
 }
 // RegistryCredentialsForImage returns registry credentials for an image only
