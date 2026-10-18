@@ -252,10 +252,6 @@ func (dl *Download) Execute() error {
 		return errors.New("downloader: got bad response status from endpoint: " + res.Status)
 	}
 
-	if res.ContentLength < 1 {
-		return errors.New("downloader: request is missing ContentLength")
-	}
-
 	if dl.req.UseHeader {
 		if contentDisposition := res.Header.Get("Content-Disposition"); contentDisposition != "" {
 			_, params, err := mime.ParseMediaType(contentDisposition)
@@ -285,8 +281,14 @@ func (dl *Download) Execute() error {
 	dl.server.Log().WithField("path", p).Debug("writing remote file to disk")
 
 	// Write the file while tracking the progress, Write will check that the
-	// size of the file won't exceed the disk limit.
-	r := io.TeeReader(res.Body, dl.counter(res.ContentLength))
+	// size of the file won't exceed the disk limit. The length is unknown (-1)
+	// for chunked responses and for responses that the HTTP client transparently
+	// decompressed, in which case Write enforces the limit as the data comes in
+	// and the progress stays at zero since there is nothing to measure it against.
+	var r io.Reader = res.Body
+	if res.ContentLength > 0 {
+		r = io.TeeReader(res.Body, dl.counter(res.ContentLength))
+	}
 	if err := dl.server.Filesystem().Write(p, r, res.ContentLength, 0o644); err != nil {
 		return errors.WrapIf(err, "downloader: failed to write file to server directory")
 	}
@@ -308,7 +310,8 @@ func (dl *Download) BelongsTo(s *server.Server) bool {
 }
 
 // Progress returns the current progress of the download as a float value between 0 and 1 where
-// 1 indicates that the download is completed.
+// 1 indicates that the download is completed. If the remote server did not report the size of
+// the file, the progress remains at 0 until the download finishes.
 func (dl *Download) Progress() float64 {
 	dl.mu.RLock()
 	defer dl.mu.RUnlock()
