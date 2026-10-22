@@ -244,6 +244,22 @@ func postUpdateConfiguration(c *gin.Context) {
 		cfg.Api.Ssl.CertificateFile = config.Get().Api.Ssl.CertificateFile
 	}
 
+	// The token that everything authenticates against is a derived value that is
+	// not part of the payload sent by the Panel, so it has to be re-resolved from
+	// the new token values.
+	if err := cfg.ResolveToken(true); err != nil {
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
+
+	// Refuse to go any further with a token we could never authenticate against.
+	if cfg.Token.ID == "" || cfg.Token.Token == "" {
+		middleware.CaptureAndAbort(c, errors.New("config: refusing to apply an update with an empty authentication token"))
+		return
+	}
+
+	tokenId, token := cfg.Token.ID, cfg.Token.Token
+
 	// Try to write this new configuration to the disk before updating our global
 	// state with it.
 	if err := config.WriteToDisk(cfg); err != nil {
@@ -253,6 +269,11 @@ func postUpdateConfiguration(c *gin.Context) {
 	// Since we wrote it to the disk successfully now update the global configuration
 	// state to use this new configuration struct.
 	config.Set(cfg)
+
+	// Requests we make back to the Panel use credentials that were captured when
+	// the client was created at boot, so they have to be rotated explicitly.
+	middleware.ExtractManager(c).Client().SetCredentials(tokenId, token)
+
 	c.JSON(http.StatusOK, postUpdateConfigurationResponse{
 		Applied: true,
 	})
