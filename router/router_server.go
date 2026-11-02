@@ -285,22 +285,23 @@ func deleteServer(c *gin.Context) {
 	pool := config.Get().System.Transfers.StoragePool
 	skipFileRemoval := pool.Enabled && pool.PoolName != "" && s.IsTransferring()
 	if !skipFileRemoval {
+		// Copy what the goroutine needs: "s" is set to nil below, before it runs.
 		p := s.Filesystem().Path()
-		go func(p string) {
+		uuid, pid := s.Config().Uuid, s.Config().Pid
+		go func(p, uuid string, pid int) {
 			if err := os.RemoveAll(p); err != nil {
 				log.WithFields(log.Fields{"path": p, "error": err}).
 					Warn("failed to remove server files during deletion process")
 			}
 
 			if config.Get().System.Quotas.Enabled {
-				if err = quotas.DelQuota(s.Config().Uuid); err != nil {
-					log.WithFields(log.Fields{"server_id": s.Config().Pid, "error": err}).
+				if err := quotas.DelQuota(uuid); err != nil {
+					log.WithFields(log.Fields{"server_id": pid, "error": err}).
 						Warn("failed to remove quota during deletion process")
 				}
 			}
-		}(p)
+		}(p, uuid, pid)
 	}
-
 
 	if err := s.Filesystem().Close(); err != nil {
 		log.WithFields(log.Fields{"server": s.ID(), "error": err}).Warn("failed to close filesystem root")
