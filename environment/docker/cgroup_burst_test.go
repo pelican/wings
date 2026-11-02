@@ -29,41 +29,47 @@ func TestCpuBurstMicroseconds(t *testing.T) {
 
 func TestResolveCgroupCpuFile(t *testing.T) {
 	tests := []struct {
-		name       string
-		procCgroup string
-		v2         bool
-		expected   string
-		wantErr    bool
+		name        string
+		procCgroup  string
+		v2          bool
+		containerID string
+		expected    string
+		wantErr     bool
 	}{
 		{
-			name:       "v2 systemd scope",
-			procCgroup: "0::/system.slice/docker-abc123.scope\n",
-			v2:         true,
-			expected:   "/sys/fs/cgroup/system.slice/docker-abc123.scope/cpu.max.burst",
+			name:        "v2 systemd scope",
+			procCgroup:  "0::/system.slice/docker-abc123.scope\n",
+			v2:          true,
+			containerID: "abc123",
+			expected:    "/sys/fs/cgroup/system.slice/docker-abc123.scope/cpu.max.burst",
 		},
 		{
-			name:       "v2 rootless",
-			procCgroup: "0::/user.slice/user-1000.slice/user@1000.service/user.slice/docker-abc123.scope\n",
-			v2:         true,
-			expected:   "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/user.slice/docker-abc123.scope/cpu.max.burst",
+			name:        "v2 rootless",
+			procCgroup:  "0::/user.slice/user-1000.slice/user@1000.service/user.slice/docker-abc123.scope\n",
+			v2:          true,
+			containerID: "abc123",
+			expected:    "/sys/fs/cgroup/user.slice/user-1000.slice/user@1000.service/user.slice/docker-abc123.scope/cpu.max.burst",
 		},
 		{
-			name:       "v1 combined cpu controller",
-			procCgroup: "12:pids:/docker/abc123\n4:cpu,cpuacct:/docker/abc123\n1:name=systemd:/docker/abc123\n",
-			v2:         false,
-			expected:   "/sys/fs/cgroup/cpu/docker/abc123/cpu.cfs_burst_us",
+			name:        "v1 combined cpu controller",
+			procCgroup:  "12:pids:/docker/abc123\n4:cpu,cpuacct:/docker/abc123\n1:name=systemd:/docker/abc123\n",
+			v2:          false,
+			containerID: "abc123",
+			expected:    "/sys/fs/cgroup/cpu/docker/abc123/cpu.cfs_burst_us",
 		},
 		{
-			name:       "v1 bare cpu controller",
-			procCgroup: "4:cpu:/docker/abc123\n",
-			v2:         false,
-			expected:   "/sys/fs/cgroup/cpu/docker/abc123/cpu.cfs_burst_us",
+			name:        "v1 bare cpu controller",
+			procCgroup:  "4:cpu:/docker/abc123\n",
+			v2:          false,
+			containerID: "abc123",
+			expected:    "/sys/fs/cgroup/cpu/docker/abc123/cpu.cfs_burst_us",
 		},
 		{
-			name:       "v1 cpuset and cpuacct do not match",
-			procCgroup: "5:cpuset:/docker/abc123\n4:cpuacct:/docker/abc123\n",
-			v2:         false,
-			wantErr:    true,
+			name:        "v1 cpuset and cpuacct do not match",
+			procCgroup:  "5:cpuset:/docker/abc123\n4:cpuacct:/docker/abc123\n",
+			v2:          false,
+			containerID: "abc123",
+			wantErr:     true,
 		},
 		{
 			name:       "v1 host ignores the unified hierarchy line",
@@ -87,7 +93,7 @@ func TestResolveCgroupCpuFile(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f, err := resolveCgroupCpuFile(tt.procCgroup, tt.v2)
+			f, err := resolveCgroupCpuFile(tt.procCgroup, tt.v2, tt.containerID)
 			if tt.wantErr {
 				if err == nil {
 					t.Errorf("expected an error, got %q", f)

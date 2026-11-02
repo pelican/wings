@@ -125,7 +125,7 @@ func (e *Environment) InSituUpdate() error {
 	// The kernel rejects a CFS quota lower than the current burst, so remove the
 	// burst before updating the limits and re-apply it afterwards.
 	if c.State != nil {
-		e.clearCpuBurst(c.State.Pid)
+		e.clearCpuBurst(c.ID, c.State.Pid)
 	}
 
 	// CPU pinning cannot be removed once it is applied to a container. The same is true
@@ -135,8 +135,6 @@ func (e *Environment) InSituUpdate() error {
 	if _, err := e.client.ContainerUpdate(ctx, e.Id, container.UpdateConfig{
 		Resources: e.Configuration.Limits().AsContainerResources(),
 	}); err != nil {
-		return errors.Wrap(err, "environment/docker: could not update container")
-        e.applyCpuBurst(ctx)
 		return errors.Wrap(err, "environment/docker: could not update container")
 	}
 	e.applyCpuBurst(ctx)
