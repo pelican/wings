@@ -18,7 +18,6 @@ import (
 	"github.com/pelletier/go-toml/v2"
 	"github.com/tidwall/pretty"
 	"gopkg.in/ini.v1"
-	"gopkg.in/yaml.v3"
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/internal/ufs"
@@ -483,37 +482,14 @@ func (f *ConfigurationFile) parseYamlFile(file ufs.File) error {
 		return err
 	}
 
-	i := make(map[string]interface{})
-	if err := yaml.Unmarshal(b, &i); err != nil {
-		return err
-	}
-
-	// Unmarshal the yaml data into a JSON interface such that we can work with
-	// any arbitrary data structure. This allows us to use gjson/sjson for
-	// working with unknown JSON significantly easier.
-	jsonBytes, err := json.Marshal(dyno.ConvertMapI2MapS(i))
+	// Apply the replacements while preserving the layout, comments and key order
+	// of the original file. See updateYaml for details.
+	marshaled, changed, err := f.updateYaml(b)
 	if err != nil {
 		return err
 	}
-
-	// Now that the data is converted, treat it just like JSON and pass it to the
-	// iterator function to update values as necessary.
-	data, err := f.IterateOverJson(jsonBytes)
-	if err != nil {
-		return err
-	}
-
-	var jsonData interface{}
-	yamlDecoder := json.NewDecoder(bytes.NewReader(data))
-	yamlDecoder.UseNumber()
-	if err := yamlDecoder.Decode(&jsonData); err != nil {
-		return err
-	}
-	jsonData = normalizeYamlTypes(jsonData)
-
-	marshaled, err := yaml.Marshal(jsonData)
-	if err != nil {
-		return err
+	if !changed {
+		return nil
 	}
 
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
