@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"runtime"
 	"sync"
 	"time"
@@ -196,10 +195,17 @@ func (m *Manager) InitServer(data remote.ServerConfigurationResponse) (*Server, 
 		return nil, errors.WithStackIf(err)
 	}
 
-	s.fs, err = filesystem.New(filepath.Join(config.Get().System.Data, s.ID()), s.DiskSpace(), s.Config().Egg.FileDenylist)
+	d, err := s.EnsureDataDirectoryExists()
 	if err != nil {
-		return nil, errors.WithStackIf(err)
+		return nil, err
 	}
+
+	fs, err := filesystem.New(d, s.DiskSpace(), s.Config().Egg.FileDenylist)
+	if err != nil {
+		return nil, err
+	}
+
+	s.fs = fs
 
 	// if quotas are enabled ensure quotas are configured
 	if config.Get().System.Quotas.Enabled {

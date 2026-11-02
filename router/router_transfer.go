@@ -119,9 +119,11 @@ func postTransfers(c *gin.Context) {
 			if !successful && err != nil {
 				// Delete all extracted files.
 				go func(trnsfr *transfer.Transfer) {
-					_ = trnsfr.Server.Filesystem().UnixFS().Close()
-					if err := os.RemoveAll(trnsfr.Server.Filesystem().Path()); err != nil && !os.IsNotExist(err) {
-						trnsfr.Log().WithError(err).Warn("failed to delete local server files")
+					_ = trnsfr.Server.Filesystem().Close()
+					if err := os.RemoveAll(trnsfr.Server.Filesystem().Path()); err != nil {
+						if !errors.Is(err, os.ErrNotExist) {
+							trnsfr.Log().WithError(err).Warn("failed to delete local server files")
+						}
 					}
 				}(trnsfr)
 			}
@@ -194,7 +196,7 @@ out:
 				trnsfr.Log().Debug("received archive")
 				hasArchive = true
 
-				if err := trnsfr.Server.EnsureDataDirectoryExists(); err != nil {
+				if _, err := trnsfr.Server.EnsureDataDirectoryExists(); err != nil {
 					middleware.CaptureAndAbort(c, err)
 					return
 				}
