@@ -60,6 +60,12 @@ var (
 // in areas that might already be locked, so we don't want to crash the process.
 var _writeLock sync.Mutex
 
+// ErrTokenEnvMismatch is returned by ResolveToken in strict mode when the
+// WINGS_TOKEN / WINGS_TOKEN_ID environment override differs from the token in
+// the configuration. The environment values are still resolved into c.Token,
+// so the override keeps winning at runtime.
+var ErrTokenEnvMismatch = errors.New("config: token does not match environment override")
+
 // SftpConfiguration defines the configuration of the internal SFTP server.
 type SftpConfiguration struct {
 	// The bind address of the SFTP server.

@@ -257,8 +257,15 @@ func postUpdateConfiguration(c *gin.Context) {
 	// not part of the payload sent by the Panel, so it has to be re-resolved from
 	// the new token values.
 	if err := cfg.ResolveToken(true); err != nil {
-		middleware.CaptureAndAbort(c, err)
-		return
+		if !errors.Is(err, config.ErrTokenEnvMismatch) {
+			middleware.CaptureAndAbort(c, err)
+			return
+		}
+		// An environment override pins the credentials and keeps winning at
+		// runtime. Rejecting the push would leave the Panel and Wings permanently
+		// out of sync after a token reset, so accept and persist the Panel's
+		// configuration and tell the operator that the override is stale.
+		log.WithField("error", err).Warn("the Panel pushed a token that differs from the WINGS_TOKEN/WINGS_TOKEN_ID environment override; the override is still in use, update or remove it to use the new token")
 	}
 
 	// Refuse to go any further with a token we could never authenticate against.
