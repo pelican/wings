@@ -501,6 +501,14 @@ func postServerDecompressFiles(c *gin.Context) {
 	s := middleware.ExtractServer(c)
 	lg := middleware.ExtractLogger(c).WithFields(log.Fields{"root_path": data.RootPath, "file": data.File})
 
+	// Refuse an archive that does not fit before writing anything, as main does,
+	// rather than stopping at the limit with part of it extracted.
+	lg.Debug("checking if space is available for file decompression")
+	if err := s.Filesystem().SpaceAvailableForDecompression(context.Background(), data.RootPath, data.File); err != nil {
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
+
 	lg.Info("starting file decompression")
 	if err := s.Filesystem().DecompressFile(context.Background(), data.RootPath, data.File); err != nil {
 		// If the file is busy for some reason just return a nicer error to the user since there is not

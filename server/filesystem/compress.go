@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	iofs "io/fs"
+	"math"
 	"os"
 	"path"
 	"path/filepath"
@@ -251,6 +252,64 @@ type limitedFile struct {
 
 func (f *limitedFile) Read(p []byte) (int, error) {
 	return f.r.Read(p)
+}
+
+// SpaceAvailableForDecompression returns an ErrCodeDiskSpace error when the files
+// in the archive do not fit in the space the server has left, before anything is
+// written, so a request that cannot fit fails without leaving half an archive
+// behind. This is the check main makes.
+//
+// The sizes come from the archive's own headers, which can be wrong (a zip can
+// claim any size). That is fine: every write during the decompression still goes
+// through a quota-tracked handle, which stops at the limit whatever the headers
+// said. Single-file compression (.gz, .xz and so on) is not checked here because
+// its size is not known without decompressing it; the per-write limit covers it.
+func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir string, file string) error {
+	// Nothing to check when the server has no limit.
+	if fs.MaxDisk() <= 0 {
+		return nil
+	}
+
+	f, _, err := fs.File(filepath.Join(dir, file))
+	if err != nil {
+		return errors.Wrap(err, "server/filesystem: decompress: failed to open file")
+	}
+	defer f.Close()
+
+	format, input, err := archives.Identify(ctx, filepath.Base(file), f)
+	if err != nil {
+		if errors.Is(err, archives.NoMatch) {
+			return newFilesystemError(ErrCodeUnknownArchive, err)
+		}
+		return errors.Wrap(err, "server/filesystem: decompress: failed to identify archive format")
+	}
+	ex, ok := format.(archives.Extractor)
+	if !ok {
+		return nil
+	}
+
+	var total int64
+	err = ex.Extract(ctx, input, func(_ context.Context, fi archives.FileInfo) error {
+		size := fi.Size()
+		if size <= 0 || !fi.Mode().IsRegular() {
+			return nil
+		}
+		if size > math.MaxInt64-total {
+			return newFilesystemError(ErrCodeDiskSpace, nil)
+		}
+		total += size
+		if !fs.quota.CanFit(total) {
+			return newFilesystemError(ErrCodeDiskSpace, nil)
+		}
+		return nil
+	})
+	if err != nil {
+		if IsErrorCode(err, ErrCodeDiskSpace) {
+			return err
+		}
+		return errors.Wrap(err, "server/filesystem: decompress: failed to read archive")
+	}
+	return nil
 }
 
 // DecompressFile will decompress a file in a given directory by using the

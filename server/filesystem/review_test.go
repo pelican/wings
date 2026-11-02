@@ -1,6 +1,7 @@
 package filesystem
 
 import (
+	"archive/tar"
 	"bytes"
 	"compress/gzip"
 	"context"
@@ -268,5 +269,57 @@ func TestFilesystem_ChmodKeepsSetgidAndSticky(t *testing.T) {
 	}
 	if st.Mode()&os.ModeSetgid == 0 || st.Mode()&os.ModeSticky == 0 {
 		t.Errorf("expected setgid and sticky, got %v", st.Mode())
+	}
+}
+
+// tarGz returns a .tar.gz holding one file of the given size. Zeros compress to
+// almost nothing, so the archive is tiny while its contents are not.
+func tarGz(t *testing.T, name string, size int) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	gw := gzip.NewWriter(&b)
+	tw := tar.NewWriter(gw)
+	if err := tw.WriteHeader(&tar.Header{Name: name, Mode: 0o644, Size: int64(size), Typeflag: tar.TypeReg}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tw.Write(make([]byte, size)); err != nil {
+		t.Fatal(err)
+	}
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := gw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return b.Bytes()
+}
+
+// An archive whose contents do not fit is refused before anything is written,
+// as on main; one that fits is allowed.
+func TestFilesystem_SpaceAvailableForDecompression(t *testing.T) {
+	fs := NewFs()
+	defer fs.reset()
+
+	fs.write("big.tar.gz", tarGz(t, "big.bin", 256*1024))
+	fs.write("small.tar.gz", tarGz(t, "small.bin", 1024))
+	fs.SetDiskLimit(64 * 1024)
+	if _, err := fs.updateCachedDiskUsage(); err != nil {
+		t.Fatal(err)
+	}
+
+	err := fs.SpaceAvailableForDecompression(context.Background(), "/", "big.tar.gz")
+	if !IsErrorCode(err, ErrCodeDiskSpace) {
+		t.Fatalf("expected ErrCodeDiskSpace for big.tar.gz, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(fs.rootPath, "big.bin")); !os.IsNotExist(err) {
+		t.Errorf("expected nothing to be written, got %v", err)
+	}
+	if err := fs.SpaceAvailableForDecompression(context.Background(), "/", "small.tar.gz"); err != nil {
+		t.Errorf("expected small.tar.gz to fit, got %v", err)
+	}
+
+	fs.write("notes.txt", []byte("not an archive"))
+	if err := fs.SpaceAvailableForDecompression(context.Background(), "/", "notes.txt"); !IsErrorCode(err, ErrCodeUnknownArchive) {
+		t.Errorf("expected ErrCodeUnknownArchive for a text file, got %v", err)
 	}
 }
