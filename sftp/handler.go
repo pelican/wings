@@ -203,6 +203,22 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		l = l.WithField("target", request.Target)
 	}
 
+	// Enforce the egg file denylist on the source path before performing any
+	// operation. Without this, a user with file.update/file.delete could modify,
+	// rename, delete or symlink denylisted files.
+	if err := h.fs.IsIgnored(request.Filepath); err != nil {
+		return sftp.ErrSSHFxNoSuchFile
+	}
+
+	// Also check the target path (Rename/Symlink). Otherwise a denylisted file could be
+	// renamed to a non-matching path, which would defeat the Fileread/Filewrite checks.
+	if request.Target != "" {
+		if err := h.fs.IsIgnored(request.Target); err != nil {
+			return sftp.ErrSSHFxPermissionDenied
+		}
+	}
+
+
 	switch request.Method {
 	// Allows a user to make changes to the permissions of a given file or directory
 	// on their server using their SFTP client.

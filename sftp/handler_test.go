@@ -9,7 +9,9 @@ import (
 	"github.com/apex/log"
 	pkgsftp "github.com/pkg/sftp"
 
+	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/server"
+	"github.com/pelican/wings/server/filesystem"
 )
 
 type writeAtFunc func([]byte, int64) (int, error)
@@ -142,12 +144,18 @@ func TestWriterForwardsWritesWhenServerIsAvailable(t *testing.T) {
 }
 
 func TestHandlerRejectsMalformedSetstatAttributes(t *testing.T) {
+	config.Set(&config.Configuration{AuthenticationToken: "test-token"})
 	srv, err := server.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs, err := filesystem.New(t.TempDir(), 0, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	h := Handler{
 		server:      srv,
+		fs:          fs,
 		permissions: []string{PermissionFileUpdate},
 		logger:      log.WithField("test", t.Name()),
 	}
