@@ -152,7 +152,11 @@ func SetCpuBurst(ctx context.Context, cli *client.Client, containerID string, qu
 // applyCpuBurst applies the configured CFS burst to the environment's container
 // using its current CPU limit.
 func (e *Environment) applyCpuBurst(ctx context.Context) {
-	quota := e.Configuration.Limits().CpuLimit * config.Get().Docker.CpuPeriodMicroseconds() / 100
+	//quota := e.Configuration.Limits().CpuLimit * config.Get().Docker.CpuPeriodMicroseconds() / 100
+	
+	// applyCpuBurst applies the configured CFS burst to the environment's container
+	// using the same CPU quota that is applied to the container itself.
+	quota := e.Configuration.Limits().AsContainerResources().CPUQuota
 	SetCpuBurst(ctx, e.client, e.Id, quota)
 }
 
