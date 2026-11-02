@@ -31,7 +31,7 @@ func NewFs() *testFs {
 		},
 	})
 
-	tmpDir, err := os.MkdirTemp(os.TempDir(), "pelican")
+	tmpDir, err := os.MkdirTemp(testTempDir(), "pelican")
 	if err != nil {
 		panic(err)
 	}
@@ -48,6 +48,16 @@ func NewFs() *testFs {
 	return tfs
 }
 
+// testTempDir returns the system temp directory with symlinks resolved, so the
+// paths compared below match on macOS, where it lives under /var -> /private/var.
+func testTempDir() string {
+	d := os.TempDir()
+	if resolved, err := filepath.EvalSymlinks(d); err == nil {
+		d = resolved
+	}
+	return d
+}
+
 func getFileContent(file *os.File) string {
 	var w bytes.Buffer
 	if _, err := bufio.NewReader(file).WriteTo(&w); err != nil {
@@ -60,7 +70,7 @@ func (tfs *testFs) reset() {
 	if err := tfs.root.Close(); err != nil {
 		panic(err)
 	}
-	if !strings.HasPrefix(tfs.tmpDir, "/tmp/pelican") {
+	if !strings.HasPrefix(tfs.tmpDir, filepath.Join(testTempDir(), "pelican")) {
 		panic("filesystem_test: attempting to delete outside root directory: " + tfs.tmpDir)
 	}
 
