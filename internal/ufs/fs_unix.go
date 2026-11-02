@@ -644,7 +644,7 @@ func (fs *UnixFS) ReplaceWithSymlink(oldpath, newpath string, uid, gid int) (Fil
 		if _, err := rand.Read(suffix); err != nil {
 			return nil, err
 		}
-		tmp = "." + name + ".wings-" + hex.EncodeToString(suffix)
+		tmp = ".wings-" + hex.EncodeToString(suffix)
 		err := ignoringEINTR(func() error {
 			// We aren't concerned with oldpath here as a symlink can point
 			// anywhere it wants.
