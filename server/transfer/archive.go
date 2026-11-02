@@ -14,6 +14,7 @@ import (
 	"github.com/apex/log"
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/internal/progress"
+	"github.com/pelican/wings/server/backup"
 	"github.com/pelican/wings/server/filesystem"
 )
 
@@ -39,6 +40,14 @@ func (a *Archive) StreamBackups(ctx context.Context, mp *multipart.Writer) error
 	if len(a.transfer.BackupUUIDs) == 0 {
 		a.transfer.Log().Debug("no backups specified for transfer")
 		return nil
+	}
+
+	// Move any of the requested backups still stored in the legacy location into
+	// the server's backup directory so they are included in the transfer.
+	for _, id := range a.transfer.BackupUUIDs {
+		if err := backup.NewLocal(nil, id, a.transfer.Server.ID(), "").MigrateLegacy(); err != nil {
+			a.transfer.Log().WithField("backup", id).WithField("error", err).Warn("failed to move backup from legacy location")
+		}
 	}
 
 	cfg := config.Get()
