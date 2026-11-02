@@ -1,6 +1,8 @@
 package server
 
 import (
+	"errors"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
@@ -97,10 +99,15 @@ func (s *Server) customMounts() []environment.Mount {
 			}
 
 			mounted = true
+			device, err := isDevicePath(source)
+			if err != nil {
+				logger.WithField("error", err).Warn("failed to check if custom server mount is a device, mounting it without device access")
+			}
 			mounts = append(mounts, environment.Mount{
 				Source:   source,
 				Target:   target,
 				ReadOnly: m.ReadOnly,
+				Device:   device,
 			})
 
 			break
@@ -112,4 +119,46 @@ func (s *Server) customMounts() []environment.Mount {
 	}
 
 	return mounts
+}
+
+// isDevicePath returns true if the path is a device node, or a directory under /dev
+// containing at least one device node (e.g. /dev/dri). A symlinked path is resolved
+// first, but symlinks inside a directory are not followed. Directories outside of /dev
+// are never walked, so that regular data mounts are not scanned on every sync. A missing
+// path is not a device; any other error while inspecting the path is returned.
+func isDevicePath(path string) (bool, error) {
+	// WalkDir does not follow a symlinked root, so resolve it before walking.
+	path, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	st, err := os.Stat(path)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if st.Mode()&os.ModeDevice != 0 {
+		return true, nil
+	}
+	if !st.IsDir() || (path != "/dev" && !strings.HasPrefix(path, "/dev/")) {
+		return false, nil
+	}
+
+	found := false
+	err = filepath.WalkDir(path, func(_ string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.Type()&os.ModeDevice != 0 {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found, err
 }

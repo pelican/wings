@@ -234,6 +234,9 @@ func (e *Environment) Create() error {
 		}
 	}
 
+	resources := e.Configuration.Limits().AsContainerResources()
+	resources.Devices = e.convertDevices()
+
 	hostConf := &container.HostConfig{
 		PortBindings: a.DockerBindings(),
 
@@ -249,7 +252,7 @@ func (e *Environment) Create() error {
 
 		// Define resource limits for the container based on the data passed through
 		// from the Panel.
-		Resources: e.Configuration.Limits().AsContainerResources(),
+		Resources: resources,
 
 		DNS: cfg.Docker.Network.Dns,
 
@@ -471,6 +474,30 @@ func (e *Environment) convertMounts() []mount.Mount {
 			Target:   m.Target,
 			ReadOnly: m.ReadOnly,
 		}
+	}
+	return out
+}
+
+// convertDevices returns the device mappings for any mounts that point to device nodes.
+// Docker expands a directory source (e.g. /dev/dri) into every device node it contains,
+// but skips anything else in it, so device mounts are still bind mounted as well (see
+// convertMounts) to keep regular files and symlinks such as /dev/dri/by-path available.
+// The device mappings are what grant the container cgroup access to the devices.
+func (e *Environment) convertDevices() []container.DeviceMapping {
+	var out []container.DeviceMapping
+	for _, m := range e.Configuration.Mounts() {
+		if !m.Device {
+			continue
+		}
+		perms := "rwm"
+		if m.ReadOnly {
+			perms = "rm"
+		}
+		out = append(out, container.DeviceMapping{
+			PathOnHost:        m.Source,
+			PathInContainer:   m.Target,
+			CgroupPermissions: perms,
+		})
 	}
 	return out
 }
