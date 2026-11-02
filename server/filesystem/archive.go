@@ -292,10 +292,13 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		// the logs, but we're not going to stop the backup. There are far too many cases of
 		// symlinks causing all sorts of unnecessary pain in this process. Sucks to suck if
 		// it doesn't work.
-		target, err = os.Readlink(s.Name())
+		//
+		// The link must be read relative to its parent directory descriptor; reading it by
+		// its bare name would resolve against the working directory of the Wings process.
+		target, err = a.Filesystem.unixFS.Readlinkat(dirfd, name)
 		if err != nil {
 			// Ignore the not exist errors specifically, since there is nothing important about that.
-			if !os.IsNotExist(err) {
+			if !errors.Is(err, ufs.ErrNotExist) {
 				log.WithField("name", name).WithField("readlink_err", err.Error()).Warn("failed reading symlink for target path; skipping...")
 			}
 			return nil
@@ -308,10 +311,9 @@ func (a *Archive) addToArchive(dirfd int, name, relative string, entry ufs.DirEn
 		return errors.WrapIff(err, "failed to get tar#FileInfoHeader for '%s'", name)
 	}
 
-	// Fix the header name if the file is not a symlink.
-	if s.Mode()&fs.ModeSymlink == 0 {
-		header.Name = relative
-	}
+	// FileInfoHeader only knows the base name of the entry, so always store the full
+	// path relative to the server root.
+	header.Name = relative
 
 	// Write the tar FileInfoHeader to the archive.
 	if err := a.w.WriteHeader(header); err != nil {

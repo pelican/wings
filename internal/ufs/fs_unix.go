@@ -529,6 +529,29 @@ func (fs *UnixFS) Lstatat(dirfd int, name string) (FileInfo, error) {
 	return fs._fstatat("lstatat", dirfd, name, AT_SYMLINK_NOFOLLOW)
 }
 
+// Readlinkat returns the destination of the symbolic link name, relative to
+// the directory referenced by dirfd. The link itself is never followed.
+//
+// If there is an error, it will be of type *PathError.
+func (fs *UnixFS) Readlinkat(dirfd int, name string) (string, error) {
+	for size := 128; ; size *= 2 {
+		b := make([]byte, size)
+		var n int
+		if err := ignoringEINTR(func() error {
+			var err error
+			n, err = unix.Readlinkat(dirfd, name, b)
+			return err
+		}); err != nil {
+			return "", ensurePathError(err, "readlinkat", name)
+		}
+		// A full buffer may mean the target was truncated, so retry with a
+		// larger buffer.
+		if n < size {
+			return string(b[:n]), nil
+		}
+	}
+}
+
 func (fs *UnixFS) fstat(name string, flags int) (FileInfo, error) {
 	return fs._fstat("fstat", name, flags)
 }

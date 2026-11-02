@@ -9,6 +9,7 @@ import (
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/docker/docker/client"
+	"github.com/mholt/archives"
 
 	"github.com/pelican/wings/environment"
 	"github.com/pelican/wings/remote"
@@ -158,6 +159,16 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	err = b.Restore(s.Context(), reader, func(file string, info fs.FileInfo, r io.ReadCloser) error {
 		defer r.Close()
 		s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
+		// Symbolic links have no content, recreate the link itself instead of
+		// writing an empty regular file in its place.
+		if info.Mode()&fs.ModeSymlink != 0 {
+			fi, ok := info.(archives.FileInfo)
+			if !ok || fi.LinkTarget == "" {
+				s.Log().WithField("file", file).Warn("skipping symlink without a target during backup restoration")
+				return nil
+			}
+			return s.Filesystem().RestoreSymlink(file, fi.LinkTarget)
+		}
 		// TODO: since this will be called a lot, it may be worth adding an optimized
 		// Write with Chtimes method to the UnixFS that is able to re-use the
 		// same dirfd and file name.

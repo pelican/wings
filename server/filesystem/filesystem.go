@@ -224,6 +224,33 @@ func (fs *Filesystem) Symlink(oldpath, newpath string) error {
 	return fs.unixFS.Symlink(oldpath, newpath)
 }
 
+// RestoreSymlink creates name as a symbolic link to target, creating any missing
+// parent directories and replacing an existing file or link at that path. It is
+// used when restoring archives that contain symbolic links. The target is stored
+// as-is; all filesystem access performed by Wings resolves paths beneath the
+// server root, so a link pointing outside of it cannot be followed by Wings.
+func (fs *Filesystem) RestoreSymlink(name, target string) error {
+	if err := fs.mkdirAll(filepath.Dir(filepath.Clean(name)), 0o755); err != nil {
+		return err
+	}
+
+	if st, err := fs.unixFS.Lstat(name); err == nil {
+		if st.IsDir() {
+			return errors.Errorf("filesystem: cannot replace directory '%s' with a symlink", name)
+		}
+		if err := fs.unixFS.Remove(name); err != nil {
+			return err
+		}
+	} else if !errors.Is(err, ufs.ErrNotExist) {
+		return err
+	}
+
+	if err := fs.unixFS.Symlink(target, name); err != nil {
+		return err
+	}
+	return fs.chownFile(name)
+}
+
 func (fs *Filesystem) chownFile(name string) error {
 	if fs.isTest {
 		return nil
