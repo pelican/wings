@@ -3,6 +3,7 @@ package filesystem
 import (
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"slices"
@@ -16,6 +17,7 @@ import (
 	"github.com/apex/log"
 	"github.com/gabriel-vasile/mimetype"
 	ignore "github.com/sabhiram/go-gitignore"
+	"golang.org/x/sys/unix"
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/internal/ufs"
@@ -152,6 +154,12 @@ func (fs *Filesystem) Writefile(p string, r io.Reader) error {
 	return err
 }
 
+// Write writes the contents of r to the file at p, creating or truncating it
+// as needed. newSize is the number of bytes that will be read from r and is
+// checked against the disk limit before anything is written. A negative
+// newSize means the size is not known ahead of time, in which case the disk
+// limit is enforced while the data is being written instead, and an existing
+// file at p is only replaced once all of the data has been written.
 func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode ufs.FileMode) error {
 	var currentSize int64
 	st, err := fs.unixFS.Stat(p)
@@ -178,6 +186,10 @@ func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode ufs.FileM
 	// chown the ones we add.
 	if err := fs.mkdirAll(filepath.Dir(p), 0o755); err != nil {
 		return err
+	}
+
+	if newSize < 0 {
+		return fs.writeUnknownSize(p, r, mode)
 	}
 
 	// Touch the file and return the handle to it at this point. This will
@@ -208,6 +220,75 @@ func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode ufs.FileM
 
 	// Return any remaining error.
 	return err
+}
+
+// writeUnknownSize writes r to p when the final size of the data is not known
+// up front. The data goes to a hidden temporary file next to p, with every
+// write checked against the disk limit, and is only renamed over p once all of
+// it has been written. If anything goes wrong, including the data not fitting
+// in the disk limit, the temporary file is removed and any existing file at p
+// is left untouched.
+func (fs *Filesystem) writeUnknownSize(p string, r io.Reader, mode ufs.FileMode) error {
+	dirfd, name, closeFd, err := fs.unixFS.SafePath(p)
+	defer closeFd()
+	if err != nil {
+		return err
+	}
+
+	tmpName := "." + name + "." + strconv.FormatUint(rand.Uint64(), 36) + ".tmp"
+	file, err := fs.unixFS.OpenFileat(dirfd, tmpName, ufs.O_RDWR|ufs.O_CREATE|ufs.O_EXCL, mode)
+	if err != nil {
+		return err
+	}
+
+	dst := newQuotaFile(fs, file, 0)
+	_, err = io.Copy(dst, r)
+	if closeErr := dst.Close(); err == nil {
+		err = closeErr
+	}
+	if err == nil && !fs.isTest {
+		err = fs.unixFS.Lchownat(dirfd, tmpName, config.Get().System.User.Uid, config.Get().System.User.Gid)
+	}
+	if err == nil {
+		err = fs.replaceFile(dirfd, tmpName, name)
+	}
+	if err != nil {
+		fs.removeTempFile(dirfd, tmpName)
+		return err
+	}
+	return nil
+}
+
+// replaceFile atomically renames tmpName over name within dirfd, releasing the
+// disk space used by the file that gets replaced.
+func (fs *Filesystem) replaceFile(dirfd int, tmpName, name string) error {
+	var replacedSize int64
+	st, err := fs.unixFS.Lstatat(dirfd, name)
+	if err != nil && !errors.Is(err, ufs.ErrNotExist) {
+		return err
+	} else if err == nil && st.Mode().IsRegular() {
+		replacedSize = st.Size()
+	}
+
+	if err := unix.Renameat(dirfd, tmpName, dirfd, name); err != nil {
+		return &ufs.LinkError{Op: "rename", Old: tmpName, New: name, Err: err}
+	}
+	fs.unixFS.Add(-replacedSize)
+	return nil
+}
+
+// removeTempFile removes a temporary file created by writeUnknownSize and
+// releases the disk space that was reserved while writing it.
+func (fs *Filesystem) removeTempFile(dirfd int, tmpName string) {
+	st, err := fs.unixFS.Lstatat(dirfd, tmpName)
+	if err != nil {
+		return
+	}
+	if err := unix.Unlinkat(dirfd, tmpName, 0); err != nil {
+		log.WithField("file", tmpName).WithField("error", err).Warn("failed to remove temporary file")
+		return
+	}
+	fs.unixFS.Add(-st.Size())
 }
 
 // CreateDirectory creates a new directory (name) at a specified path (p) for
