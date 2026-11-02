@@ -32,7 +32,9 @@ import (
 	"github.com/pelican/wings/environment"
 	"github.com/pelican/wings/internal/cron"
 	"github.com/pelican/wings/internal/database"
+	"github.com/pelican/wings/internal/pluginbridge"
 	"github.com/pelican/wings/loggers/cli"
+	"github.com/pelican/wings/plugins"
 	"github.com/pelican/wings/remote"
 	"github.com/pelican/wings/router"
 	"github.com/pelican/wings/server"
@@ -188,6 +190,18 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 		return
 	}
 
+	// Bring the plugin subsystem up. Discovery happens here rather than with
+	// loading so the management endpoints can report a plugin that fails to
+	// load, along with the reason. Nothing is loaded yet: a plugin may
+	// register recurring jobs, and the scheduler does not exist until later.
+	pluginManager := plugins.NewManager(config.Get().Plugins, pluginbridge.New(manager), database.Instance())
+	plugins.SetManager(pluginManager)
+	defer pluginManager.Shutdown()
+
+	if err := pluginManager.Discover(); err != nil {
+		log.WithField("error", err).Error("failed to scan the plugin directory")
+	}
+
 	if err := environment.ConfigureDocker(cmd.Context()); err != nil {
 		log.WithField("error", err).Fatal("failed to configure docker environment")
 		return
@@ -322,6 +336,14 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	} else {
 		log.WithField("subsystem", "cron").Info("starting cron processes")
 		s.Start()
+
+		// Plugins are loaded last, with the scheduler available so a plugin
+		// registering a job gets it scheduled, and with every server already
+		// booted so a plugin's Init can see them.
+		pluginManager.SetJobScheduler(cron.PluginScheduler(s))
+		if err := pluginManager.LoadEnabled(); err != nil {
+			log.WithField("error", err).Error("failed to load plugins")
+		}
 	}
 
 	go func() {
@@ -535,12 +557,12 @@ var pelicanRowHues = [6]hue{
 
 var (
 	hueLightCyan = hue{103, 232, 249, 123} // #67E8F9 — W I N G S letters
-	hueTeal      = hue{22, 78, 99, 23}      // #164E63 — rule end caps
-	hueCyan      = hue{34, 211, 238, 51}    // #22D3EE — ▸ accents / URLs
-	hueDim       = hue{107, 114, 128, 243}  // #6B7280 — version / descriptions
-	hueGray      = hue{156, 163, 175, 247}  // #9CA3AF — tagline
-	hueWhite     = hue{244, 244, 245, 255}  // #F4F4F5 — link labels
-	hueYellow    = hue{250, 204, 21, 226}   // #FACC15 — star CTA
+	hueTeal      = hue{22, 78, 99, 23}     // #164E63 — rule end caps
+	hueCyan      = hue{34, 211, 238, 51}   // #22D3EE — ▸ accents / URLs
+	hueDim       = hue{107, 114, 128, 243} // #6B7280 — version / descriptions
+	hueGray      = hue{156, 163, 175, 247} // #9CA3AF — tagline
+	hueWhite     = hue{244, 244, 245, 255} // #F4F4F5 — link labels
+	hueYellow    = hue{250, 204, 21, 226}  // #FACC15 — star CTA
 )
 
 // printLogo renders the wings startup banner once, before log output begins:

@@ -12,6 +12,8 @@ import (
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
 	"github.com/pelican/wings/internal/models"
+	"github.com/pelican/wings/plugins"
+	"github.com/pelican/wings/plugins/api"
 )
 
 type CrashHandler struct {
@@ -82,6 +84,14 @@ func (s *Server) handleServerCrash() error {
 	s.PublishConsoleOutputFromDaemon(fmt.Sprintf("Out of memory: %t", oomKilled))
 
 	c := s.crasher.LastCrashTime()
+
+	// Read before SetLastCrash below replaces it, so the hook sees the
+	// previous crash rather than this one.
+	var lastCrashUnix int64
+	if !c.IsZero() {
+		lastCrashUnix = c.Unix()
+	}
+
 	timeout := config.Get().System.CrashDetection.Timeout
 
 	// If the last crash time was within the last `timeout` seconds we do not want to perform
@@ -101,6 +111,32 @@ func (s *Server) handleServerCrash() error {
 	})
 
 	s.crasher.SetLastCrash(time.Now())
+
+	snapshot := s.PluginSnapshot()
+
+	plugins.Lifecycle(api.Lifecycle{
+		Server:    snapshot,
+		Event:     api.ServerCrashed,
+		ExitCode:  int(exitCode),
+		OOMKilled: oomKilled,
+	})
+
+	// Ask plugins whether this one should come back up. Wings has already
+	// decided the crash is worth restarting from; this is for policy it cannot
+	// know, such as a maintenance window or a crash the logs say a restart
+	// will not fix.
+	if allow, reason := plugins.GateCrashRestart(api.CrashInfo{
+		Server:        snapshot,
+		ExitCode:      int(exitCode),
+		OOMKilled:     oomKilled,
+		LastCrashUnix: lastCrashUnix,
+		Logs:          logs,
+	}); !allow {
+		s.PublishConsoleOutputFromDaemon(reason)
+		s.Log().WithField("reason", reason).Info("a plugin declined the automatic restart after a crash")
+
+		return nil
+	}
 
 	return errors.Wrap(s.HandlePowerAction(PowerActionStart), "failed to start server after crash detection")
 }

@@ -70,6 +70,38 @@ func Configure(m *wserver.Manager, client remote.Client) *gin.Engine {
 	protected.GET("/api/system/ips", getSystemIps)
 	protected.GET("/api/system/utilization", getSystemUtilization)
 	protected.GET("/api/servers", getAllServers)
+
+	// Plugin management. These mirror the Panel's own plugin endpoints, so the
+	// admin UI can list, enable, disable and uninstall a node's plugins the
+	// same way it does the Panel's.
+	pluginRoutes := router.Group("/api/plugins")
+	pluginRoutes.Use(middleware.RequireAuthorization())
+	{
+		pluginRoutes.GET("", getPlugins)
+		pluginRoutes.POST("/import", postPluginImport)
+		pluginRoutes.POST("/order", postPluginOrder)
+
+		pluginRoutes.GET("/:plugin", getPlugin)
+		pluginRoutes.GET("/:plugin/source", getPluginSource)
+		pluginRoutes.PUT("/:plugin/settings", putPluginSettings)
+
+		pluginRoutes.POST("/:plugin/install", postPluginInstall)
+		pluginRoutes.POST("/:plugin/update", postPluginUpdate)
+		pluginRoutes.POST("/:plugin/uninstall", postPluginUninstall)
+		pluginRoutes.POST("/:plugin/enable", postPluginEnable)
+		pluginRoutes.POST("/:plugin/disable", postPluginDisable)
+
+		// Routes plugins registered for themselves, mounted as a catch-all
+		// because Gin cannot be given new routes once it is serving and
+		// enabling a plugin must not need a restart.
+		//
+		// They sit under "/http" rather than directly under the plugin, because
+		// Gin refuses a catch-all beside static siblings: "/:plugin/*path"
+		// conflicts with "/:plugin/enable" and the rest. The extra segment also
+		// keeps the management verbs above reserved, so a plugin registering a
+		// route called "enable" cannot shadow one.
+		pluginRoutes.Any("/:plugin/http/*path", pluginRouteHandler(false))
+	}
 	protected.POST("/api/servers", postCreateServer)
 	protected.DELETE("/api/transfers/:server", deleteTransfer)
 	protected.POST("/api/deauthorize-user", postDeauthorizeUser)
@@ -98,6 +130,13 @@ func Configure(m *wserver.Manager, client remote.Client) *gin.Engine {
 
 		// Deletes all backups for a server
 		server.DELETE("deleteAllBackups", deleteAllServerBackups)
+
+		// Server scoped routes a plugin registered. The server is resolved by
+		// the group's middleware, so a plugin never sees a request for a
+		// server that is not on this node. The "/http" segment matches the
+		// node scoped mount above so a plugin's routes are addressed the same
+		// way in both scopes.
+		server.Any("/plugins/:plugin/http/*path", pluginRouteHandler(true))
 
 		files := server.Group("/files")
 		{

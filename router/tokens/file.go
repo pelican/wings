@@ -8,7 +8,7 @@ type FilePayload struct {
 	jwt.Payload
 	FilePath   string `json:"file_path"`
 	ServerUuid string `json:"server_uuid"`
-	UserUuid   string `json:"user_uuid"`	
+	UserUuid   string `json:"user_uuid"`
 	UniqueId   string `json:"unique_id"`
 	Scoped
 }
@@ -25,7 +25,6 @@ func (p *FilePayload) GetPayload() *jwt.Payload {
 func (p *FilePayload) IsUniqueRequest() bool {
 	return getTokenStore().IsValidToken(p.UniqueId)
 }
-
 
 // Denylisted returns true if this token was issued before the user's access to
 // the server was revoked.

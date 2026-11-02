@@ -270,6 +270,11 @@ func (e *Environment) Create() error {
 		UsernsMode:  container.UsernsMode(cfg.Docker.UsernsMode),
 	}
 
+	// Let plugins shape the container before it is created. This runs on every
+	// boot rather than only the first, so a plugin's changes survive a
+	// container being recreated.
+	applyPluginContainerPatch(e.Id, conf, hostConf)
+
 	var netConf *network.NetworkingConfig = nil //In case when no networking config is needed set nil
 	var serverNetConfig = config.Get().Docker.Network
 	if "macvlan" == serverNetConfig.Driver { //Generate networking config for macvlan driver

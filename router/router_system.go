@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"slices"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -13,6 +14,8 @@ import (
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/internal/diagnostics"
+	"github.com/pelican/wings/plugins"
+	"github.com/pelican/wings/plugins/api"
 	"github.com/pelican/wings/router/middleware"
 	"github.com/pelican/wings/router/tokens"
 	"github.com/pelican/wings/server"
@@ -84,7 +87,68 @@ func getDiagnostics(c *gin.Context) {
 		return
 	}
 
+	report += pluginDiagnostics()
+
 	c.Data(http.StatusOK, "text/plain; charset=utf-8", []byte(report))
+}
+
+// pluginDiagnostics renders what each enabled plugin wants included in the
+// node's diagnostics report.
+//
+// Anything going wrong with a node running plugins is going to raise the
+// question of which plugins, so the report says which are enabled even when
+// none of them contributes anything of its own.
+func pluginDiagnostics() string {
+	m := plugins.Active()
+	if m == nil || !m.Enabled() {
+		return ""
+	}
+
+	var b strings.Builder
+	b.WriteString("\n\n------------ Plugins ------------\n")
+
+	var enabled []*plugins.Instance
+	for _, inst := range m.All() {
+		if inst.Status() == plugins.StatusEnabled {
+			enabled = append(enabled, inst)
+		}
+	}
+
+	if len(enabled) == 0 {
+		b.WriteString("no plugins are enabled on this node\n")
+		return b.String()
+	}
+
+	for _, inst := range enabled {
+		manifest := inst.Manifest()
+		b.WriteString("\n" + manifest.ID + " " + manifest.Version)
+		if m.IsTrusted(manifest.ID) {
+			b.WriteString(" (trusted)")
+		}
+		b.WriteString("\n")
+	}
+
+	// Sections a plugin contributes itself, which is where a plugin author
+	// puts whatever someone debugging it would want to see.
+	for id, fields := range plugins.Diagnostics() {
+		if len(fields) == 0 {
+			continue
+		}
+
+		b.WriteString("\n[" + id + "]\n")
+
+		keys := make([]string, 0, len(fields))
+		for k := range fields {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+
+		for _, k := range keys {
+			b.WriteString("  " + k + ": " + fields[k] + "\n")
+		}
+	}
+
+	return b.String()
 }
 
 // Returns list of host machine IP addresses
@@ -183,6 +247,13 @@ func postCreateServer(c *gin.Context) {
 	// Plop that server instance onto the request so that it can be referenced in
 	// requests from here-on out.
 	manager.Add(install.Server())
+
+	// Reported once the server exists on the node but before its install runs,
+	// so a plugin can prepare anything the install will need.
+	plugins.Lifecycle(api.Lifecycle{
+		Server: install.Server().PluginSnapshot(),
+		Event:  api.ServerCreated,
+	})
 
 	// Begin the installation process in the background to not block the request
 	// cycle. If there are any errors they will be logged and communicated back

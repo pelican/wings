@@ -24,6 +24,8 @@ import (
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
+	"github.com/pelican/wings/plugins"
+	"github.com/pelican/wings/plugins/api"
 	"github.com/pelican/wings/remote"
 	"github.com/pelican/wings/system"
 )
@@ -39,6 +41,23 @@ func (s *Server) Install() error {
 }
 
 func (s *Server) install(reinstall bool) error {
+	snapshot := s.PluginSnapshot()
+
+	// Ask plugins before anything is touched. An install wipes and recreates
+	// the server's files, so this is the gate a plugin uses to hold back a
+	// reinstall that would destroy something it is responsible for.
+	if allow, reason := plugins.GateServerInstall(snapshot); !allow {
+		s.PublishConsoleOutputFromDaemon(reason)
+
+		plugins.Lifecycle(api.Lifecycle{
+			Server: snapshot,
+			Event:  api.ServerInstallFailed,
+			Error:  reason,
+		})
+
+		return errors.New(reason)
+	}
+
 	var err error
 	if !s.Config().SkipEggScripts {
 		// Send the start event so the Panel can automatically update. We don't
@@ -46,6 +65,7 @@ func (s *Server) install(reinstall bool) error {
 		// sorts of weird rapid UI behavior happens since there isn't an actual
 		// install process being executed.
 		s.Events().Publish(InstallStartedEvent, "")
+		plugins.Lifecycle(api.Lifecycle{Server: snapshot, Event: api.ServerInstallStarted})
 
 		err = s.internalInstall()
 	} else {
@@ -74,6 +94,15 @@ func (s *Server) install(reinstall bool) error {
 	// Push an event to the websocket, so we can auto-refresh the information in
 	// the panel once the installation is completed.
 	s.Events().Publish(InstallCompletedEvent, "")
+
+	// Reported after SyncInstallState, so a plugin reacting to a finished
+	// install sees the same outcome the Panel was told about.
+	lifecycle := api.Lifecycle{Server: s.PluginSnapshot(), Event: api.ServerInstallCompleted}
+	if err != nil {
+		lifecycle.Event = api.ServerInstallFailed
+		lifecycle.Error = err.Error()
+	}
+	plugins.Lifecycle(lifecycle)
 
 	return errors.WithStackIf(err)
 }
@@ -579,7 +608,17 @@ func (ip *InstallationProcess) StreamOutput(ctx context.Context, id string) erro
 	}
 	defer reader.Close()
 
-	err = system.ScanReader(reader, ip.Server.Sink(system.InstallSink).Push)
+	err = system.ScanReader(reader, func(line []byte) {
+		ip.Server.Sink(system.InstallSink).Push(line)
+
+		// Offer the line to plugins, so an install failure can be noticed by
+		// something other than a person reading the log afterwards. Unlike
+		// console output this cannot be rewritten: the install log is the
+		// record of what the script actually did.
+		if plugins.HasInstallOutputHooks() {
+			plugins.InstallOutput(ip.Server.PluginSnapshot(), string(line))
+		}
+	})
 	if err != nil && !errors.Is(err, context.Canceled) {
 		ip.Server.Log().WithFields(log.Fields{"container_id": id, "error": err}).Warn("error processing install output lines")
 	}

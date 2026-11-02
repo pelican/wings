@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"io"
 	iofs "io/fs"
-	"math"	
+	"math"
 	"path"
 	"path/filepath"
 	"strings"
@@ -253,7 +253,7 @@ func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir st
 				return newFilesystemError(ErrCodeDiskSpace, nil)
 			}
 			next := current + fileSize
-			if !fs.unixFS.CanFit(next) {			
+			if !fs.unixFS.CanFit(next) {
 				return newFilesystemError(ErrCodeDiskSpace, nil)
 			}
 			size.Store(next)

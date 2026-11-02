@@ -13,6 +13,7 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/pelican/wings/config"
+	"github.com/pelican/wings/plugins/api"
 	"github.com/pelican/wings/server"
 	"github.com/pelican/wings/server/filesystem"
 )
@@ -105,7 +106,7 @@ func (h *Handler) Fileread(request *sftp.Request) (io.ReaderAt, error) {
 	defer h.mu.Unlock()
 	if err := h.fs.IsIgnored(request.Filepath); err != nil {
 		return nil, err
-	}	
+	}
 	f, _, err := h.fs.File(request.Filepath)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
@@ -134,7 +135,7 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 
 	if err := h.fs.IsIgnored(request.Filepath); err != nil {
 		return nil, err
-	}	
+	}
 	// The specific permission required to perform this action. If the file exists on the
 	// system already it only needs to be an update, otherwise we'll check for a create.
 	permission := PermissionFileUpdate
@@ -178,10 +179,10 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 	if request.Target != "" {
 		l = l.WithField("target", request.Target)
 	}
-	
+
 	if err := h.fs.IsIgnored(request.Filepath); err != nil {
 		return err
-	}	
+	}
 
 	switch request.Method {
 	// Allows a user to make changes to the permissions of a given file or directory
@@ -199,6 +200,11 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		if request.Attributes().FileMode().IsDir() {
 			mode = 0o755
 		}
+		if handled, err := h.gateFileAction(api.FileChmod, request.Filepath, "", -1, false); err != nil {
+			return err
+		} else if handled {
+			return sftp.ErrSSHFxOk
+		}
 		if err := h.fs.Chmod(request.Filepath, mode); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return sftp.ErrSSHFxNoSuchFile
@@ -206,11 +212,18 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 			l.WithField("error", err).Error("failed to perform setstat on item")
 			return sftp.ErrSSHFxFailure
 		}
+		h.observeFileAction(api.FileChmod, request.Filepath, "", false)
 		break
 	// Support renaming a file (aka Move).
 	case "Rename":
 		if !h.can(PermissionFileUpdate) {
 			return sftp.ErrSSHFxPermissionDenied
+		}
+		if handled, err := h.gateFileAction(api.FileRename, request.Filepath, request.Target, -1, false); err != nil {
+			return err
+		} else if handled {
+			h.events.MustLog(server.ActivitySftpRename, FileAction{Entity: request.Filepath, Target: request.Target})
+			return sftp.ErrSSHFxOk
 		}
 		if err := h.fs.Rename(request.Filepath, request.Target); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -220,6 +233,7 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 			return sftp.ErrSSHFxFailure
 		}
 		h.events.MustLog(server.ActivitySftpRename, FileAction{Entity: request.Filepath, Target: request.Target})
+		h.observeFileAction(api.FileRename, request.Filepath, request.Target, false)
 		break
 	// Handle deletion of a directory. This will properly delete all of the files and
 	// folders within that directory if it is not already empty (unlike a lot of SFTP
@@ -229,11 +243,22 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 			return sftp.ErrSSHFxPermissionDenied
 		}
 		p := filepath.Clean(request.Filepath)
+		size, _ := h.sizeOf(p)
+		if handled, err := h.gateFileAction(api.FileDelete, p, "", size, true); err != nil {
+			return err
+		} else if handled {
+			// A plugin moved the directory somewhere else. The user asked for
+			// it to go from here, and from their point of view it has, so this
+			// is logged and reported as the delete they requested.
+			h.events.MustLog(server.ActivitySftpDelete, FileAction{Entity: request.Filepath})
+			return sftp.ErrSSHFxOk
+		}
 		if err := h.fs.Delete(p); err != nil {
 			l.WithField("error", err).Error("failed to remove directory")
 			return sftp.ErrSSHFxFailure
 		}
 		h.events.MustLog(server.ActivitySftpDelete, FileAction{Entity: request.Filepath})
+		h.observeFileAction(api.FileDelete, p, "", true)
 		return sftp.ErrSSHFxOk
 	// Handle requests to create a new Directory.
 	case "Mkdir":
@@ -242,11 +267,18 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		}
 		name := strings.Split(filepath.Clean(request.Filepath), "/")
 		p := strings.Join(name[0:len(name)-1], "/")
+		if handled, err := h.gateFileAction(api.FileCreateDir, request.Filepath, "", -1, true); err != nil {
+			return err
+		} else if handled {
+			h.events.MustLog(server.ActivitySftpCreateDirectory, FileAction{Entity: request.Filepath})
+			return sftp.ErrSSHFxOk
+		}
 		if err := h.fs.CreateDirectory(name[len(name)-1], p); err != nil {
 			l.WithField("error", err).Error("failed to create directory")
 			return sftp.ErrSSHFxFailure
 		}
 		h.events.MustLog(server.ActivitySftpCreateDirectory, FileAction{Entity: request.Filepath})
+		h.observeFileAction(api.FileCreateDir, request.Filepath, "", true)
 		break
 	// Support creating symlinks between files. The source and target must resolve within
 	// the server home directory.
@@ -264,6 +296,16 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		if !h.can(PermissionFileDelete) {
 			return sftp.ErrSSHFxPermissionDenied
 		}
+		size, isDir := h.sizeOf(request.Filepath)
+		if handled, err := h.gateFileAction(api.FileDelete, request.Filepath, "", size, isDir); err != nil {
+			return err
+		} else if handled {
+			// The file still exists, somewhere a plugin put it, but it is gone
+			// from where the user deleted it. Reporting Ok is what makes a
+			// recycle bin invisible to the person emptying a folder.
+			h.events.MustLog(server.ActivitySftpDelete, FileAction{Entity: request.Filepath})
+			return sftp.ErrSSHFxOk
+		}
 		if err := h.fs.Delete(request.Filepath); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return sftp.ErrSSHFxNoSuchFile
@@ -272,6 +314,7 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 			return sftp.ErrSSHFxFailure
 		}
 		h.events.MustLog(server.ActivitySftpDelete, FileAction{Entity: request.Filepath})
+		h.observeFileAction(api.FileDelete, request.Filepath, "", false)
 		return sftp.ErrSSHFxOk
 	default:
 		return sftp.ErrSSHFxOpUnsupported

@@ -289,7 +289,6 @@ type Backups struct {
 	// Defaults to "best_speed" (level 1)
 	CompressionLevel string `default:"best_speed" yaml:"compression_level"`
 
-
 	// RestoreHostAllowlist allows backup restore downloads to connect to otherwise blocked
 	// private/internal destinations. Entries may be hostnames, IP addresses, or CIDR ranges.
 	RestoreHostAllowlist []string `yaml:"restore_host_allowlist"`
@@ -401,6 +400,92 @@ type Configuration struct {
 
 	// IgnorePanelConfigUpdates causes confiuration updates that are sent by the panel to be ignored.
 	IgnorePanelConfigUpdates bool `json:"ignore_panel_config_updates" yaml:"ignore_panel_config_updates"`
+
+	// Plugins controls the plugin subsystem.
+	Plugins PluginConfiguration `json:"plugins" yaml:"plugins"`
+}
+
+// PluginConfiguration controls Wings plugins: where they live, and what the
+// node is willing to let them do.
+//
+// Everything here is the node operator's decision and is read only from the
+// Wings config file. None of it can be influenced by a plugin's own manifest,
+// which is the point: a plugin that could widen its own limits would not be
+// limited.
+type PluginConfiguration struct {
+	// Enabled turns the whole subsystem on or off. With it off, no plugin is
+	// loaded whatever its manifest says, the management endpoints report an
+	// empty list, and every hook dispatch is a no-op. This is the switch to
+	// reach for when diagnosing whether a plugin is behind a problem.
+	Enabled bool `default:"true" json:"enabled" yaml:"enabled"`
+
+	// Directory is where plugins live, one directory per plugin, each named
+	// for the plugin's id.
+	Directory string `default:"/var/lib/pelican/plugins" json:"directory" yaml:"directory"`
+
+	// GateTimeout is how many seconds a gating hook may take before Wings
+	// stops waiting and takes the plugin out of the dispatch path. Gating
+	// hooks sit in front of power actions, so this is the ceiling on how much
+	// latency a misbehaving plugin can add to one.
+	GateTimeout int `default:"2" json:"gate_timeout" yaml:"gate_timeout"`
+
+	// Trusted lists plugin ids that are loaded against the full Go standard
+	// library rather than the curated subset, which means they can reach the
+	// filesystem, the network and reflect directly.
+	//
+	// This is an explicit escape hatch for a plugin an operator has read and
+	// vouches for. Listing a plugin here gives it, in practice, the same reach
+	// over the node as Wings itself.
+	Trusted []string `json:"trusted" yaml:"trusted"`
+
+	// AllowedHosts restricts where plugins may send outbound HTTP requests, as
+	// a list of hostnames. An entry may lead with "*." to cover subdomains. An
+	// empty list, the default, allows any host: a plugin's source is readable
+	// and enabling one is already a decision to trust it, so the allowlist is
+	// there for operators who want a second boundary rather than being the
+	// first one.
+	AllowedHosts []string `json:"allowed_hosts" yaml:"allowed_hosts"`
+
+	// RequestTimeout bounds a plugin's outbound HTTP request, in seconds.
+	RequestTimeout int `default:"15" json:"request_timeout" yaml:"request_timeout"`
+
+	// MaxResponseSize caps an outbound response body, in mebibytes. A larger
+	// response is an error rather than a truncated body, which would otherwise
+	// parse as something the plugin did not fetch.
+	MaxResponseSize int64 `default:"8" json:"max_response_size" yaml:"max_response_size"`
+
+	// MaxInstallSize caps a plugin archive on import, in mebibytes, measured
+	// after decompression so a small archive cannot expand to fill the volume.
+	MaxInstallSize int64 `default:"16" json:"max_install_size" yaml:"max_install_size"`
+
+	// AllowDevices lets a plugin expose host devices to a container, which is
+	// how a plugin would pass a GPU through. It is off by default because a
+	// device is a hole straight through container isolation.
+	AllowDevices bool `default:"false" json:"allow_devices" yaml:"allow_devices"`
+
+	// AllowDependencies lets a plugin declare Go modules in its manifest,
+	// which Wings fetches as source and makes importable, the way the Panel
+	// installs a plugin's composer packages.
+	//
+	// The source is interpreted against the same curated symbol table as the
+	// plugin itself, so a dependency gains a plugin no reach it did not
+	// already have. Turning this off refuses any plugin that declares one,
+	// rather than loading it without its libraries.
+	AllowDependencies bool `default:"true" json:"allow_dependencies" yaml:"allow_dependencies"`
+
+	// ModuleProxy is where dependency source is fetched from. It speaks the
+	// Go module proxy protocol, so GOPROXY values work here, including a
+	// proxy of your own such as an Athens instance.
+	ModuleProxy string `default:"https://proxy.golang.org" json:"module_proxy" yaml:"module_proxy"`
+
+	// MaxDependencySize caps one module's archive, in mebibytes, measured
+	// after decompression.
+	MaxDependencySize int64 `default:"32" json:"max_dependency_size" yaml:"max_dependency_size"`
+
+	// MaxDependencies caps how many modules one plugin may pull in, counting
+	// the ones its own dependencies need. It is a backstop against a plugin
+	// naming something with an enormous dependency tree.
+	MaxDependencies int `default:"50" json:"max_dependencies" yaml:"max_dependencies"`
 }
 
 // SearchRecursion holds the configuration for directory search recursion settings.
@@ -694,6 +779,11 @@ func ConfigureDirectories() error {
 
 	log.WithField("path", _config.System.MachineID.Directory).Debug("ensuring machine-id directory exists")
 	if err := os.MkdirAll(_config.System.MachineID.Directory, 0o700); err != nil {
+		return err
+	}
+
+	log.WithField("path", _config.Plugins.Directory).Debug("ensuring plugin directory exists")
+	if err := os.MkdirAll(_config.Plugins.Directory, 0o700); err != nil {
 		return err
 	}
 	return nil

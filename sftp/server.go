@@ -21,6 +21,8 @@ import (
 	"golang.org/x/crypto/ssh"
 
 	"github.com/pelican/wings/config"
+	"github.com/pelican/wings/plugins"
+	"github.com/pelican/wings/plugins/api"
 	"github.com/pelican/wings/remote"
 	"github.com/pelican/wings/server"
 )
@@ -273,6 +275,30 @@ func (c *SFTPServer) makeCredentialsRequest(conn ssh.ConnMetadata, t remote.Sftp
 	}
 
 	logger.WithField("server", resp.Server).Debug("credentials validated and matched to server instance")
+
+	// The Panel has said who this is and what they may do. Plugins get the
+	// last word, for a policy the Panel cannot express, such as which
+	// addresses are allowed to connect to this node.
+	if plugins.HasSftpAuthHooks() {
+		allow, reason := plugins.GateSftpAuth(api.SftpAuth{
+			User:        resp.User,
+			Username:    request.User,
+			IP:          conn.RemoteAddr().String(),
+			ServerUUID:  resp.Server,
+			PublicKey:   t == remote.SftpAuthPublicKey,
+			Permissions: resp.Permissions,
+		})
+		if !allow {
+			logger.WithField("reason", reason).Warn("a plugin refused this sftp session")
+
+			// Reported as invalid credentials rather than with the plugin's
+			// reason. Anyone who can reach the SFTP port can try to log in, so
+			// telling them why they were refused hands an attacker a probe for
+			// whatever policy the plugin implements.
+			return nil, &remote.SftpInvalidCredentialsError{}
+		}
+	}
+
 	permissions := ssh.Permissions{
 		Extensions: map[string]string{
 			"ip":          conn.RemoteAddr().String(),

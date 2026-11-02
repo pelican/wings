@@ -14,6 +14,8 @@ import (
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/server/filesystem/quotas"
 
+	"github.com/pelican/wings/plugins"
+	"github.com/pelican/wings/plugins/api"
 	"github.com/pelican/wings/router/downloader"
 	"github.com/pelican/wings/router/middleware"
 	"github.com/pelican/wings/router/tokens"
@@ -159,10 +161,39 @@ func postServerCommands(c *gin.Context) {
 		return
 	}
 
+	// Offer each command to plugins, which may rewrite it or refuse it. A
+	// refusal stops that one command rather than the whole batch, so a plugin
+	// blocking "stop" does not also swallow the commands sent alongside it.
+	var refused []string
+
 	for _, command := range data.Commands {
+		if plugins.HasCommandHooks() {
+			rewritten, allow, reason := plugins.Command(api.Command{
+				Server:  s.PluginSnapshot(),
+				Command: command,
+				User:    requestUser(c),
+			})
+			if !allow {
+				s.Log().WithFields(log.Fields{"command": command, "reason": reason}).
+					Debug("a plugin refused a console command")
+				s.PublishConsoleOutputFromDaemon(reason)
+				refused = append(refused, reason)
+				continue
+			}
+			command = rewritten
+		}
+
 		if err := s.Environment.SendCommand(command); err != nil {
 			s.Log().WithFields(log.Fields{"command": command, "error": err}).Warn("failed to send command to server instance")
 		}
+	}
+
+	// Report a refusal rather than a silent success, so the Panel can show the
+	// user why nothing happened. If some commands did go through, the request
+	// still succeeded overall.
+	if len(refused) > 0 && len(refused) == len(data.Commands) {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": refused[0]})
+		return
 	}
 
 	c.Status(http.StatusNoContent)
@@ -225,6 +256,19 @@ func postServerReinstall(c *gin.Context) {
 func deleteServer(c *gin.Context) {
 	s := middleware.ExtractServer(c)
 	ID := s.ID()
+
+	snapshot := s.PluginSnapshot()
+
+	// Ask plugins before anything is suspended or removed. A transfer deletes
+	// the source server once it has been copied, and refusing that would strand
+	// the transfer, so a plugin only gets a say when this is a real deletion.
+	if !s.IsTransferring() {
+		if allow, reason := plugins.GateServerDelete(snapshot); !allow {
+			c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": reason})
+			return
+		}
+	}
+
 	// Immediately suspend the server to prevent a user from attempting
 	// to start it while this process is running.
 	s.Config().SetSuspended(true)
@@ -236,8 +280,17 @@ func deleteServer(c *gin.Context) {
 	// the client needs to switch to the new node.
 	if s.IsTransferring() {
 		s.Events().Publish(server.TransferStatusEvent, transfer.StatusCompleted)
+
+		// The source server is deleted once a transfer has copied it, so this
+		// is where a transfer actually finishes from this node's point of view.
+		plugins.Lifecycle(api.Lifecycle{
+			Server: snapshot,
+			Event:  api.ServerTransferComplete,
+		})
 	}
 	s.Events().Publish(server.DeletedEvent, nil)
+
+	plugins.Lifecycle(api.Lifecycle{Server: snapshot, Event: api.ServerDeleted})
 
 	s.CleanupForDestroy()
 
@@ -285,24 +338,23 @@ func deleteServer(c *gin.Context) {
 	pool := config.Get().System.Transfers.StoragePool
 	skipFileRemoval := pool.Enabled && pool.PoolName != "" && s.IsTransferring()
 	if !skipFileRemoval {
-	    go func(s *server.Server) {
-	    	fs := s.Filesystem()
-	    	p := fs.Path()
-	    	_ = fs.UnixFS().Close()
-	    	if err := os.RemoveAll(p); err != nil {
-	    		log.WithFields(log.Fields{"path": p, "error": err}).
-	    			Warn("failed to remove server files during deletion process")
-	    	}
+		go func(s *server.Server) {
+			fs := s.Filesystem()
+			p := fs.Path()
+			_ = fs.UnixFS().Close()
+			if err := os.RemoveAll(p); err != nil {
+				log.WithFields(log.Fields{"path": p, "error": err}).
+					Warn("failed to remove server files during deletion process")
+			}
 
-	    	if config.Get().System.Quotas.Enabled {
-	    		if err = quotas.DelQuota(s.Config().Uuid); err != nil {
-	    			log.WithFields(log.Fields{"server_id": s.Config().Pid, "error": err}).
-	    				Warn("failed to remove quota during deletion process")
-	    		}
-	    	}
-	    }(s)
+			if config.Get().System.Quotas.Enabled {
+				if err = quotas.DelQuota(s.Config().Uuid); err != nil {
+					log.WithFields(log.Fields{"server_id": s.Config().Pid, "error": err}).
+						Warn("failed to remove quota during deletion process")
+				}
+			}
+		}(s)
 	}
-
 
 	// remove hanging machine-id file for the server when removing
 	go func(s *server.Server) {

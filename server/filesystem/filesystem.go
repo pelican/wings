@@ -379,7 +379,7 @@ func (fs *Filesystem) Copy(p string) error {
 		return err
 	}
 	defer dst.Close()
-	
+
 	// Do not use CopyBuffer here, it is wasteful as the file implements
 	// io.ReaderFrom, which causes it to not use the buffer anyways.
 	n, err := io.Copy(dst, io.LimitReader(source, currentSize))

@@ -129,7 +129,7 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 		a.Files = files
 	}
 
-		// If we're specifically looking for only certain files, or have requested
+	// If we're specifically looking for only certain files, or have requested
 	// that certain files be ignored we'll update the callback function to reflect
 	// that request. Ignore patterns are compiled before anything is written so that
 	// an invalid list does not leave an empty archive behind.
