@@ -7,13 +7,13 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
-	"strconv"
 	"time"
 
 	"emperror.dev/errors"
 	"github.com/cenkalti/backoff/v4"
 	"github.com/juju/ratelimit"
 	"github.com/mholt/archives"
+	"golang.org/x/sync/errgroup"
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/remote"
@@ -122,101 +122,143 @@ func (s *S3Backup) Restore(ctx context.Context, r io.Reader, callback RestoreCal
 }
 
 // Generates the remote S3 request and begins the upload.
-func (s *S3Backup) generateRemoteRequest(ctx context.Context, rc io.ReadCloser) ([]remote.BackupPart, error) {
-	defer rc.Close()
-
+func (s *S3Backup) generateRemoteRequest(ctx context.Context, rc *os.File) ([]remote.BackupPart, error) {
 	s.log().Debug("attempting to get size of backup...")
-	size, err := s.Backup.Size()
+	st, err := rc.Stat()
 	if err != nil {
 		return nil, err
 	}
+	size := st.Size()
 	s.log().WithField("size", size).Debug("got size of backup")
 
 	s.log().Debug("attempting to get S3 upload urls from Panel...")
-	urls, err := s.client.GetBackupRemoteUploadURLs(context.Background(), s.Backup.Uuid, size)
+	urls, err := s.client.GetBackupRemoteUploadURLs(ctx, s.Backup.Uuid, size)
 	if err != nil {
 		return nil, err
 	}
 	s.log().Debug("got S3 upload urls from the Panel")
 	s.log().WithField("parts", len(urls.Parts)).Info("attempting to upload backup to s3 endpoint...")
 
-	uploader := newS3FileUploader(rc)
+	concurrency := urls.MaxConcurrentUploads
+
+	// Always allow at least 1 upload at time
+	if concurrency <= 0 {
+		concurrency = 1
+	}
+	
+	uploader := newS3FileUploader(concurrency)
+	// Close all connections when the function completes
+	defer uploader.client.CloseIdleConnections()
+
+	parts := make([]remote.BackupPart, len(urls.Parts))
+
+	g, ctx := errgroup.WithContext(ctx)
+	g.SetLimit(concurrency)
+
 	for i, part := range urls.Parts {
 		// Get the size for the current part.
-		var partSize int64
-		if i+1 < len(urls.Parts) {
-			partSize = urls.PartSize
-		} else {
-			// This is the remaining size for the last part,
-			// there is not a minimum size limit for the last part.
+		partSize := urls.PartSize
+		if i+1 == len(urls.Parts) {
+			// This is the remaining size for the last part, there is not a
+			// minimum size limit for the last part.
 			partSize = size - (int64(i) * urls.PartSize)
 		}
+		offset := int64(i) * urls.PartSize
 
-		// Attempt to upload the part.
-		etag, err := uploader.uploadPart(ctx, part, partSize)
-		if err != nil {
-			s.log().WithField("part_id", i+1).WithError(err).Warn("failed to upload part")
-			return nil, err
-		}
-		uploader.uploadedParts = append(uploader.uploadedParts, remote.BackupPart{
-			ETag:       etag,
-			PartNumber: i + 1,
+		g.Go(func() error {
+			// Each part gets its own independent view of the file, backed by
+			// ReadAt, which is safe for concurrent use.
+			section := io.NewSectionReader(rc, offset, partSize)
+
+			etag, err := uploader.uploadPart(ctx, part, section, partSize)
+			if err != nil {
+				s.log().WithField("part_id", i+1).WithError(err).Warn("failed to upload part")
+				return errors.WrapIff(err, "backup: failed to upload part %d", i+1)
+			}
+
+			parts[i] = remote.BackupPart{
+				ETag:       etag,
+				PartNumber: i + 1,
+			}
+
+			s.log().WithField("part_id", i+1).Info("successfully uploaded backup part")
+			return nil
 		})
-		s.log().WithField("part_id", i+1).Info("successfully uploaded backup part")
 	}
-	s.log().WithField("parts", len(urls.Parts)).Info("backup has been successfully uploaded")
 
-	return uploader.uploadedParts, nil
+	if err := g.Wait(); err != nil {
+		return nil, err
+	}
+
+	s.log().WithField("parts", len(urls.Parts)).Info("backup has been successfully uploaded")
+	return parts, nil
 }
 
 type s3FileUploader struct {
-	io.ReadCloser
-	client        *http.Client
-	uploadedParts []remote.BackupPart
+	client *http.Client
 }
 
 // newS3FileUploader returns a new file uploader instance.
-func newS3FileUploader(file io.ReadCloser) *s3FileUploader {
+func newS3FileUploader(concurrency int) *s3FileUploader {
+    t := http.DefaultTransport.(*http.Transport).Clone()
+	// DefaultTransport keeps only 2 idle connections per host, so most of the
+	// concurrent parts would pay for a fresh TCP + TLS handshake.
+	t.MaxIdleConnsPerHost = concurrency
+	
 	return &s3FileUploader{
-		ReadCloser: file,
 		// We purposefully use a super high timeout on this request since we need to upload
 		// a 5GB file. This assumes at worst a 10Mbps connection for uploading. While technically
 		// you could go slower we're targeting mostly hosted servers that should have 100Mbps
 		// connections anyways.
-		client: &http.Client{Timeout: time.Hour * 2},
+		client: &http.Client{
+			Timeout: time.Hour * 2,
+			Transport: t,
+		},
 	}
 }
 
-// backoff returns a new expoential backoff implementation using a context that
+// backoff returns a new exponential backoff implementation using a context that
 // will also stop the backoff if it is canceled.
+//
+// The elapsed time tracked by the backoff includes the time spent inside the
+// operation itself, and a single part upload easily runs for several minutes.
+// Bounding on elapsed time would therefore stop the retries before the second
+// attempt ever happened, so the number of attempts is bounded instead and the
+// context carries the actual deadline.
 func (fu *s3FileUploader) backoff(ctx context.Context) backoff.BackOffContext {
 	b := backoff.NewExponentialBackOff()
 	b.Multiplier = 2
-	b.MaxElapsedTime = time.Minute
+	b.MaxElapsedTime = 0
 
-	return backoff.WithContext(b, ctx)
+	return backoff.WithContext(backoff.WithMaxRetries(b, 5), ctx)
 }
 
 // uploadPart attempts to upload a given S3 file part to the S3 system. If a
 // 5xx error is returned from the endpoint this will continue with an exponential
 // backoff to try and successfully upload the part.
 //
+// The section is rewound before every attempt, so a retry always sends the full
+// part from its correct offset.
+//
 // Once uploaded the ETag is returned to the caller.
-func (fu *s3FileUploader) uploadPart(ctx context.Context, part string, size int64) (string, error) {
-	r, err := http.NewRequestWithContext(ctx, http.MethodPut, part, nil)
-	if err != nil {
-		return "", errors.Wrap(err, "backup: could not create request for S3")
-	}
-
-	r.ContentLength = size
-	r.Header.Add("Content-Length", strconv.Itoa(int(size)))
-	r.Header.Add("Content-Type", "application/x-gzip")
-
-	// Limit the reader to the size of the part.
-	r.Body = Reader{Reader: io.LimitReader(fu.ReadCloser, size)}
-
+func (fu *s3FileUploader) uploadPart(ctx context.Context, part string, section *io.SectionReader, size int64) (string, error) {
 	var etag string
-	err = backoff.Retry(func() error {
+	err := backoff.Retry(func() error {
+		// Rewind the section so that a retry re-sends the whole part rather than
+		// whatever is left over from the previous attempt.
+		if _, err := section.Seek(0, io.SeekStart); err != nil {
+			return backoff.Permanent(errors.Wrap(err, "backup: could not rewind part reader"))
+		}
+
+		// Build the request inside the retry: a request body can only be
+		// consumed once, so it cannot be reused across attempts.
+		r, err := http.NewRequestWithContext(ctx, http.MethodPut, part, section)
+		if err != nil {
+			return backoff.Permanent(errors.Wrap(err, "backup: could not create request for S3"))
+		}
+		r.ContentLength = size
+		r.Header.Set("Content-Type", "application/x-gzip")
+
 		res, err := fu.client.Do(r)
 		if err != nil {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
@@ -226,14 +268,21 @@ func (fu *s3FileUploader) uploadPart(ctx context.Context, part string, size int6
 			// the URL due to DNS issues we want to keep re-trying.
 			return errors.Wrap(err, "backup: S3 HTTP request failed")
 		}
+		// Drain the body so the connection can go back to the idle pool. On an
+        // error S3 returns XML that would otherwise leave the connection unusable.
+        _, _ = io.Copy(io.Discard, res.Body)
 		_ = res.Body.Close()
 
 		if res.StatusCode != http.StatusOK {
-			err := errors.New(fmt.Sprintf("backup: failed to put S3 object: [HTTP/%d] %s", res.StatusCode, res.Status))
+			err := fmt.Errorf("backup: failed to put S3 object: [HTTP/%d] %s", res.StatusCode, res.Status)
 			// Only attempt a backoff retry if this error is because of a 5xx error from
 			// the S3 endpoint. Any 4xx error should be treated as an error that a retry
 			// would not fix.
-			if res.StatusCode >= http.StatusInternalServerError {
+			//
+			// 429 is the exception: it signals rate limiting rather than a client
+			// error, and S3-compatible endpoints emit it when parts are uploaded
+			// concurrently. Backing off and retrying is the correct response.
+			if res.StatusCode >= http.StatusInternalServerError || res.StatusCode == http.StatusTooManyRequests {
 				return err
 			}
 			return backoff.Permanent(err)
@@ -247,20 +296,11 @@ func (fu *s3FileUploader) uploadPart(ctx context.Context, part string, size int6
 	}, fu.backoff(ctx))
 
 	if err != nil {
-		if v, ok := err.(*backoff.PermanentError); ok {
-			return "", v.Unwrap()
+		var permanent *backoff.PermanentError
+		if errors.As(err, &permanent) {
+			return "", permanent.Unwrap()
 		}
 		return "", err
 	}
 	return etag, nil
-}
-
-// Reader provides a wrapper around an existing io.Reader
-// but implements io.Closer in order to satisfy an io.ReadCloser.
-type Reader struct {
-	io.Reader
-}
-
-func (Reader) Close() error {
-	return nil
 }

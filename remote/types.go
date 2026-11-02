@@ -153,8 +153,9 @@ type ProcessConfiguration struct {
 }
 
 type BackupRemoteUploadResponse struct {
-	Parts    []string `json:"parts"`
-	PartSize int64    `json:"part_size"`
+	Parts                []string `json:"parts"`
+	PartSize             int64    `json:"part_size"`
+	MaxConcurrentUploads int      `json:"max_concurrent_uploads"`
 }
 
 type BackupPart struct {

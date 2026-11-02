@@ -82,7 +82,7 @@ func (e *Environment) pollResources(ctx context.Context) error {
 				Uptime:      uptime,
 				Memory:      calculateDockerMemory(v.MemoryStats),
 				MemoryLimit: v.MemoryStats.Limit,
-				CpuAbsolute: calculateDockerAbsoluteCpu(v.PreCPUStats, v.CPUStats),
+				CpuAbsolute: calculateDockerAbsoluteCpu(v),
 				Network:     environment.NetworkStats{},
 			}
 
@@ -130,28 +130,16 @@ func calculateDockerMemory(stats container.MemoryStats) uint64 {
 // Calculates the absolute CPU usage used by the server process on the system, not constrained
 // by the defined CPU limits on the container.
 //
-// @see https://github.com/docker/cli/blob/aa097cf1aa19099da70930460250797c8920b709/cli/command/container/stats_helpers.go#L166
-func calculateDockerAbsoluteCpu(pStats container.CPUStats, stats container.CPUStats) float64 {
-	// Calculate the change in CPU usage between the current and previous reading.
-	cpuDelta := float64(stats.CPUUsage.TotalUsage) - float64(pStats.CPUUsage.TotalUsage)
-
-	// Calculate the change for the entire system's CPU usage between current and previous reading.
-	systemDelta := float64(stats.SystemUsage) - float64(pStats.SystemUsage)
-
-	// Calculate the total number of CPU cores being used.
-	cpus := float64(stats.OnlineCPUs)
-	if cpus == 0.0 {
-		cpus = float64(len(stats.CPUUsage.PercpuUsage))
+// CPU time is compared to the elapsed time between samples because Podman's Docker-compatible API
+// does not provide Docker-equivalent SystemUsage values.
+func calculateDockerAbsoluteCpu(stats container.StatsResponse) float64 {
+	current := stats.CPUStats.CPUUsage.TotalUsage
+	previous := stats.PreCPUStats.CPUUsage.TotalUsage
+	if current <= previous || stats.PreRead.IsZero() || !stats.Read.After(stats.PreRead) {
+		return 0
 	}
 
-	percent := 0.0
-	if systemDelta > 0.0 && cpuDelta > 0.0 {
-		percent = (cpuDelta / systemDelta) * 100.0
-
-		if cpus > 0 {
-			percent *= cpus
-		}
-	}
-
-	return math.Round(percent*1000) / 1000
+	cpuDelta := float64(current - previous)
+	timeDelta := float64(stats.Read.Sub(stats.PreRead).Nanoseconds())
+	return math.Round((cpuDelta/timeDelta)*100*1000) / 1000
 }
