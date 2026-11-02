@@ -178,7 +178,10 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 			if err := s.Filesystem().CreateDirectory(file, "/"); err != nil {
 				return errors.WithStack(err)
 			}
-			dirs = append(dirs, restoredDir{name: file, mode: info.Mode().Perm(), mtime: info.ModTime()})
+			// Keep setgid and sticky: shared folders rely on them. Setuid means
+			// nothing on a directory and is not restored.
+			mode := info.Mode() & (fs.ModePerm | fs.ModeSetgid | fs.ModeSticky)
+			dirs = append(dirs, restoredDir{name: file, mode: mode, mtime: info.ModTime()})
 			return nil
 		} else {
 			if !info.Mode().IsRegular() {

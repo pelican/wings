@@ -1,6 +1,8 @@
 package filesystem
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"os"
@@ -184,5 +186,87 @@ func TestArchive_StreamReportsFailureOnFinalWrite(t *testing.T) {
 	}
 	if err := a.Stream(context.Background(), &failingWriter{n: 64}); err == nil {
 		t.Fatal("expected the failed write to be reported")
+	}
+}
+
+// Compressing "." keeps the leading dot of hidden files and folders.
+func TestFilesystem_CompressFilesWholeDirectoryKeepsDotfiles(t *testing.T) {
+	fs := NewFs()
+	defer fs.reset()
+
+	fs.write(".env", []byte("a"))
+	fs.write("env", []byte("b"))
+	if err := os.Mkdir(filepath.Join(fs.rootPath, ".hidden"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fs.write(".hidden/x", []byte("c"))
+
+	info, _, err := fs.CompressFiles(context.Background(), "/", "", []string{"."}, "tar.gz")
+	if err != nil {
+		t.Fatal(err)
+	}
+	names := archiveNames(t, filepath.Join(fs.rootPath, info.Name()))
+	if got, want := strings.Join(names, ","), ".env,.hidden,.hidden/x,env"; got != want {
+		t.Errorf("unexpected archive contents: got %s, want %s", got, want)
+	}
+}
+
+func gzipBytes(t *testing.T, data []byte) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	w := gzip.NewWriter(&b)
+	if _, err := w.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.Close(); err != nil {
+		t.Fatal(err)
+	}
+	return b.Bytes()
+}
+
+// Single-file decompression must never truncate the archive it is reading.
+func TestFilesystem_DecompressSingleFileNeverOverwritesItself(t *testing.T) {
+	fs := NewFs()
+	defer fs.reset()
+
+	gz := gzipBytes(t, []byte("hello"))
+	fs.write("data", gz)
+	if err := fs.DecompressFile(context.Background(), "/", "data"); err == nil {
+		t.Error("expected an error when the output would be the archive itself")
+	}
+	if b, _ := os.ReadFile(filepath.Join(fs.rootPath, "data")); !bytes.Equal(b, gz) {
+		t.Errorf("the archive was changed: %d bytes left of %d", len(b), len(gz))
+	}
+
+	// An upper case extension is still stripped.
+	fs.write("dump.sql.GZ", gz)
+	if err := fs.DecompressFile(context.Background(), "/", "dump.sql.GZ"); err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(fs.rootPath, "dump.sql")); string(b) != "hello" {
+		t.Errorf("expected dump.sql to contain hello, got %q", b)
+	}
+	if b, _ := os.ReadFile(filepath.Join(fs.rootPath, "dump.sql.GZ")); !bytes.Equal(b, gz) {
+		t.Error("the archive was changed")
+	}
+}
+
+// Chmod passes setgid and sticky through, which backup restore relies on.
+func TestFilesystem_ChmodKeepsSetgidAndSticky(t *testing.T) {
+	fs := NewFs()
+	defer fs.reset()
+
+	if err := os.Mkdir(filepath.Join(fs.rootPath, "shared"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := fs.Chmod("shared", 0o775|os.ModeSetgid|os.ModeSticky); err != nil {
+		t.Fatal(err)
+	}
+	st, err := os.Stat(filepath.Join(fs.rootPath, "shared"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Mode()&os.ModeSetgid == 0 || st.Mode()&os.ModeSticky == 0 {
+		t.Errorf("expected setgid and sticky, got %v", st.Mode())
 	}
 }

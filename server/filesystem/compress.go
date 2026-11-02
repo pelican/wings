@@ -21,6 +21,9 @@ type extractOptions struct {
 	file   string
 	format archives.Format
 	r      io.Reader
+	// src is the archive being read, when it is a file in the server. A
+	// single-file decompression never writes over it.
+	src os.FileInfo
 }
 
 // CompressFiles compresses all the files matching the given paths in the
@@ -182,7 +185,13 @@ func (fs *Filesystem) filesForArchive(dir string, paths []string) ([]archives.Fi
 				return err
 			}
 
-			nameInArchive := path.Join(name, strings.TrimPrefix(strings.TrimPrefix(full, base), "/"))
+			// When base is "." the walk already returns paths relative to it, and
+			// trimming "." would take the dot off names such as ".env".
+			rel := full
+			if base != "." {
+				rel = strings.TrimPrefix(strings.TrimPrefix(full, base), "/")
+			}
+			nameInArchive := path.Join(name, rel)
 			fi := archives.FileInfo{FileInfo: info, NameInArchive: nameInArchive}
 
 			switch mode := info.Mode(); {
@@ -250,7 +259,7 @@ func (f *limitedFile) Read(p []byte) (int, error) {
 // zip-slip attack being attempted by validating that the final path is within
 // the server data directory.
 func (fs *Filesystem) DecompressFile(ctx context.Context, dir string, file string) error {
-	f, _, err := fs.File(filepath.Join(dir, file))
+	f, st, err := fs.File(filepath.Join(dir, file))
 	if err != nil {
 		return errors.Wrap(err, "server/filesystem: decompress: failed to open file")
 	}
@@ -264,7 +273,7 @@ func (fs *Filesystem) DecompressFile(ctx context.Context, dir string, file strin
 		return errors.Wrap(err, "server/filesystem: decompress: failed to identify archive format")
 	}
 
-	return fs.extractStream(ctx, extractOptions{dir: dir, file: file, format: format, r: input})
+	return fs.extractStream(ctx, extractOptions{dir: dir, file: file, format: format, r: input, src: st.FileInfo})
 }
 
 func (fs *Filesystem) extractStream(ctx context.Context, opts extractOptions) error {
@@ -278,9 +287,23 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractOptions) er
 			return nil
 		}
 
-		p := filepath.Join(opts.dir, strings.TrimSuffix(opts.file, opts.format.Extension()))
+		// Strip the extension whatever its case, so "backup.sql.GZ" gives "backup.sql".
+		name := opts.file
+		if ext := opts.format.Extension(); len(name) > len(ext) && strings.EqualFold(name[len(name)-len(ext):], ext) {
+			name = name[:len(name)-len(ext)]
+		}
+		p := filepath.Join(opts.dir, name)
 		if err := fs.IsIgnored(p); err != nil {
 			return nil
+		}
+
+		// The output is opened with O_TRUNC, so it must never be the archive being
+		// read: that happens when the name has no extension to strip (a gzip file
+		// called "data"), or when the output name is a symlink to the archive.
+		if opts.src != nil {
+			if st, err := fs.root.Stat(normalize(p)); err == nil && os.SameFile(st, opts.src) {
+				return errors.New("server/filesystem: decompress: the decompressed file would overwrite the archive itself; rename the archive to end in " + opts.format.Extension())
+			}
 		}
 
 		reader, err := de.OpenReader(opts.r)
