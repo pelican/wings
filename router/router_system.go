@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
@@ -219,8 +220,16 @@ type postUpdateConfigurationResponse struct {
 	Applied bool `json:"applied"`
 }
 
+// updateConfigMu serializes the whole configuration update, from reading the
+// current config through writing it to disk, setting it globally and rotating
+// the Panel client credentials. Without it, overlapping requests can leave the
+// global config on one token while the shared client uses another.
+var updateConfigMu sync.Mutex
+
 // Updates the running configuration for this Wings instance.
 func postUpdateConfiguration(c *gin.Context) {
+	updateConfigMu.Lock()
+	defer updateConfigMu.Unlock()
 	cfg := config.Get()
 
 	if cfg.IgnorePanelConfigUpdates {
