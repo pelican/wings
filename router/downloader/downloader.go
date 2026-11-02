@@ -252,10 +252,6 @@ func (dl *Download) Execute() error {
 		return errors.New("downloader: got bad response status from endpoint: " + res.Status)
 	}
 
-	if res.ContentLength < 1 {
-		return errors.New("downloader: request is missing ContentLength")
-	}
-
 	if dl.req.UseHeader {
 		if contentDisposition := res.Header.Get("Content-Disposition"); contentDisposition != "" {
 			_, params, err := mime.ParseMediaType(contentDisposition)
@@ -284,10 +280,18 @@ func (dl *Download) Execute() error {
 	p := dl.Path()
 	dl.server.Log().WithField("path", p).Debug("writing remote file to disk")
 
-	// Write the file while tracking the progress, Write will check that the
-	// size of the file won't exceed the disk limit.
+	// Write the file while tracking the progress. Write checks that the size of
+	// the file won't exceed the disk limit before writing; responses without a
+	// Content-Length (chunked transfer encoding) are streamed and stopped once
+	// they exceed the remaining disk space.
 	r := io.TeeReader(res.Body, dl.counter(res.ContentLength))
-	if err := dl.server.Filesystem().Write(p, r, res.ContentLength, 0o644); err != nil {
+	var err error
+	if res.ContentLength >= 0 {
+		err = dl.server.Filesystem().Write(p, r, res.ContentLength, 0o644)
+	} else {
+		err = dl.server.Filesystem().WriteStream(p, r, 0o644)
+	}
+	if err != nil {
 		return errors.WrapIf(err, "downloader: failed to write file to server directory")
 	}
 	return nil
@@ -325,7 +329,10 @@ func (dl *Download) counter(contentLength int64) *Counter {
 	onWrite := func(t int) {
 		dl.mu.Lock()
 		defer dl.mu.Unlock()
-		dl.progress = float64(t) / float64(contentLength)
+		// The progress cannot be calculated when the size is unknown.
+		if contentLength > 0 {
+			dl.progress = float64(t) / float64(contentLength)
+		}
 	}
 	return &Counter{
 		onWrite: onWrite,
