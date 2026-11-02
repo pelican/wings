@@ -6,6 +6,8 @@
 package ufs
 
 import (
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"os"
@@ -600,6 +602,77 @@ func (fs *UnixFS) Symlink(oldpath, newpath string) error {
 		return &LinkError{Op: "symlink", Old: oldpath, New: newpath, Err: err}
 	}
 	return nil
+}
+
+// ReplaceWithSymlink atomically makes newpath a symbolic link to oldpath,
+// replacing any existing non-directory entry at newpath.
+//
+// The link is first created under a temporary name next to newpath and owned
+// by uid and gid (-1 leaves the owner unchanged), then renamed over newpath. If
+// any step fails the temporary link is removed and an existing entry at newpath
+// is left untouched. The entry that was replaced, if any, is returned so the
+// caller can account for it.
+//
+// If there is an error, it will be of type *PathError or *LinkError.
+func (fs *UnixFS) ReplaceWithSymlink(oldpath, newpath string, uid, gid int) (FileInfo, error) {
+	dirfd, name, closeFd, err := fs.safePath(newpath)
+	defer closeFd()
+	if err != nil {
+		return nil, err
+	}
+	if name == "." {
+		return nil, &PathError{Op: "symlink", Path: newpath, Err: ErrBadPathResolution}
+	}
+
+	previous, err := fs.Lstatat(dirfd, name)
+	switch {
+	case err == nil:
+		if previous.IsDir() {
+			return nil, &PathError{Op: "symlink", Path: newpath, Err: unix.EISDIR}
+		}
+	case errors.Is(err, ErrNotExist):
+		previous = nil
+	default:
+		return nil, err
+	}
+
+	// Create the link under a temporary name in the same directory, so that
+	// the final rename is atomic and never leaves newpath missing.
+	var tmp string
+	for attempt := 0; ; attempt++ {
+		suffix := make([]byte, 6)
+		if _, err := rand.Read(suffix); err != nil {
+			return nil, err
+		}
+		tmp = "." + name + ".wings-" + hex.EncodeToString(suffix)
+		err := ignoringEINTR(func() error {
+			// We aren't concerned with oldpath here as a symlink can point
+			// anywhere it wants.
+			return unix.Symlinkat(oldpath, dirfd, tmp)
+		})
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, unix.EEXIST) || attempt >= 2 {
+			return nil, &LinkError{Op: "symlink", Old: oldpath, New: newpath, Err: err}
+		}
+	}
+	cleanup := func() { _ = unix.Unlinkat(dirfd, tmp, 0) }
+
+	if uid != -1 || gid != -1 {
+		if err := fs.Lchownat(dirfd, tmp, uid, gid); err != nil {
+			cleanup()
+			return nil, err
+		}
+	}
+
+	if err := ignoringEINTR(func() error {
+		return unix.Renameat(dirfd, tmp, dirfd, name)
+	}); err != nil {
+		cleanup()
+		return nil, &LinkError{Op: "rename", Old: tmp, New: newpath, Err: err}
+	}
+	return previous, nil
 }
 
 // Touch will attempt to open a file for reading and/or writing. If the file

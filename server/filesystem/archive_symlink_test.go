@@ -127,6 +127,48 @@ func TestFilesystem_RestoreSymlink(t *testing.T) {
 	if err := fs.RestoreSymlink("dir", "elsewhere"); err == nil {
 		t.Error("expected an error when replacing a directory with a symlink")
 	}
+
+	// No temporary links are left behind.
+	des, err := os.ReadDir(filepath.Join(rfs.root, "server"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, de := range des {
+		if strings.Contains(de.Name(), ".wings-") {
+			t.Errorf("temporary link %q was left behind", de.Name())
+		}
+	}
+}
+
+// Replacing a regular file with a link releases its size from the disk usage.
+func TestFilesystem_RestoreSymlinkQuota(t *testing.T) {
+	fs, _ := NewFs()
+	defer fs.TruncateRootDirectory()
+	fs.SetDiskLimit(1024)
+	fs.unixFS.SetUsage(0)
+
+	r := strings.NewReader("0123456789")
+	if err := fs.Write("unix_args.txt", r, r.Size(), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if usage := fs.CachedUsage(); usage != 10 {
+		t.Fatalf("expected usage 10 after writing the file, got %d", usage)
+	}
+
+	if err := fs.RestoreSymlink("unix_args.txt", "libraries/unix_args.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if usage := fs.CachedUsage(); usage != 0 {
+		t.Errorf("expected usage 0 after replacing the file with a link, got %d", usage)
+	}
+
+	// Replacing a link with another link does not change the usage.
+	if err := fs.RestoreSymlink("unix_args.txt", "other.txt"); err != nil {
+		t.Fatal(err)
+	}
+	if usage := fs.CachedUsage(); usage != 0 {
+		t.Errorf("expected usage to stay 0, got %d", usage)
+	}
 }
 
 func keys(m map[string]*tar.Header) []string {

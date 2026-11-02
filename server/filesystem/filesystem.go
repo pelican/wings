@@ -16,6 +16,7 @@ import (
 	"github.com/apex/log"
 	"github.com/gabriel-vasile/mimetype"
 	ignore "github.com/sabhiram/go-gitignore"
+	"golang.org/x/sys/unix"
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/internal/ufs"
@@ -229,26 +230,33 @@ func (fs *Filesystem) Symlink(oldpath, newpath string) error {
 // used when restoring archives that contain symbolic links. The target is stored
 // as-is; all filesystem access performed by Wings resolves paths beneath the
 // server root, so a link pointing outside of it cannot be followed by Wings.
+//
+// The link is created and chowned under a temporary name and then atomically
+// renamed into place, so an existing entry is only replaced once the new link
+// is ready. A directory is never replaced.
 func (fs *Filesystem) RestoreSymlink(name, target string) error {
 	if err := fs.mkdirAll(filepath.Dir(filepath.Clean(name)), 0o755); err != nil {
 		return err
 	}
 
-	if st, err := fs.unixFS.Lstat(name); err == nil {
-		if st.IsDir() {
+	uid, gid := -1, -1
+	if !fs.isTest {
+		uid, gid = config.Get().System.User.Uid, config.Get().System.User.Gid
+	}
+
+	previous, err := fs.unixFS.ReplaceWithSymlink(target, name, uid, gid)
+	if err != nil {
+		if errors.Is(err, unix.EISDIR) {
 			return errors.Errorf("filesystem: cannot replace directory '%s' with a symlink", name)
 		}
-		if err := fs.unixFS.Remove(name); err != nil {
-			return err
-		}
-	} else if !errors.Is(err, ufs.ErrNotExist) {
 		return err
 	}
 
-	if err := fs.unixFS.Symlink(target, name); err != nil {
-		return err
+	// The replaced regular file no longer counts towards the disk usage.
+	if previous != nil && previous.Mode().IsRegular() {
+		fs.unixFS.Add(-previous.Size())
 	}
-	return fs.chownFile(name)
+	return nil
 }
 
 func (fs *Filesystem) chownFile(name string) error {
