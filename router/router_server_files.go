@@ -36,7 +36,8 @@ func getServerFileContents(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
-	f, st, err := s.Filesystem().File(c.Query("file"))
+	// Open the same path that was checked against the denylist above.
+	f, st, err := s.Filesystem().File(p)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{

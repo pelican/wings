@@ -4,6 +4,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"sort"
 	"time"
 
 	"emperror.dev/errors"
@@ -155,6 +156,17 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	// Attempt to restore the backup to the server by running through each entry
 	// in the file one at a time and writing them to the disk.
 	s.Log().Debug("starting file writing process for backup restoration")
+
+	// Directory modes and times are applied once everything has been restored. A
+	// mode without write permission would otherwise stop the files inside it being
+	// written, and writing those files would change the directory's time anyway.
+	type restoredDir struct {
+		name  string
+		mode  fs.FileMode
+		mtime time.Time
+	}
+	var dirs []restoredDir
+
 	err = b.Restore(s.Context(), reader, func(file string, info fs.FileInfo, r io.ReadCloser) error {
 		defer r.Close()
 		if file == "." {
@@ -166,9 +178,8 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 			if err := s.Filesystem().CreateDirectory(file, "/"); err != nil {
 				return errors.WithStack(err)
 			}
-			if err := s.Filesystem().Chmod(file, info.Mode().Perm()); err != nil {
-				return errors.WithStack(err)
-			}
+			dirs = append(dirs, restoredDir{name: file, mode: info.Mode().Perm(), mtime: info.ModTime()})
+			return nil
 		} else {
 			if !info.Mode().IsRegular() {
 				return nil
@@ -182,6 +193,20 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 		atime := info.ModTime()
 		return s.Filesystem().Chtimes(file, atime, atime)
 	})
+	if err != nil {
+		return errors.WithStackIf(err)
+	}
 
-	return errors.WithStackIf(err)
+	// Deepest directories first, so a parent's mode is set after its children.
+	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i].name) > len(dirs[j].name) })
+	for _, d := range dirs {
+		if err := s.Filesystem().Chmod(d.name, d.mode); err != nil {
+			return errors.WithStack(err)
+		}
+		if err := s.Filesystem().Chtimes(d.name, d.mtime, d.mtime); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+
+	return nil
 }

@@ -93,7 +93,16 @@ func (fs *Filesystem) CompressFiles(ctx context.Context, dir string, name string
 		_ = fs.Delete(destPath)
 	}
 
-	if err := format.Archive(ctx, f, files); err != nil {
+	// The archive libraries close their writers in a defer and drop the error, and
+	// every format holds its last bytes until then. Without errWriter a write that
+	// fails at that point (such as running out of disk space on a small archive)
+	// would be reported as success with a truncated archive left behind.
+	w := &errWriter{w: f}
+	err = format.Archive(ctx, w, files)
+	if w.err != nil {
+		err = w.err
+	}
+	if err != nil {
 		cleanup()
 		if IsErrorCode(err, ErrCodeDiskSpace) {
 			return nil, "", ErrNoSpaceAvailable
@@ -123,10 +132,9 @@ func (fs *Filesystem) filesForArchive(dir string, paths []string) ([]archives.Fi
 	seen := make(map[string]struct{})
 
 	for _, p := range paths {
+		// "." selects everything in dir; its contents are stored at the top of the
+		// archive (path.Join drops the "." below) and dir itself is not added.
 		name := normalize(p)
-		if name == "." {
-			continue
-		}
 		base := normalize(path.Join(dir, name))
 
 		// io/fs.WalkDir follows the starting path if it is a symlink, so only walk
@@ -145,12 +153,15 @@ func (fs *Filesystem) filesForArchive(dir string, paths []string) ([]archives.Fi
 			}
 		}
 
-		err = walk(fs.root.FS(), base, func(full string, d iofs.DirEntry, err error) error {
+		err = walk(rootDirFS{fs.root}, base, func(full string, d iofs.DirEntry, err error) error {
 			if err != nil {
 				if errors.Is(err, iofs.ErrNotExist) {
 					return nil
 				}
 				return err
+			}
+			if name == "." && full == base {
+				return nil
 			}
 			if fs.IsIgnored(full) != nil {
 				if d.IsDir() {

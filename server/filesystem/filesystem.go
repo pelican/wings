@@ -469,6 +469,16 @@ func (fs *Filesystem) Symlink(source, target string) error {
 	// from reading any symlinks or acting on any file that points outside the root as defined
 	// by os.Root. The check above is mostly to prevent stupid mistakes or basic attempts to
 	// get around this. Running server processes can create any symlink they want anyway.
+	// The relative link below is worked out from the directory names as given, but
+	// os.Root follows symlinks in those directories when it creates the link. If one
+	// of them is a symlink the link would be relative to the wrong directory, so it
+	// is refused rather than created pointing somewhere else.
+	for d := filepath.Dir(target); d != "."; d = filepath.Dir(d) {
+		if st, err := fs.root.Lstat(d); err == nil && st.Mode()&os.ModeSymlink != 0 {
+			return errors.New("server/filesystem: symlink: cannot create a symlink inside a symlinked directory")
+		}
+	}
+
 	link := source
 	if rel, err := filepath.Rel(filepath.Dir(target), source); err == nil {
 		link = rel
@@ -480,9 +490,67 @@ func (fs *Filesystem) Symlink(source, target string) error {
 	return nil
 }
 
+// rootDirFS is the [fs2.FS] used to list and walk directories inside an os.Root.
+//
+// The FS from [os.Root.FS] opens every path with a plain O_RDONLY, and opening a
+// named pipe that way blocks until something writes to it. A server process can
+// put a pipe wherever it likes, including in place of a directory that is about
+// to be walked. rootDirFS opens directories with O_DIRECTORY and everything with
+// O_NONBLOCK, so a pipe fails straight away instead.
+type rootDirFS struct {
+	root *os.Root
+}
+
+func (r rootDirFS) Open(name string) (fs2.File, error) {
+	if !fs2.ValidPath(name) {
+		return nil, &os.PathError{Op: "open", Path: name, Err: os.ErrInvalid}
+	}
+	return r.root.OpenFile(name, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+}
+
+func (r rootDirFS) Stat(name string) (fs2.FileInfo, error) {
+	if !fs2.ValidPath(name) {
+		return nil, &os.PathError{Op: "stat", Path: name, Err: os.ErrInvalid}
+	}
+	return r.root.Stat(name)
+}
+
+// ReadDir returns the entries of the directory sorted by name, as [fs2.ReadDir] does.
+func (r rootDirFS) ReadDir(name string) ([]fs2.DirEntry, error) {
+	if !fs2.ValidPath(name) {
+		return nil, &os.PathError{Op: "readdir", Path: name, Err: os.ErrInvalid}
+	}
+	f, err := r.root.OpenFile(name, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	entries, err := f.ReadDir(-1)
+	slices.SortFunc(entries, func(a, b fs2.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
+	return entries, err
+}
+
+// errWriter passes writes through to w and remembers the first error, for when
+// the code doing the writing does not pass every error back.
+type errWriter struct {
+	w   io.Writer
+	err error
+}
+
+func (e *errWriter) Write(p []byte) (int, error) {
+	if e.err != nil {
+		return 0, e.err
+	}
+	n, err := e.w.Write(p)
+	if err != nil {
+		e.err = err
+	}
+	return n, err
+}
+
 // ReadDir returns all the contents of the given directory.
 func (fs *Filesystem) ReadDir(p string) ([]fs2.DirEntry, error) {
-	e, err := fs2.ReadDir(fs.root.FS(), normalize(p))
+	e, err := fs2.ReadDir(rootDirFS{fs.root}, normalize(p))
 	if err != nil {
 		return []fs2.DirEntry{}, errors.Wrap(err, "server/filesystem: readdir: failed to read directory")
 	}
@@ -493,7 +561,7 @@ func (fs *Filesystem) ReadDir(p string) ([]fs2.DirEntry, error) {
 // TruncateRootDirectory removes _all_ files and directories from a server's
 // data directory and resets the used disk space to zero.
 func (fs *Filesystem) TruncateRootDirectory() error {
-	entries, err := fs2.ReadDir(fs.root.FS(), ".")
+	entries, err := fs2.ReadDir(rootDirFS{fs.root}, ".")
 	if err == nil {
 		for _, e := range entries {
 			if err = fs.root.RemoveAll(e.Name()); err != nil {
@@ -542,6 +610,19 @@ func (fs *Filesystem) Delete(p string) error {
 	}
 
 	if err := fs.root.RemoveAll(p); err != nil {
+		// Part of the tree may have been removed before the error. Stop counting
+		// what is gone, so the server is not refused writes for space it has back.
+		var remaining int64
+		if st, serr := fs.root.Lstat(p); serr == nil {
+			if st.IsDir() {
+				remaining, _ = fs.DirectorySize(p)
+			} else if st.Mode().IsRegular() {
+				remaining = st.Size()
+			}
+		}
+		if remaining < size {
+			fs.addDisk(remaining - size)
+		}
 		return errors.Wrap(err, "server/filesystem: delete: failed to remove path")
 	}
 	fs.addDisk(-size)

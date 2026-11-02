@@ -194,17 +194,32 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 	// Create a new gzip writer around the file.
 	gw, _ := pgzip.NewWriterLevel(w, compressionLevel)
 	_ = gw.SetConcurrency(1<<20, 1)
-	defer gw.Close()
 
 	// Create a new tar writer around the gzip writer.
 	tw := tar.NewWriter(gw)
-	defer tw.Close()
 
 	a.pw = NewTarProgress(tw, a.p)
 
 	// The walk is performed through the os.Root instance, so nothing outside the
 	// server's data directory can ever be reached, and symlinks are not followed.
-	return fs.WalkDir(a.root.FS(), a.dir, a.walker(ctx))
+	if err := fs.WalkDir(rootDirFS{a.root}, a.dir, a.walker(ctx)); err != nil {
+		_ = tw.Close()
+		_ = gw.Close()
+		return err
+	}
+
+	// Close both writers here rather than in a defer, so their errors are returned.
+	// Up to 1 MiB of compressed data is only written out by gw.Close, so for a small
+	// server a write failure (a full disk, a dropped connection) would otherwise
+	// still be reported as a complete archive.
+	if err := tw.Close(); err != nil {
+		_ = gw.Close()
+		return errors.Wrap(err, "server/filesystem: archive: failed to finish tar stream")
+	}
+	if err := gw.Close(); err != nil {
+		return errors.Wrap(err, "server/filesystem: archive: failed to finish gzip stream")
+	}
+	return nil
 }
 
 // Callback function used to determine if a given file should be included in the archive

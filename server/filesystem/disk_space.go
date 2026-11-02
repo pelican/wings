@@ -170,7 +170,7 @@ func (fs *Filesystem) DirectorySize(dir string) (int64, error) {
 	var size int64
 	var links []uint64
 
-	err := fs2.WalkDir(fs.root.FS(), dir, func(_ string, d fs2.DirEntry, err error) error {
+	err := fs2.WalkDir(rootDirFS{fs.root}, dir, func(_ string, d fs2.DirEntry, err error) error {
 		if err != nil {
 			// A file or directory disappearing while we are walking is expected on a
 			// running server; skip over it rather than aborting the entire calculation.

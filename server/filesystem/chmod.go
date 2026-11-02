@@ -64,7 +64,7 @@ func (fs *Filesystem) Chown(p string) error {
 
 	// If this was a directory, begin walking over its contents recursively and ensure that all
 	// the subfiles and directories get their owner updated as well.
-	return fs2.WalkDir(fs.root.FS(), p, func(name string, _ fs2.DirEntry, err error) error {
+	return fs2.WalkDir(rootDirFS{fs.root}, p, func(name string, _ fs2.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, fs2.ErrNotExist) {
 				return nil
