@@ -16,7 +16,6 @@ import (
 	"github.com/goccy/go-json"
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
-	"github.com/pelican/wings/environment/docker"
 	"github.com/pelican/wings/remote"
 	"github.com/pelican/wings/server/filesystem"
 	"github.com/pelican/wings/server/filesystem/quotas"
@@ -26,13 +25,41 @@ type Manager struct {
 	mu      sync.RWMutex
 	client  remote.Client
 	servers []*Server
+
+	// envFactory builds the process environment for every server initialized
+	// through this manager. Defaults to DockerEnvironmentFactory.
+	envFactory EnvironmentFactory
+	// installer runs installation scripts for servers initialized through this
+	// manager. Defaults to the Docker based installer.
+	installer Installer
+}
+
+// ManagerOption configures optional behaviour of a Manager.
+type ManagerOption func(m *Manager)
+
+// WithEnvironmentFactory sets the factory used to create the process
+// environment of every server initialized by the manager. When not set, the
+// Docker environment is used.
+func WithEnvironmentFactory(f EnvironmentFactory) ManagerOption {
+	return func(m *Manager) {
+		m.envFactory = f
+	}
+}
+
+// WithInstaller sets the installer used to run installation scripts for every
+// server initialized by the manager. When not set, scripts run in a Docker
+// container.
+func WithInstaller(i Installer) ManagerOption {
+	return func(m *Manager) {
+		m.installer = i
+	}
 }
 
 // NewManager returns a new server manager instance. This will boot up all the
 // servers that are currently present on the filesystem and set them into the
 // manager.
-func NewManager(ctx context.Context, client remote.Client) (*Manager, error) {
-	m := NewEmptyManager(client)
+func NewManager(ctx context.Context, client remote.Client, opts ...ManagerOption) (*Manager, error) {
+	m := NewEmptyManager(client, opts...)
 	if err := m.init(ctx); err != nil {
 		return nil, err
 	}
@@ -42,8 +69,12 @@ func NewManager(ctx context.Context, client remote.Client) (*Manager, error) {
 // NewEmptyManager returns a new empty manager collection without actually
 // loading any of the servers from the disk. This allows the caller to set their
 // own servers into the collection as needed.
-func NewEmptyManager(client remote.Client) *Manager {
-	return &Manager{client: client}
+func NewEmptyManager(client remote.Client, opts ...ManagerOption) *Manager {
+	m := &Manager{client: client}
+	for _, opt := range opts {
+		opt(m)
+	}
+	return m
 }
 
 // Client returns the HTTP client interface that allows interaction with the
@@ -208,9 +239,6 @@ func (m *Manager) InitServer(data remote.ServerConfigurationResponse) (*Server, 
 		}
 	}
 
-	// Right now we only support a Docker based environment, so I'm going to hard code
-	// this logic in. When we're ready to support other environment we'll need to make
-	// some modifications here, obviously.
 	settings := environment.Settings{
 		Mounts:      s.Mounts(),
 		Allocations: s.cfg.Allocations,
@@ -219,14 +247,19 @@ func (m *Manager) InitServer(data remote.ServerConfigurationResponse) (*Server, 
 	}
 
 	envCfg := environment.NewConfiguration(settings, s.GetEnvironmentVariables())
-	meta := docker.Metadata{
-		Image: s.Config().Container.Image,
-	}
 
-	if env, err := docker.New(s.ID(), &meta, envCfg); err != nil {
+	// Build the process environment through the configured factory. The default
+	// is the Docker environment, alternative environments are registered with
+	// WithEnvironmentFactory.
+	factory := m.envFactory
+	if factory == nil {
+		factory = DockerEnvironmentFactory
+	}
+	if env, err := factory(s, envCfg); err != nil {
 		return nil, err
 	} else {
 		s.Environment = env
+		s.installer = m.installer
 		s.StartEventListeners()
 	}
 

@@ -3,8 +3,6 @@ package server
 import (
 	"time"
 
-	"github.com/pelican/wings/environment/docker"
-
 	"github.com/pelican/wings/environment"
 )
 
@@ -31,10 +29,10 @@ func (s *Server) SyncWithEnvironment() {
 		Labels:      cfg.Labels,
 	})
 
-	// For Docker specific environments we also want to update the configured image
-	// and stop configuration.
-	if e, ok := s.Environment.(*docker.Environment); ok {
-		s.Log().Debug("syncing stop configuration with configured docker environment")
+	// Environments that track the container image and the stop configuration
+	// (such as Docker) also need to be told about the new values.
+	if e, ok := s.Environment.(ImageAndStopConfigurable); ok {
+		s.Log().Debug("syncing image and stop configuration with configured environment")
 		e.SetImage(cfg.Container.Image)
 		e.SetStopConfiguration(s.ProcessConfiguration().Stop)
 	}
