@@ -126,6 +126,11 @@ func WithMatching(files []string) ArchiveOption {
 			return errors.NewPlain("cannot create an archive with both ignored and matching configurations")
 		}
 
+		if len(files) == 0 {
+			// No files means no restriction, the same as not using this option.
+			return nil
+		}
+
 		a.matching = make([]string, 0, len(files))
 		for _, f := range files {
 			if f = normalize(f); f != "." {
@@ -237,10 +242,10 @@ func (a *Archive) walker(ctx context.Context) fs.WalkDirFunc {
 			if err := budget.track(time.Since(start)); err != nil {
 				return err
 			}
+			// Directories are still walked even when they match, the same as the
+			// previous implementation, so that "!" rules can re-include files inside
+			// them. They are just not added to the archive themselves.
 			if skip {
-				if de.IsDir() {
-					return fs.SkipDir
-				}
 				return nil
 			}
 		}

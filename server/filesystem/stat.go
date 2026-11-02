@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"strconv"
+	"syscall"
 	"time"
 
 	"emperror.dev/errors"
@@ -62,7 +63,7 @@ func (fs *Filesystem) Stat(p string) (Stat, error) {
 		return st, nil
 	}
 
-	f, err := fs.root.Open(p)
+	f, err := fs.openRegular(p)
 	if err != nil {
 		return Stat{}, errors.Wrap(err, "server/filesystem: stat: failed to open file")
 	}
@@ -74,6 +75,25 @@ func (fs *Filesystem) Stat(p string) (Stat, error) {
 	st.Mimetype = m.String()
 
 	return st, nil
+}
+
+// openRegular opens a file for reading, returning an ErrCodeNotRegular error if
+// it is not a regular file. It never blocks, even if the file is a named pipe.
+func (fs *Filesystem) openRegular(p string) (*os.File, error) {
+	f, err := fs.root.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, err
+	}
+	st, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if !st.Mode().IsRegular() {
+		_ = f.Close()
+		return nil, &Error{code: ErrCodeNotRegular, resolved: p}
+	}
+	return f, nil
 }
 
 func (fs *Filesystem) Stat2(p string) (os.FileInfo, error) {

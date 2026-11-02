@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 
+	"emperror.dev/errors"
 	"github.com/gammazero/workerpool"
 
 	"github.com/pelican/wings/server/filesystem"
@@ -52,7 +53,7 @@ func (s *Server) UpdateConfigurationFiles() {
 			}()
 			if err != nil {
 				log := s.Log().WithField("file_name", filename)
-				if os.IsNotExist(err) && !f.AllowCreateFile {
+				if errors.Is(err, os.ErrNotExist) && !f.AllowCreateFile {
 					log.Debug("file not created")
 				} else {
 					s.Log().WithField("file_name", f.FileName).WithField("error", err).Error("failed to open configuration file")

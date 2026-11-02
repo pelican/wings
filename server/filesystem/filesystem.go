@@ -105,7 +105,7 @@ func (fs *Filesystem) File(p string) (*os.File, Stat, error) {
 	if !st.Mode().IsRegular() {
 		return nil, Stat{FileInfo: st}, &Error{code: ErrCodeNotRegular, resolved: p}
 	}
-	f, err := fs.root.Open(p)
+	f, err := fs.root.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, Stat{}, errors.WithStackIf(err)
 	}
@@ -181,6 +181,9 @@ func (fs *Filesystem) touch(p string, flag int, mode os.FileMode) (*os.File, err
 		}
 	}
 
+	// O_NONBLOCK makes sure we never hang if the file is swapped for a named pipe
+	// after the check above; the handle is rejected below if it is not a regular file.
+	flag |= syscall.O_NONBLOCK
 	o := &fileOpener{root: fs.root}
 	f, err := o.open(p, flag, mode)
 	if err != nil {
@@ -428,7 +431,7 @@ func (fs *Filesystem) Copy(p string) error {
 		name = strings.TrimSuffix(name, ".tar")
 	}
 
-	source, err := fs.root.Open(p)
+	source, err := fs.openRegular(p)
 	if err != nil {
 		return err
 	}
@@ -546,6 +549,58 @@ func (fs *Filesystem) Delete(p string) error {
 	return nil
 }
 
+// SafeDeleteRecursively deletes a file or directory while respecting the denylist.
+// Denylisted files and directories are left in place, as is every directory that
+// still contains one of them.
+func (fs *Filesystem) SafeDeleteRecursively(p string) error {
+	p = normalize(p)
+	if p == "." {
+		return errors.New("server/filesystem: delete: cannot delete root directory")
+	}
+
+	info, err := fs.root.Lstat(p)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return errors.Wrap(err, "server/filesystem: delete: failed to stat file")
+	}
+
+	// Skip denylisted files and directories entirely.
+	if fs.IsIgnored(p) != nil {
+		return nil
+	}
+
+	if !info.IsDir() {
+		return fs.Delete(p)
+	}
+
+	entries, err := fs.ReadDir(p)
+	if err != nil {
+		return err
+	}
+
+	remaining := false
+	for _, e := range entries {
+		child := path.Join(p, e.Name())
+		if err := fs.SafeDeleteRecursively(child); err != nil {
+			return err
+		}
+		if _, err := fs.root.Lstat(child); err == nil {
+			remaining = true
+		}
+	}
+
+	// Only remove the directory itself if nothing was left behind in it.
+	if remaining {
+		return nil
+	}
+	if err := fs.root.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return errors.Wrap(err, "server/filesystem: delete: failed to remove directory")
+	}
+	return nil
+}
+
 type fileOpener struct {
 	busy uint
 	root *os.Root
@@ -584,6 +639,10 @@ func (fs *Filesystem) ListDirectory(p string) ([]Stat, error) {
 	}
 
 	var wg sync.WaitGroup
+	// Bound the number of files inspected at once so that listing a directory with a
+	// huge number of entries does not spawn an equally huge number of goroutines and
+	// open file descriptors.
+	sem := make(chan struct{}, 16)
 
 	// You must initialize the output of this directory as a non-nil value otherwise
 	// when it is marshaled into a JSON object you'll just get 'null' back, which will
@@ -595,8 +654,10 @@ func (fs *Filesystem) ListDirectory(p string) ([]Stat, error) {
 	for i, file := range files {
 		wg.Add(1)
 
+		sem <- struct{}{}
 		go func(idx int, d fs2.DirEntry) {
 			defer wg.Done()
+			defer func() { <-sem }()
 
 			fi, err := d.Info()
 			if err != nil {
@@ -616,7 +677,7 @@ func (fs *Filesystem) ListDirectory(p string) ([]Stat, error) {
 			//
 			// @see https://github.com/pterodactyl/panel/issues/4059
 			if fi.Mode().IsRegular() {
-				if f, err := fs.root.Open(normalize(filepath.Join(p, d.Name()))); err != nil {
+				if f, err := fs.openRegular(normalize(filepath.Join(p, d.Name()))); err != nil {
 					if !IsPathError(err) && !IsLinkError(err) {
 						log.WithField("error", err).WithField("path", filepath.Join(p, d.Name())).Warn("error opening file for mimetype detection")
 					}

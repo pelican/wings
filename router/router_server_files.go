@@ -242,7 +242,7 @@ func postServerDeleteFiles(c *gin.Context) {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
-				return s.Filesystem().Delete(pi)
+				return s.Filesystem().SafeDeleteRecursively(pi)
 			}
 		})
 	}
@@ -467,7 +467,7 @@ func postServerCompressFiles(c *gin.Context) {
 	// The extention comes from the panel
 	// Supported are: zip, tar.gz, tar.bz2, tar.xz
 	// No need to check if it is empty or wrong as if data.Extention is wrong the function falls back to tar.gz
-	f, mimetype, err := s.Filesystem().CompressFiles(c.Request.Context(), data.RootPath, data.Name, data.Files, data.Extension)
+	f, mimetype, err := s.Filesystem().CompressFiles(context.Background(), data.RootPath, data.Name, data.Files, data.Extension)
 	if err != nil {
 		if errors.Is(err, filesystem.ErrNoSpaceAvailable) {
 			c.AbortWithStatusJSON(http.StatusConflict, gin.H{

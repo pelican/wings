@@ -272,3 +272,67 @@ func TestFilesystem_IsIgnoredCleansPaths(t *testing.T) {
 		t.Errorf("expected foo/config.yml to be allowed, got %v", err)
 	}
 }
+
+func TestFilesystem_SafeDeleteRecursivelyKeepsDenylistedFiles(t *testing.T) {
+	fs := NewFs()
+	defer fs.reset()
+
+	fs.denylist = ignore.CompileIgnoreLines("config.yml")
+	if err := os.MkdirAll(filepath.Join(fs.rootPath, "dir/sub"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fs.write("dir/config.yml", []byte("secret"))
+	fs.write("dir/other.txt", []byte("other"))
+	fs.write("dir/sub/file.txt", []byte("file"))
+	fs.write("config.yml", []byte("secret"))
+
+	if err := fs.SafeDeleteRecursively("dir"); err != nil {
+		t.Fatalf("SafeDeleteRecursively returned an error: %v", err)
+	}
+	if err := fs.SafeDeleteRecursively("config.yml"); err != nil {
+		t.Fatalf("SafeDeleteRecursively returned an error: %v", err)
+	}
+
+	for _, p := range []string{"dir/config.yml", "config.yml"} {
+		if _, err := os.Stat(filepath.Join(fs.rootPath, p)); err != nil {
+			t.Errorf("expected denylisted %s to be kept: %v", p, err)
+		}
+	}
+	for _, p := range []string{"dir/other.txt", "dir/sub"} {
+		if _, err := os.Lstat(filepath.Join(fs.rootPath, p)); !os.IsNotExist(err) {
+			t.Errorf("expected %s to be deleted, got %v", p, err)
+		}
+	}
+}
+
+func TestArchive_IgnoreAllowsReincludingFiles(t *testing.T) {
+	fs := NewFs()
+	defer fs.reset()
+
+	if err := os.MkdirAll(filepath.Join(fs.rootPath, "build"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fs.write("build/keep.txt", []byte("keep"))
+	fs.write("build/drop.txt", []byte("drop"))
+	fs.write("server.jar", []byte("jar"))
+
+	archivePath := filepath.Join(fs.rootPath, "../archive.tar.gz")
+	f, err := os.Create(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	a, err := NewArchive(fs.root, ".", WithIgnored("build/\n!build/keep.txt\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Create(context.Background(), f); err != nil {
+		t.Fatal(err)
+	}
+
+	got := strings.Join(archiveNames(t, archivePath), ",")
+	if want := "build,build/keep.txt,server.jar"; got != want {
+		t.Errorf("unexpected archive contents: got %s, want %s", got, want)
+	}
+}

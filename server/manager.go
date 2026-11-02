@@ -207,6 +207,15 @@ func (m *Manager) InitServer(data remote.ServerConfigurationResponse) (*Server, 
 
 	s.fs = fs
 
+	// Close the filesystem root again if the server cannot be initialized, so that
+	// the file descriptor is not leaked.
+	initialized := false
+	defer func() {
+		if !initialized {
+			_ = fs.Close()
+		}
+	}()
+
 	// if quotas are enabled ensure quotas are configured
 	if config.Get().System.Quotas.Enabled {
 		if err = quotas.AddQuota(s.Config().Pid, s.Config().Uuid); err != nil {
@@ -241,6 +250,7 @@ func (m *Manager) InitServer(data remote.ServerConfigurationResponse) (*Server, 
 		s.Filesystem().HasSpaceAvailable(true)
 	}
 
+	initialized = true
 	return s, nil
 }
 

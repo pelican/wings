@@ -111,6 +111,8 @@ func postTransfers(c *gin.Context) {
 			manager.Remove(func(match *server.Server) bool {
 				return match.ID() == trnsfr.Server.ID()
 			})
+			// The server is no longer managed by this node, release its filesystem root.
+			defer func() { _ = trnsfr.Server.Filesystem().Close() }()
 		}
 
 		if err := manager.Client().SetTransferStatus(context.Background(), trnsfr.Server.ID(), successful); err != nil {

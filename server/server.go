@@ -394,7 +394,7 @@ func (s *Server) EnsureDataDirectoryExists() (string, error) {
 		}
 
 		if err := os.Chown(serverPath, c.System.User.Uid, c.System.User.Gid); err != nil {
-			return serverPath, errors.Wrap(err, "server: failed to chown newly created root directory")
+			s.Log().WithField("error", err).Warn("server: failed to chown server data directory")
 		}
 	}
 
