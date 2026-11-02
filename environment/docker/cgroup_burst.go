@@ -130,18 +130,23 @@ func logBurstFailure(l *log.Entry, burst int64) {
 }
 
 // SetCpuBurst applies the configured CFS burst to a running container based on
-// the CFS quota in microseconds it was created with. This is a no-op when
-// bursting is disabled or the container has no CPU limit.
+// the CFS quota in microseconds it was created with. When bursting is disabled
+// or the container has no CPU limit, the burst is cleared instead, so a value
+// left over from an earlier configuration does not outlive the setting.
 func SetCpuBurst(ctx context.Context, cli *client.Client, containerID string, quota int64) {
 	cfg := config.Get().Docker.CpuBurst
-	if !cfg.Enabled || quota <= 0 {
-		return
+
+	var burst int64
+	if cfg.Enabled {
+		// Returns 0 when quota <= 0 or percent <= 0.
+		burst = cpuBurstMicroseconds(quota, cfg.Percent)
 	}
+
 	c, err := cli.ContainerInspect(ctx, containerID)
 	if err != nil || c.State == nil {
 		return
 	}
-	writeCpuBurst(log.WithField("container_id", containerID), c.ID, c.State.Pid, cpuBurstMicroseconds(quota, cfg.Percent))
+	writeCpuBurst(log.WithField("container_id", containerID), c.ID, c.State.Pid, burst)
 }
 
 // applyCpuBurst applies the configured CFS burst to the environment's container
