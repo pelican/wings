@@ -210,6 +210,85 @@ func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode ufs.FileM
 	return err
 }
 
+// WriteStream writes r to the file at p when the total size of the data is not
+// known ahead of time, such as a chunked HTTP response without a Content-Length.
+//
+// Since the space required cannot be checked before writing, the data is copied
+// up to the space remaining in the server's disk limit. If the data does not fit,
+// the partially written file is removed and a disk space error is returned.
+func (fs *Filesystem) WriteStream(p string, r io.Reader, mode ufs.FileMode) error {
+	var currentSize int64
+	st, err := fs.unixFS.Stat(p)
+	if err != nil && !errors.Is(err, ufs.ErrNotExist) {
+		return errors.Wrap(err, "server/filesystem: writestream: failed to stat file")
+	} else if err == nil {
+		if st.IsDir() {
+			return errors.WithStack(&Error{code: ErrCodeIsDirectory, resolved: ""})
+		}
+		currentSize = st.Size()
+	}
+
+	// The file being replaced frees up its current size.
+	remaining := fs.remainingSpace(currentSize)
+	if remaining == 0 {
+		return newFilesystemError(ErrCodeDiskSpace, nil)
+	}
+
+	if err := fs.mkdirAll(filepath.Dir(p), 0o755); err != nil {
+		return err
+	}
+
+	file, err := fs.unixFS.Touch(p, ufs.O_RDWR|ufs.O_TRUNC, mode)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Read at most one byte past the remaining space so that data which does not
+	// fit can be detected without writing all of it to the disk.
+	src := r
+	if remaining > 0 {
+		src = io.LimitReader(r, remaining+1)
+	}
+	n, err := io.Copy(file, src)
+	fs.unixFS.Add(n - currentSize)
+
+	if err == nil && remaining > 0 && n > remaining {
+		_ = file.Close()
+		if rerr := fs.unixFS.Remove(p); rerr != nil {
+			log.WithField("path", p).WithField("error", rerr).Warn("failed to remove file that exceeded the disk limit")
+		}
+		return newFilesystemError(ErrCodeDiskSpace, nil)
+	}
+
+	if err := fs.chownFile(p); err != nil {
+		return err
+	}
+	return err
+}
+
+// remainingSpace returns the number of bytes that may still be written to the
+// filesystem, counting freed bytes as available. A value of -1 is returned when
+// there is no limit, or the current usage is not yet known.
+func (fs *Filesystem) remainingSpace(freed int64) int64 {
+	limit := fs.unixFS.Limit()
+	switch {
+	case limit == 0:
+		return -1
+	case limit < 0:
+		// A negative limit disallows any writes.
+		return 0
+	}
+	usage := fs.unixFS.Usage()
+	if usage < 0 {
+		return -1
+	}
+	if remaining := limit - usage + freed; remaining > 0 {
+		return remaining
+	}
+	return 0
+}
+
 // CreateDirectory creates a new directory (name) at a specified path (p) for
 // the server.
 func (fs *Filesystem) CreateDirectory(name string, p string) error {
