@@ -34,13 +34,31 @@ func (s *Server) notifyPanelOfBackup(uuid string, ad *backup.ArchiveDetails, suc
 	return nil
 }
 
-// Get all of the ignored files for a server based on its .pelicanignore file in the root.
+// ignoreFileNames are the server-wide ignore files checked, in order of
+// preference. .pteroignore is still honoured for servers migrated from
+// Pterodactyl that have not renamed their ignore file.
+var ignoreFileNames = []string{".pelicanignore", ".pteroignore"}
+
+// Get all of the ignored files for a server based on its .pelicanignore file in
+// the root, falling back to a legacy .pteroignore file if that does not exist.
 func (s *Server) getServerwideIgnoredFiles() (string, error) {
-	f, st, err := s.Filesystem().File(".pelicanignore")
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
-			return "", nil
+	for _, name := range ignoreFileNames {
+		ignored, err := s.readIgnoreFile(name)
+		if err == nil {
+			return ignored, nil
 		}
+		if !errors.Is(err, os.ErrNotExist) {
+			return "", err
+		}
+	}
+	return "", nil
+}
+
+// readIgnoreFile reads and validates the ignore file with the given name in the
+// server root. An error matching os.ErrNotExist is returned if it does not exist.
+func (s *Server) readIgnoreFile(name string) (string, error) {
+	f, st, err := s.Filesystem().File(name)
+	if err != nil {
 		return "", err
 	}
 	defer f.Close()
@@ -53,7 +71,7 @@ func (s *Server) getServerwideIgnoredFiles() (string, error) {
 		return "", err
 	}
 	if err := filesystem.ValidateIgnore(string(b)); err != nil {
-		return "", errors.WrapIf(err, "backup: invalid .pelicanignore file")
+		return "", errors.WrapIf(err, "backup: invalid "+name+" file")
 	}
 	return string(b), nil
 }
