@@ -3,18 +3,26 @@ package environment
 import (
 	"fmt"
 	"strconv"
+	"strings"
 
 	"github.com/docker/go-connections/nat"
 
 	"github.com/pelican/wings/config"
 )
 
+// The transport protocols an allocation can be exposed over.
+const (
+	ProtocolTCP  = "tcp"
+	ProtocolUDP  = "udp"
+	ProtocolBoth = "both"
+)
 
 // DefaultAllocationMapping defines the IP and port mapping for a server
 type DefaultAllocationMapping struct {
 	Ip   string `json:"ip"`
 	Port int    `json:"port"`
 }
+
 // Defines the allocations available for a given server. When using the Docker environment
 // driver these correspond to mappings for the container that allow external connections.
 type Allocations struct {
@@ -32,6 +40,25 @@ type Allocations struct {
 	// Mappings contains all the ports that should be assigned to a given server
 	// attached to the IP they correspond to.
 	Mappings map[string][]int `json:"mappings"`
+
+	// Protocols optionally restricts the transport protocol of individual ports listed in
+	// Mappings, keyed by IP and then by port. Valid values are "tcp", "udp" and "both". Any
+	// port that is not listed here, or that has an unrecognised value, is exposed over both
+	// TCP and UDP, which keeps payloads from Panels that predate this field working as before.
+	Protocols map[string]map[int]string `json:"protocols"`
+}
+
+// protocolsFor returns the transport protocols that the given IP and port should be exposed
+// over. Anything other than an explicit "tcp" or "udp" results in both being exposed.
+func (a *Allocations) protocolsFor(ip string, port int) []string {
+	switch strings.ToLower(a.Protocols[ip][port]) {
+	case ProtocolTCP:
+		return []string{ProtocolTCP}
+	case ProtocolUDP:
+		return []string{ProtocolUDP}
+	default:
+		return []string{ProtocolTCP, ProtocolUDP}
+	}
 }
 
 // Converts the server allocation mappings into a format that can be understood by Docker. While
@@ -54,11 +81,10 @@ func (a *Allocations) Bindings() nat.PortMap {
 				HostPort: strconv.Itoa(port),
 			}
 
-			tcp := nat.Port(fmt.Sprintf("%d/tcp", port))
-			udp := nat.Port(fmt.Sprintf("%d/udp", port))
-
-			out[tcp] = append(out[tcp], binding)
-			out[udp] = append(out[udp], binding)
+			for _, proto := range a.protocolsFor(ip, port) {
+				key := nat.Port(fmt.Sprintf("%d/%s", port, proto))
+				out[key] = append(out[key], binding)
+			}
 		}
 	}
 
