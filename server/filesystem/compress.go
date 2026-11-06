@@ -74,13 +74,16 @@ func (fs *Filesystem) CompressFiles(ctx context.Context, dir string, name string
 		return nil, "", fmt.Errorf("no valid files to compress")
 	}
 
+	// The default name has one-second resolution, so it can be taken too: two
+	// archives made in the same second must not collide.
 	if name == "" {
-		name = fmt.Sprintf("archive-%s%s", strings.ReplaceAll(time.Now().Format(time.RFC3339), ":", ""), ext)
+		name = "archive-" + strings.ReplaceAll(time.Now().Format(time.RFC3339), ":", "")
 	} else {
-		name, err = fs.findCopySuffix(dir, path.Base(normalize(name)), ext)
-		if err != nil {
-			return nil, "", errors.Wrap(err, "server/filesystem: compress: failed to find unique archive name")
-		}
+		name = path.Base(normalize(name))
+	}
+	name, err = fs.findCopySuffix(dir, name, ext)
+	if err != nil {
+		return nil, "", errors.Wrap(err, "server/filesystem: compress: failed to find unique archive name")
 	}
 	destPath := normalize(path.Join(dir, name))
 

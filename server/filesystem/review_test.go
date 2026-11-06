@@ -51,6 +51,36 @@ func TestFilesystem_CompressFilesWholeDirectory(t *testing.T) {
 	}
 }
 
+// The default archive name only has one-second resolution. A second archive made
+// in the same second, or a file the user already has with that name, must get a
+// new name instead of failing (or, as main did, being overwritten).
+func TestFilesystem_CompressFilesDefaultNameAlreadyTaken(t *testing.T) {
+	fs := NewFs()
+	defer fs.reset()
+
+	fs.write("a.txt", []byte("a"))
+	now := time.Now()
+	var taken []string
+	for _, ts := range []time.Time{now, now.Add(time.Second)} {
+		n := "archive-" + strings.ReplaceAll(ts.Format(time.RFC3339), ":", "") + ".tar.gz"
+		fs.write(n, []byte("keep me"))
+		taken = append(taken, n)
+	}
+
+	info, _, err := fs.CompressFiles(context.Background(), "/", "", []string{"a.txt"}, "tar.gz")
+	if err != nil {
+		t.Fatalf("expected the archive to get a free name, got %v", err)
+	}
+	for _, n := range taken {
+		if info.Name() == n {
+			t.Errorf("archive reused the existing name %s", n)
+		}
+		if b, _ := os.ReadFile(filepath.Join(fs.rootPath, n)); string(b) != "keep me" {
+			t.Errorf("existing file %s was overwritten", n)
+		}
+	}
+}
+
 // Every archive format buffers its final bytes until it is closed. Running out
 // of space at that point must fail the request, not return a truncated archive.
 func TestFilesystem_CompressFilesReportsFailureOnFinalWrite(t *testing.T) {
