@@ -4,6 +4,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"sort"
 	"time"
 
 	"emperror.dev/errors"
@@ -155,18 +156,60 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	// Attempt to restore the backup to the server by running through each entry
 	// in the file one at a time and writing them to the disk.
 	s.Log().Debug("starting file writing process for backup restoration")
+
+	// Directory modes and times are applied once everything has been restored. A
+	// mode without write permission would otherwise stop the files inside it being
+	// written, and writing those files would change the directory's time anyway.
+	type restoredDir struct {
+		name  string
+		mode  fs.FileMode
+		mtime time.Time
+	}
+	var dirs []restoredDir
+
 	err = b.Restore(s.Context(), reader, func(file string, info fs.FileInfo, r io.ReadCloser) error {
 		defer r.Close()
-		s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
-		// TODO: since this will be called a lot, it may be worth adding an optimized
-		// Write with Chtimes method to the UnixFS that is able to re-use the
-		// same dirfd and file name.
-		if err := s.Filesystem().Write(file, r, info.Size(), info.Mode()); err != nil {
-			return err
+		if file == "." {
+			return nil
 		}
+
+		s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
+		if info.IsDir() {
+			if err := s.Filesystem().CreateDirectory(file, "/"); err != nil {
+				return errors.WithStack(err)
+			}
+			// Keep setgid and sticky: shared folders rely on them. Setuid means
+			// nothing on a directory and is not restored.
+			mode := info.Mode() & (fs.ModePerm | fs.ModeSetgid | fs.ModeSticky)
+			dirs = append(dirs, restoredDir{name: file, mode: mode, mtime: info.ModTime()})
+			return nil
+		} else {
+			if !info.Mode().IsRegular() {
+				return nil
+			}
+
+			if err := s.Filesystem().Write(file, r, info.Size(), info.Mode().Perm()); err != nil {
+				return errors.WithStack(err)
+			}
+		}
+
 		atime := info.ModTime()
 		return s.Filesystem().Chtimes(file, atime, atime)
 	})
+	if err != nil {
+		return errors.WithStackIf(err)
+	}
 
-	return errors.WithStackIf(err)
+	// Deepest directories first, so a parent's mode is set after its children.
+	sort.Slice(dirs, func(i, j int) bool { return len(dirs[i].name) > len(dirs[j].name) })
+	for _, d := range dirs {
+		if err := s.Filesystem().Chmod(d.name, d.mode); err != nil {
+			return errors.WithStack(err)
+		}
+		if err := s.Filesystem().Chtimes(d.name, d.mtime, d.mtime); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+
+	return nil
 }
