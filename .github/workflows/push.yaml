@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04]
-        go: ["1.26.8", "1.27.1"]
+        go: ["1.26.8", "1.27.3"]
         goos: [linux]
         goarch: [amd64, arm64]
 
@@ -82,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ["1.26.8", "1.27.1"]
+        go: ["1.26.8", "1.27.3"]
 
     steps:
       - name: Setup Go
