@@ -2,6 +2,7 @@ package middleware
 
 import (
 	"context"
+	"io/fs"
 	"net/http"
 	"os"
 	"strings"
@@ -117,10 +118,24 @@ func (re *RequestError) asFilesystemError() (int, string) {
 	if err == nil {
 		return 0, ""
 	}
-	if filesystem.IsErrorCode(err, filesystem.ErrNotExist) ||
-		filesystem.IsErrorCode(err, filesystem.ErrCodePathResolution) || strings.Contains(err.Error(), "file does not exist") ||
-		strings.Contains(err.Error(), "resolves to a location outside the server root") {
-		return http.StatusNotFound, "The requested resources was not found on the system."
+	// os.Root returns an error ending in "path escapes from parent" when a path would
+	// resolve to a location outside the server's data directory; treat it the same as
+	// a file that does not exist, like "resolves to a location outside the server root"
+	// was treated previously.
+	if filesystem.IsErrorCode(err, filesystem.ErrNotExist) || errors.Is(err, fs.ErrNotExist) ||
+		strings.Contains(err.Error(), "path escapes from parent") {
+		return http.StatusNotFound, "The requested file or folder does not exist on the system."
+	}
+	if filesystem.IsErrorCode(err, filesystem.ErrCodeNotRegular) {
+		return http.StatusBadRequest, "Cannot perform that action: not a regular file."
+	}
+	if filesystem.IsErrorCode(err, filesystem.ErrCodeArchiveIsOutput) {
+		var fserr *filesystem.Error
+		_ = errors.As(err, &fserr)
+		return http.StatusBadRequest, "The file cannot be decompressed over the archive itself. Rename the archive to end in " + fserr.Resolved() + " first."
+	}
+	if filesystem.IsErrorCode(err, filesystem.ErrCodeUnknownArchive) {
+		return http.StatusBadRequest, "The archive provided is in a format Wings does not understand."
 	}
 	if filesystem.IsErrorCode(err, filesystem.ErrCodeDenylistFile) || strings.Contains(err.Error(), "filesystem: file access prohibited") {
 		return http.StatusForbidden, "This file cannot be modified: present in egg denylist."

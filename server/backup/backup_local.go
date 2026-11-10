@@ -85,19 +85,21 @@ func (b *LocalBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem,
 	if err := b.validateIdentifier(); err != nil {
 		return nil, err
 	}
-	a := &filesystem.Archive{
-		Filesystem: fsys,
-		Ignore:     ignore,
+	a, err := fsys.NewArchive(".", filesystem.WithIgnored(ignore))
+	if err != nil {
+		return nil, errors.WrapIf(err, "server/backup: failed to create archive")
 	}
 
 	b.log().WithField("path", b.Path()).Info("creating backup for server")
-	if _, err := os.Stat(filepath.Dir(b.Path())); os.IsNotExist(err) {
-		err := os.Mkdir(filepath.Dir(b.Path()), 0o700)
-		if err != nil {
-			return nil, err
-		}
+	if err := os.MkdirAll(filepath.Dir(b.Path()), 0o700); err != nil {
+		return nil, errors.Wrap(err, "server/backup: failed to create backup directory")
 	}
-	if err := a.Create(ctx, b.Path()); err != nil {
+	f, err := os.OpenFile(b.Path(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, errors.Wrap(err, "server/backup: failed to open file for writing")
+	}
+	defer f.Close()
+	if err := a.Create(ctx, f); err != nil {
 		return nil, err
 	}
 	b.log().Info("created backup successfully")
