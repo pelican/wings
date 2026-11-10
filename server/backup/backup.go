@@ -111,7 +111,11 @@ func (b *Backup) validateIdentifier() error {
 	if err != nil {
 		return err
 	}
-	b.Uuid = identifier
+	// Only write when normalizing changes the identifier: Details validates it
+	// from two goroutines at once.
+	if b.Uuid != identifier {
+		b.Uuid = identifier
+	}
 	return nil
 }
 
@@ -163,6 +167,10 @@ func (b *Backup) Checksum() ([]byte, error) {
 // Details returns both the checksum and size of the archive currently stored on
 // the disk to the caller.
 func (b *Backup) Details(ctx context.Context, parts []remote.BackupPart) (*ArchiveDetails, error) {
+	// Normalize the identifier before Checksum and Size read it concurrently.
+	if err := b.validateIdentifier(); err != nil {
+		return nil, err
+	}
 	ad := ArchiveDetails{ChecksumType: "sha1", Parts: parts}
 	g, ctx := errgroup.WithContext(ctx)
 
