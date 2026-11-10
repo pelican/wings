@@ -22,14 +22,19 @@ func (restoreTestClient) SendRestorationStatus(context.Context, string, bool) er
 // after every file was deleted recreates them (#168).
 func TestRestoreBackupRecreatesSymlinks(t *testing.T) {
 	serverDir := t.TempDir()
-	config.Set(&config.Configuration{
+	cfg := &config.Configuration{
 		AuthenticationToken: "abc",
 		System: config.SystemConfiguration{
 			RootDirectory:     filepath.Dir(serverDir),
 			BackupDirectory:   t.TempDir(),
 			DiskCheckInterval: 150,
 		},
-	})
+	}
+	// Restored files are chowned to the Wings user, so use the user running the
+	// test, which is not root in CI.
+	cfg.System.User.Uid = os.Getuid()
+	cfg.System.User.Gid = os.Getgid()
+	config.Set(cfg)
 
 	// The NeoForge layout: unix_args.txt in the server root links into libraries.
 	lib := filepath.Join(serverDir, "libraries", "neoforge")
