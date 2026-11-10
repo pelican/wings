@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"strings"
 
+	"emperror.dev/errors"
 	"github.com/gammazero/workerpool"
-	"github.com/pelican/wings/internal/ufs"
+
+	"github.com/pelican/wings/server/filesystem"
 )
 
 // Helper function to replace variables in the file path of the configuration parser
@@ -36,33 +38,32 @@ func replaceParserConfigPathVariables(filename string, envvars map[string]interf
 func (s *Server) UpdateConfigurationFiles() {
 	pool := workerpool.New(runtime.NumCPU())
 
-	s.Log().Debug("acquiring process configuration files...")
 	files := s.ProcessConfiguration().ConfigurationFiles
-	s.Log().Debug("acquired process configuration files")
+
 	for _, cf := range files {
 		f := cf
 
 		pool.Submit(func() {
 			filename := replaceParserConfigPathVariables(f.FileName, s.Config().EnvVars)
-			file, err := func() (ufs.File, error) {
+			file, err := func() (filesystem.File, error) {
 				if f.AllowCreateFile {
-					return s.Filesystem().UnixFS().Touch(filename, ufs.O_RDWR|ufs.O_CREATE, 0o644)
+					return s.Filesystem().Touch(filename, os.O_RDWR|os.O_CREATE, 0o644)
 				}
-				return s.Filesystem().UnixFS().Open(filename)
+				return s.Filesystem().Touch(filename, os.O_RDWR, 0o644)
 			}()
 			if err != nil {
 				log := s.Log().WithField("file_name", filename)
-				if os.IsNotExist(err) && !f.AllowCreateFile {
+				if errors.Is(err, os.ErrNotExist) && !f.AllowCreateFile {
 					log.Debug("file not created")
 				} else {
-					log.WithField("error", err).Error("failed to open file for configuration")
+					s.Log().WithField("file_name", f.FileName).WithField("error", err).Error("failed to open configuration file")
 				}
 				return
 			}
 			defer file.Close()
 
 			if err := f.Parse(file); err != nil {
-				s.Log().WithField("error", err).Error("failed to parse and update server configuration file")
+				s.Log().WithField("error", err).WithField("file_name", f.FileName).Error("failed to parse and update server configuration file")
 			}
 
 			s.Log().WithField("file_name", f.FileName).Debug("finished processing server configuration file")
