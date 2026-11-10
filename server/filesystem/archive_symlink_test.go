@@ -67,7 +67,14 @@ func TestArchive_IncludesSymlinks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := a.Create(context.Background(), archivePath); err != nil {
+	out, err := os.Create(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Create(context.Background(), out); err != nil {
+		t.Fatal(err)
+	}
+	if err := out.Close(); err != nil {
 		t.Fatal(err)
 	}
 
@@ -100,7 +107,7 @@ func TestFilesystem_RestoreSymlink(t *testing.T) {
 	if err := fs.RestoreSymlink("a/b/link", "../target.txt"); err != nil {
 		t.Fatal(err)
 	}
-	got, err := os.Readlink(filepath.Join(fs.tmpDir, "a/b/link"))
+	got, err := os.Readlink(filepath.Join(fs.rootPath, "a/b/link"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +123,7 @@ func TestFilesystem_RestoreSymlink(t *testing.T) {
 	if err := fs.RestoreSymlink("unix_args.txt", "libraries/unix_args.txt"); err != nil {
 		t.Fatal(err)
 	}
-	st, err := os.Lstat(filepath.Join(fs.tmpDir, "unix_args.txt"))
+	st, err := os.Lstat(filepath.Join(fs.rootPath, "unix_args.txt"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +140,7 @@ func TestFilesystem_RestoreSymlink(t *testing.T) {
 	}
 
 	// No temporary links are left behind.
-	des, err := os.ReadDir(fs.tmpDir)
+	des, err := os.ReadDir(fs.rootPath)
 	if err != nil {
 		t.Fatal(err)
 	}
