@@ -179,7 +179,13 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		l = l.WithField("target", request.Target)
 	}
 
-	if err := h.fs.IsIgnored(request.Filepath); err != nil {
+	// Renaming and deleting act on the entry itself, so a symlink at the end of
+	// the path is not followed: a link to a denylisted file can still be removed.
+	check := h.fs.IsIgnored
+	if request.Method == "Rename" || request.Method == "Rmdir" || request.Method == "Remove" {
+		check = h.fs.IsIgnoredNoFollow
+	}
+	if err := check(request.Filepath); err != nil {
 		return err
 	}
 

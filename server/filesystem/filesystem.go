@@ -30,6 +30,10 @@ type Filesystem struct {
 	diskCheckInterval time.Duration
 	denylist          *ignore.GitIgnore
 
+	// hasDenylist is false when the egg has no denylist, so that checks against it
+	// can skip resolving symlinks.
+	hasDenylist bool
+
 	// quota tracks the disk space used by this Filesystem instance along with
 	// the maximum amount of disk space (in bytes) that it is allowed to use.
 	quota diskQuota
@@ -62,6 +66,7 @@ func New(path string, size int64, denylist []string) (*Filesystem, error) {
 		lastLookupTime:    &usageLookupTime{},
 		lookupInProgress:  system.NewAtomicBool(false),
 		denylist:          ignore.CompileIgnoreLines(denylist...),
+		hasDenylist:       slices.ContainsFunc(denylist, func(l string) bool { return strings.TrimSpace(l) != "" }),
 	}
 	fs.root.Store(r)
 	fs.quota.SetLimit(size)
@@ -769,7 +774,7 @@ func (fs *Filesystem) SafeDeleteRecursively(p string) error {
 	}
 
 	// Skip denylisted files and directories entirely.
-	if fs.IsIgnored(p) != nil {
+	if fs.IsIgnoredNoFollow(p) != nil {
 		return nil
 	}
 

@@ -1,8 +1,16 @@
 package filesystem
 
 import (
+	"os"
+	"path"
+	"strings"
+
 	"emperror.dev/errors"
 )
+
+// maxSymlinkHops is how many symlinks resolveInRoot follows before giving up,
+// the same limit Linux uses (MAXSYMLINKS).
+const maxSymlinkHops = 40
 
 // Checks if the given file or path is in the server's file denylist. If so, an Error
 // is returned, otherwise nil is returned.
@@ -12,13 +20,107 @@ import (
 // "../config.yml" can be used to get around an anchored pattern like "/config.yml";
 // callers do not all clean a leading "/" off the same way before using the path.
 //
-// TODO: symlinks are not resolved, so a symlink pointing at a denylisted file is not
-// itself treated as denylisted (this was already the case before the move to os.Root).
+// The path is also checked after resolving any symlinks in it, since os.Root
+// follows symlinks that stay inside the server directory. Without that a link
+// such as "notes -> config.yml" would give access to a denylisted file.
 func (fs *Filesystem) IsIgnored(paths ...string) error {
 	for _, p := range paths {
-		if fs.denylist.MatchesPath(p) || fs.denylist.MatchesPath(normalize(p)) || fs.denylist.MatchesPath(normalize("/"+p)) {
+		if fs.matchesDenylist(p) {
 			return errors.WithStack(&Error{code: ErrCodeDenylistFile, path: p, resolved: normalize(p)})
+		}
+		if err := fs.isIgnoredThroughLink(p); err != nil {
+			return err
 		}
 	}
 	return nil
+}
+
+// IsIgnoredNoFollow is IsIgnored for operations that act on a directory entry
+// itself rather than on what it points to: deleting and renaming. Symlinks in the
+// parent directories are followed, since os.Root follows them too, but a symlink
+// at the end of the path is not, so a link to a denylisted file can still be
+// deleted or renamed without the file it points to being touched.
+func (fs *Filesystem) IsIgnoredNoFollow(paths ...string) error {
+	for _, p := range paths {
+		if fs.matchesDenylist(p) {
+			return errors.WithStack(&Error{code: ErrCodeDenylistFile, path: p, resolved: normalize(p)})
+		}
+		if !fs.hasDenylist {
+			continue
+		}
+		clean := normalize("/" + p)
+		if clean == "." {
+			continue
+		}
+		resolved := normalize("/" + path.Join(fs.resolveInRoot(path.Dir(clean)), path.Base(clean)))
+		if resolved != clean && fs.matchesDenylist(resolved) {
+			return errors.WithStack(&Error{code: ErrCodeDenylistFile, path: p, resolved: resolved})
+		}
+	}
+	return nil
+}
+
+// isIgnoredThroughLink returns an error if p, once its symlinks are resolved,
+// is a different path that is in the denylist. It does not check p itself.
+func (fs *Filesystem) isIgnoredThroughLink(p string) error {
+	if !fs.hasDenylist {
+		return nil
+	}
+	resolved := fs.resolveInRoot(p)
+	if resolved != normalize("/"+p) && fs.matchesDenylist(resolved) {
+		return errors.WithStack(&Error{code: ErrCodeDenylistFile, path: p, resolved: resolved})
+	}
+	return nil
+}
+
+func (fs *Filesystem) matchesDenylist(p string) bool {
+	return fs.denylist.MatchesPath(p) || fs.denylist.MatchesPath(normalize(p)) || fs.denylist.MatchesPath(normalize("/"+p))
+}
+
+// resolveInRoot returns the path, relative to the server root, that p refers to
+// once every symlink in it has been followed the way os.Root follows them.
+//
+// Resolving stops at the first part of the path that does not exist, at an
+// absolute symlink (os.Root refuses to follow those) and after maxSymlinkHops
+// links; whatever is left of the path is then joined on as it is. A link that
+// climbs above the root is kept at the root, as with every other path here, and
+// os.Root refuses to follow it anyway.
+func (fs *Filesystem) resolveInRoot(p string) string {
+	r, err := fs.openRoot()
+	if err != nil {
+		return normalize("/" + p)
+	}
+	rest := strings.Split(normalize("/"+p), "/")
+	var done []string
+	hops := 0
+	for len(rest) > 0 {
+		part := rest[0]
+		rest = rest[1:]
+		if part == "." || part == "" {
+			continue
+		}
+		cur := path.Join(append(done, part)...)
+		st, err := r.Lstat(cur)
+		if err != nil || st.Mode()&os.ModeSymlink == 0 {
+			done = append(done, part)
+			if err != nil {
+				done = append(done, rest...)
+				break
+			}
+			continue
+		}
+		target, err := r.Readlink(cur)
+		hops++
+		if err != nil || path.IsAbs(target) || hops > maxSymlinkHops {
+			done = append(done, part)
+			done = append(done, rest...)
+			break
+		}
+		// Replace the link with its target, relative to the directory holding it,
+		// and start again from the root so ".." in the target is handled.
+		joined := normalize("/" + path.Join(append(append([]string{}, done...), target)...))
+		rest = append(strings.Split(joined, "/"), rest...)
+		done = done[:0]
+	}
+	return normalize("/" + path.Join(done...))
 }

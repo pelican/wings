@@ -425,6 +425,11 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractOptions) er
 			// outside the server's data directory.
 			if f.LinkTarget != "" {
 				p2 := normalize(p)
+				// Leave out a link that would point at a denylisted file. Using
+				// the link is refused anyway, but there is no reason to create it.
+				if !filepath.IsAbs(f.LinkTarget) && fs.IsIgnored(filepath.Join(filepath.Dir(p2), f.LinkTarget)) != nil {
+					return nil
+				}
 				if err := fs.mkdirAll(filepath.Dir(p2), 0o755); err != nil {
 					return nil
 				}

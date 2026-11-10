@@ -11,8 +11,14 @@ import (
 	"github.com/pelican/wings/config"
 )
 
-// Chmod changes the mode of the given file or directory.
+// Chmod changes the mode of the given file or directory. os.Root follows a
+// symlink at p, so the mode of a denylisted file cannot be changed through a
+// link to it. Changing it by its own name is left to the caller to allow or
+// refuse, as before.
 func (fs *Filesystem) Chmod(p string, mode os.FileMode) error {
+	if err := fs.isIgnoredThroughLink(p); err != nil {
+		return err
+	}
 	root, err := fs.openRoot()
 	if err != nil {
 		return err
@@ -22,6 +28,24 @@ func (fs *Filesystem) Chmod(p string, mode os.FileMode) error {
 	}
 
 	return nil
+}
+
+// FileModeFromUnix converts a Unix mode such as 0o4755, as sent by the Panel,
+// to an os.FileMode. Go keeps setuid, setgid and sticky in other bits than Unix
+// does, so a plain os.FileMode(0o4755) loses them. Bits above 0o7777 are
+// ignored, as chmod(2) does.
+func FileModeFromUnix(m uint64) os.FileMode {
+	mode := os.FileMode(m & 0o777)
+	if m&0o4000 != 0 {
+		mode |= os.ModeSetuid
+	}
+	if m&0o2000 != 0 {
+		mode |= os.ModeSetgid
+	}
+	if m&0o1000 != 0 {
+		mode |= os.ModeSticky
+	}
+	return mode
 }
 
 // chownFile sets the owner of a single file or directory to the server user. If

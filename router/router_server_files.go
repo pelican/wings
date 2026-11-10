@@ -152,7 +152,7 @@ func putServerRenameFiles(c *gin.Context) {
 				fs := s.Filesystem()
 				// Ignore renames on a file that is on the denylist (both as the rename from or
 				// the rename to value).
-				if err := fs.IsIgnored(pf, pt); err != nil {
+				if err := fs.IsIgnoredNoFollow(pf, pt); err != nil {
 					return err
 				}
 				if err := fs.Rename(pf, pt); err != nil {
@@ -563,12 +563,11 @@ func postServerChmodFile(c *gin.Context) {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
-				mode, err := strconv.ParseUint(p.Mode, 8, 32)
+				m, err := strconv.ParseUint(p.Mode, 8, 32)
 				if err != nil {
 					return errInvalidFileMode
 				}
-
-				if err := s.Filesystem().Chmod(path.Join(data.Root, p.File), os.FileMode(mode)); err != nil {
+				if err := s.Filesystem().Chmod(path.Join(data.Root, p.File), filesystem.FileModeFromUnix(m)); err != nil {
 					// Return nil if the error is an is not exists.
 					// NOTE: os.IsNotExist() does not work if the error is wrapped.
 					if errors.Is(err, os.ErrNotExist) {
