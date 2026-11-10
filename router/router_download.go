@@ -56,8 +56,8 @@ func getDownloadBackup(c *gin.Context) {
 		return
 	}
 
-	// The use of `os` here is safe as backups are not stored within server
-	// accessible directories.
+	// The use of `os` here is safe as backups are not stored within server directories.
+	// this path is program-controlled, not user input.
 	f, err := os.Open(b.Path())
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)

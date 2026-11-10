@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -20,7 +21,6 @@ import (
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/internal/models"
-	"github.com/pelican/wings/internal/ufs"
 	"github.com/pelican/wings/router/downloader"
 	"github.com/pelican/wings/router/middleware"
 	"github.com/pelican/wings/router/tokens"
@@ -36,13 +36,18 @@ func getServerFileContents(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
+	// Open the same path that was checked against the denylist above.
 	f, st, err := s.Filesystem().File(p)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
 				"error":      "The requested resources was not found on the system.",
 				"request_id": c.Writer.Header().Get("X-Request-Id")})
-		} else if strings.Contains(err.Error(), "filesystem: is a directory") {
+		} else if filesystem.IsErrorCode(err, filesystem.ErrCodeNotRegular) {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"error": "Cannot open files of this type.",
+			})
+		} else if filesystem.IsErrorCode(err, filesystem.ErrCodeIsDirectory) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 				"error":      "Cannot perform that action: file is a directory.",
 				"request_id": c.Writer.Header().Get("X-Request-Id"),
@@ -147,11 +152,12 @@ func putServerRenameFiles(c *gin.Context) {
 				fs := s.Filesystem()
 				// Ignore renames on a file that is on the denylist (both as the rename from or
 				// the rename to value).
-				if err := fs.IsIgnored(pf, pt); err != nil {
+				if err := fs.IsIgnoredNoFollow(pf, pt); err != nil {
 					return err
 				}
 				if err := fs.Rename(pf, pt); err != nil {
 					// Return nil if the error is an is not exists.
+					// NOTE: os.IsNotExist() does not work if the error is wrapped.
 					if errors.Is(err, os.ErrNotExist) {
 						s.Log().WithField("error", err).
 							WithField("from_path", pf).
@@ -240,7 +246,6 @@ func postServerDeleteFiles(c *gin.Context) {
 				return s.Filesystem().SafeDeleteRecursively(pi)
 			}
 		})
-
 	}
 
 	if err := g.Wait(); err != nil {
@@ -408,12 +413,13 @@ func postServerCreateDirectory(c *gin.Context) {
 	}
 
 	if err := s.Filesystem().CreateDirectory(data.Name, data.Path); err != nil {
-		if errors.Is(err, ufs.ErrNotDirectory) {
+		if errors.Is(err, syscall.ENOTDIR) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 				"error": "Part of the path being created is not a directory (ENOTDIR).",
 			})
 			return
 		}
+
 		if errors.Is(err, os.ErrExist) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 				"error": "Cannot create directory, name conflicts with an existing file by the same name.",
@@ -462,9 +468,15 @@ func postServerCompressFiles(c *gin.Context) {
 	// The extention comes from the panel
 	// Supported are: zip, tar.gz, tar.bz2, tar.xz
 	// No need to check if it is empty or wrong as if data.Extention is wrong the function falls back to tar.gz
-	f, mimetype, err := s.Filesystem().CompressFiles(data.RootPath, data.Name, data.Files, data.Extension)
+	f, mimetype, err := s.Filesystem().CompressFiles(context.Background(), data.RootPath, data.Name, data.Files, data.Extension)
 	if err != nil {
-		middleware.CaptureAndAbort(c, err)
+		if errors.Is(err, filesystem.ErrNoSpaceAvailable) {
+			c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+				"error": "This server does not have enough available disk space to generate a compressed archive.",
+			})
+		} else {
+			middleware.CaptureAndAbort(c, err)
+		}
 		return
 	}
 
@@ -488,14 +500,11 @@ func postServerDecompressFiles(c *gin.Context) {
 
 	s := middleware.ExtractServer(c)
 	lg := middleware.ExtractLogger(c).WithFields(log.Fields{"root_path": data.RootPath, "file": data.File})
+
+	// Refuse an archive that does not fit before writing anything, as main does,
+	// rather than stopping at the limit with part of it extracted.
 	lg.Debug("checking if space is available for file decompression")
-	err := s.Filesystem().SpaceAvailableForDecompression(context.Background(), data.RootPath, data.File)
-	if err != nil {
-		if filesystem.IsErrorCode(err, filesystem.ErrCodeUnknownArchive) {
-			lg.WithField("error", err).Warn("failed to decompress file: unknown archive format")
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "The archive provided is in a format Wings does not understand."})
-			return
-		}
+	if err := s.Filesystem().SpaceAvailableForDecompression(context.Background(), data.RootPath, data.File); err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
@@ -554,12 +563,11 @@ func postServerChmodFile(c *gin.Context) {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
-				mode, err := strconv.ParseUint(p.Mode, 8, 32)
+				m, err := strconv.ParseUint(p.Mode, 8, 32)
 				if err != nil {
 					return errInvalidFileMode
 				}
-
-				if err := s.Filesystem().Chmod(path.Join(data.Root, p.File), os.FileMode(mode)); err != nil {
+				if err := s.Filesystem().Chmod(path.Join(data.Root, p.File), filesystem.FileModeFromUnix(m)); err != nil {
 					// Return nil if the error is an is not exists.
 					// NOTE: os.IsNotExist() does not work if the error is wrapped.
 					if errors.Is(err, os.ErrNotExist) {
