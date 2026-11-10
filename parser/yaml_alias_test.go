@@ -58,6 +58,22 @@ func TestUpdateYaml_MergeKeyAlias(t *testing.T) {
 	}
 }
 
+// A merge alias back into its own anchor decodes, because the explicit key
+// shadows the merged one, but can never be expanded. The update must still
+// finish with the right values instead of recursing until the stack overflows.
+func TestUpdateYaml_SelfReferencingMergeAlias(t *testing.T) {
+	src := "a: &a\n  x: 1\n  y:\n    <<: *a\n    y: 2\n"
+	out, changed := updateYamlString(t, `[{"match": "a.x", "replace_with": 2}]`, src)
+	if !changed {
+		t.Fatal("expected the document to change")
+	}
+	got := decodeYamlString(t, out)
+	want := map[string]interface{}{"x": 2, "y": map[string]interface{}{"x": 1, "y": 2}}
+	if !reflect.DeepEqual(got["a"], want) {
+		t.Errorf("unexpected a %v\n%s", got["a"], out)
+	}
+}
+
 // Root keys are decoded as strings, so a key such as "01" must be matched as
 // "01" rather than the integer 1.
 func TestUpdateYaml_RootKeyNotResolvedAsNumber(t *testing.T) {

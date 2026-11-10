@@ -222,3 +222,13 @@ func TestUpdateYaml_Sequences(t *testing.T) {
 		t.Fatalf("unexpected output\n--- got ---\n%s\n--- want ---\n%s", out, want)
 	}
 }
+
+// A new mapping holding a number is added through the node tree, so comments and
+// key order are kept, the same as for a mapping holding a string.
+func TestUpdateYaml_AddedMappingWithNumber(t *testing.T) {
+	src := "# keep me\nb: x\nc: 1 # and me\n"
+	out, _ := updateYamlString(t, `[{"match": "added.port", "replace_with": 25565}]`, src)
+	if want := src + "added:\n  port: 25565\n"; out != want {
+		t.Fatalf("unexpected output\n--- got ---\n%s\n--- want ---\n%s", out, want)
+	}
+}

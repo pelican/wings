@@ -103,7 +103,9 @@ func mergeYamlDocument(src []byte, expandAliases bool, orig, next interface{}) (
 	}
 	root := doc.Content[0]
 	if expandAliases {
-		expandYamlAliases(root)
+		if !expandYamlAliases(root, make(map[*yaml.Node]bool)) {
+			return nil, false
+		}
 		stripYamlAnchors(root)
 	}
 
@@ -148,16 +150,33 @@ func yamlDecodesTo(out []byte, want interface{}) bool {
 }
 
 // expandYamlAliases replaces every alias below n with a copy of the node it
-// refers to, keeping the comments that were on the alias.
-func expandYamlAliases(n *yaml.Node) {
+// refers to, keeping the comments that were on the alias. expanding holds the
+// alias targets whose copies are being expanded. It returns false if an alias
+// refers to a node that contains it: the decoder accepts that when an explicit
+// key shadows the merged one, but expanding it would never end.
+func expandYamlAliases(n *yaml.Node, expanding map[*yaml.Node]bool) bool {
 	for i, c := range n.Content {
-		if c.Kind == yaml.AliasNode && c.Alias != nil {
-			cp := cloneYamlNode(c.Alias)
-			cp.HeadComment, cp.LineComment, cp.FootComment = c.HeadComment, c.LineComment, c.FootComment
-			n.Content[i] = cp
+		if c.Kind != yaml.AliasNode || c.Alias == nil {
+			if !expandYamlAliases(c, expanding) {
+				return false
+			}
+			continue
 		}
-		expandYamlAliases(n.Content[i])
+		target := c.Alias
+		if expanding[target] {
+			return false
+		}
+		cp := cloneYamlNode(target)
+		cp.HeadComment, cp.LineComment, cp.FootComment = c.HeadComment, c.LineComment, c.FootComment
+		n.Content[i] = cp
+		expanding[target] = true
+		ok := expandYamlAliases(cp, expanding)
+		delete(expanding, target)
+		if !ok {
+			return false
+		}
 	}
+	return true
 }
 
 func cloneYamlNode(n *yaml.Node) *yaml.Node {
@@ -507,12 +526,35 @@ func mergeYamlNode(n *yaml.Node, orig, next interface{}, root bool) {
 	*n = *replacement
 }
 
+// buildYamlNode encodes v as a new node. v is part of the value the result is
+// verified against, and normalizeYamlTypes rewrites maps and slices in place, so
+// a copy of v is normalized.
 func buildYamlNode(v interface{}) *yaml.Node {
 	n := &yaml.Node{}
-	if err := n.Encode(normalizeYamlTypes(v)); err != nil {
+	if err := n.Encode(normalizeYamlTypes(copyJsonValue(v))); err != nil {
 		return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: fmt.Sprint(v)}
 	}
 	return n
+}
+
+// copyJsonValue returns a deep copy of the maps and slices in v.
+func copyJsonValue(v interface{}) interface{} {
+	switch typed := v.(type) {
+	case map[string]interface{}:
+		cp := make(map[string]interface{}, len(typed))
+		for k, item := range typed {
+			cp[k] = copyJsonValue(item)
+		}
+		return cp
+	case []interface{}:
+		cp := make([]interface{}, len(typed))
+		for i, item := range typed {
+			cp[i] = copyJsonValue(item)
+		}
+		return cp
+	default:
+		return v
+	}
 }
 
 // detectYamlIndent returns the indentation width used by the document, falling
