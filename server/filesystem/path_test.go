@@ -101,6 +101,41 @@ func TestFilesystem_Blocks_Symlinks(t *testing.T) {
 		})
 	})
 
+	g.Describe("Chown", func() {
+		// Chown never follows symlinks; it changes the owner of the link itself, which
+		// is inside the root, and leaves whatever it points to alone.
+		// These run before Rename, which moves the links away; each checks the link
+		// is still there so it can't pass on a missing path.
+		g.It("changes the link and not the target of a file symlinked outside the directory root", func() {
+			st, err := os.Lstat(filepath.Join(fs.rootPath, "symlinked.txt"))
+			g.Assert(err).IsNil()
+			g.Assert(st.Mode()&os.ModeSymlink != 0).IsTrue()
+
+			err = fs.Chown("symlinked.txt")
+			g.Assert(err).IsNil()
+		})
+
+		g.It("does not descend into a directory symlinked outside the directory root", func() {
+			st, err := os.Lstat(filepath.Join(fs.rootPath, "external_dir"))
+			g.Assert(err).IsNil()
+			g.Assert(st.Mode()&os.ModeSymlink != 0).IsTrue()
+
+			err = fs.Chown("external_dir")
+			g.Assert(err).IsNil()
+		})
+
+		g.It("cannot chown a file through a directory symlinked outside the directory root", func() {
+			fs.write("../malicious_dir/inner.txt", []byte("external content"))
+			if err := os.Symlink(filepath.Join(fs.rootPath, "../malicious_dir"), filepath.Join(fs.rootPath, "chown_dir")); err != nil {
+				panic(err)
+			}
+
+			err := fs.Chown("chown_dir/inner.txt")
+			g.Assert(err).IsNotNil()
+			g.Assert(IsPathError(err)).IsTrue()
+		})
+	})
+
 	g.Describe("Rename", func() {
 		// You can rename the symlink file itself, which does not impact the
 		// underlying symlinked target file outside the server directory.
@@ -137,31 +172,6 @@ func TestFilesystem_Blocks_Symlinks(t *testing.T) {
 			fs.write("my_file.txt", []byte("internal content"))
 
 			err := fs.Rename("my_file.txt", "../external_dir/my_file.txt")
-			g.Assert(err).IsNotNil()
-			g.Assert(IsPathError(err)).IsTrue()
-		})
-	})
-
-	g.Describe("Chown", func() {
-		// Chown never follows symlinks; it changes the owner of the link itself, which
-		// is inside the root, and leaves whatever it points to alone.
-		g.It("changes the link and not the target of a file symlinked outside the directory root", func() {
-			err := fs.Chown("symlinked.txt")
-			g.Assert(err).IsNil()
-		})
-
-		g.It("does not descend into a directory symlinked outside the directory root", func() {
-			err := fs.Chown("external_dir")
-			g.Assert(err).IsNil()
-		})
-
-		g.It("cannot chown a file through a directory symlinked outside the directory root", func() {
-			fs.write("../malicious_dir/inner.txt", []byte("external content"))
-			if err := os.Symlink(filepath.Join(fs.rootPath, "../malicious_dir"), filepath.Join(fs.rootPath, "chown_dir")); err != nil {
-				panic(err)
-			}
-
-			err := fs.Chown("chown_dir/inner.txt")
 			g.Assert(err).IsNotNil()
 			g.Assert(IsPathError(err)).IsTrue()
 		})
