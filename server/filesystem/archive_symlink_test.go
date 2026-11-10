@@ -43,7 +43,7 @@ func readTarHeaders(t *testing.T, p string) map[string]*tar.Header {
 }
 
 func TestArchive_IncludesSymlinks(t *testing.T) {
-	fs, rfs := NewFs()
+	fs := NewFs()
 	defer fs.TruncateRootDirectory()
 
 	if err := fs.CreateDirectory("libraries/neoforge", "/"); err != nil {
@@ -53,7 +53,8 @@ func TestArchive_IncludesSymlinks(t *testing.T) {
 	if err := fs.Write("libraries/neoforge/unix_args.txt", r, r.Size(), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// A symlink in the server root, and one nested in a subdirectory.
+	// A symlink in the server root, and one nested in a subdirectory. Symlink
+	// stores links relative to the directory they are in.
 	if err := fs.Symlink("libraries/neoforge/unix_args.txt", "unix_args.txt"); err != nil {
 		t.Fatal(err)
 	}
@@ -61,8 +62,11 @@ func TestArchive_IncludesSymlinks(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	archivePath := filepath.Join(rfs.root, "archive.tar.gz")
-	a := &Archive{Filesystem: fs}
+	archivePath := filepath.Join(t.TempDir(), "archive.tar.gz")
+	a, err := fs.NewArchive(".")
+	if err != nil {
+		t.Fatal(err)
+	}
 	if err := a.Create(context.Background(), archivePath); err != nil {
 		t.Fatal(err)
 	}
@@ -70,7 +74,7 @@ func TestArchive_IncludesSymlinks(t *testing.T) {
 	headers := readTarHeaders(t, archivePath)
 	for name, target := range map[string]string{
 		"unix_args.txt":               "libraries/neoforge/unix_args.txt",
-		"libraries/neoforge/link.txt": "unix_args.txt",
+		"libraries/neoforge/link.txt": "../../unix_args.txt",
 	} {
 		h, ok := headers[name]
 		if !ok {
@@ -89,14 +93,14 @@ func TestArchive_IncludesSymlinks(t *testing.T) {
 }
 
 func TestFilesystem_RestoreSymlink(t *testing.T) {
-	fs, rfs := NewFs()
+	fs := NewFs()
 	defer fs.TruncateRootDirectory()
 
 	// Missing parent directories are created.
 	if err := fs.RestoreSymlink("a/b/link", "../target.txt"); err != nil {
 		t.Fatal(err)
 	}
-	got, err := os.Readlink(filepath.Join(rfs.root, "server", "a/b/link"))
+	got, err := os.Readlink(filepath.Join(fs.tmpDir, "a/b/link"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +116,7 @@ func TestFilesystem_RestoreSymlink(t *testing.T) {
 	if err := fs.RestoreSymlink("unix_args.txt", "libraries/unix_args.txt"); err != nil {
 		t.Fatal(err)
 	}
-	st, err := os.Lstat(filepath.Join(rfs.root, "server", "unix_args.txt"))
+	st, err := os.Lstat(filepath.Join(fs.tmpDir, "unix_args.txt"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +133,7 @@ func TestFilesystem_RestoreSymlink(t *testing.T) {
 	}
 
 	// No temporary links are left behind.
-	des, err := os.ReadDir(filepath.Join(rfs.root, "server"))
+	des, err := os.ReadDir(fs.tmpDir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,10 +146,10 @@ func TestFilesystem_RestoreSymlink(t *testing.T) {
 
 // Replacing a regular file with a link releases its size from the disk usage.
 func TestFilesystem_RestoreSymlinkQuota(t *testing.T) {
-	fs, _ := NewFs()
+	fs := NewFs()
 	defer fs.TruncateRootDirectory()
 	fs.SetDiskLimit(1024)
-	fs.unixFS.SetUsage(0)
+	fs.quota.SetUsage(0)
 
 	r := strings.NewReader("0123456789")
 	if err := fs.Write("unix_args.txt", r, r.Size(), 0o644); err != nil {
