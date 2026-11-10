@@ -66,7 +66,20 @@ func (fs *Filesystem) CompressFiles(ctx context.Context, dir string, name string
 		format = archives.CompressedArchive{Compression: archives.Gz{}, Archival: archives.Tar{}}
 	}
 
-	files, err := fs.filesForArchive(dir, paths)
+	// A folder that does not exist is a 404, as on main, rather than an empty
+	// archive error.
+	root, err := fs.openRoot()
+	if err != nil {
+		return nil, "", err
+	}
+	if _, err := root.Stat(dir); err != nil {
+		return nil, "", errors.Wrap(err, "server/filesystem: compress: failed to stat directory")
+	}
+
+	// A named pipe is stored in a tar archive as a header without content, as main
+	// does. A zip entry needs the content, and reading a pipe would block, so pipes
+	// are left out of zip archives.
+	files, err := fs.filesForArchive(dir, paths, extension != "zip")
 	if err != nil {
 		return nil, "", err
 	}
@@ -133,8 +146,9 @@ func (fs *Filesystem) CompressFiles(ctx context.Context, dir string, name string
 // paths (relative to dir), recursing into directories. Every file is opened
 // through the os.Root instance so nothing outside the server's data directory
 // can be added, and symlinks are stored as links rather than followed. Files on
-// the server's denylist are skipped.
-func (fs *Filesystem) filesForArchive(dir string, paths []string) ([]archives.FileInfo, error) {
+// the server's denylist are skipped. Named pipes are added without content when
+// pipes is true and left out otherwise; they are never opened.
+func (fs *Filesystem) filesForArchive(dir string, paths []string, pipes bool) ([]archives.FileInfo, error) {
 	root, err := fs.openRoot()
 	if err != nil {
 		return nil, err
@@ -215,8 +229,10 @@ func (fs *Filesystem) filesForArchive(dir string, paths []string) ([]archives.Fi
 				fi.Open = func() (iofs.File, error) {
 					return fs.openForArchive(full, size)
 				}
+			case mode&os.ModeNamedPipe != 0 && pipes:
+				// Header only: the tar writer writes no body for a pipe.
 			default:
-				// Named pipes, sockets and devices are never added to the archive.
+				// Sockets and devices are never added to the archive.
 				return nil
 			}
 
@@ -376,7 +392,7 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractOptions) er
 		// called "data"), or when the output name is a symlink to the archive.
 		if opts.src != nil {
 			if st, err := root.Stat(normalize(p)); err == nil && os.SameFile(st, opts.src) {
-				return errors.New("server/filesystem: decompress: the decompressed file would overwrite the archive itself; rename the archive to end in " + opts.format.Extension())
+				return errors.WithStack(&Error{code: ErrCodeArchiveIsOutput, resolved: opts.format.Extension()})
 			}
 		}
 

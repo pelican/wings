@@ -428,8 +428,11 @@ func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode os.FileMo
 }
 
 // CreateDirectory creates a new directory ("name") at a specified path ("p") for the server.
+//
+// p and name are joined before being cleaned, as main does, so a name such as
+// "../name" under "/" stays inside the server, while "e/../../name" still fails.
 func (fs *Filesystem) CreateDirectory(name string, p string) error {
-	return fs.mkdirAll(path.Join(normalize(p), name), 0o755)
+	return fs.mkdirAll(path.Join(p, name), 0o755)
 }
 
 // Rename moves (or renames) a file or directory.
@@ -440,6 +443,11 @@ func (fs *Filesystem) Rename(from string, to string) error {
 	}
 	to = normalize(to)
 	from = normalize(from)
+
+	// Renaming something to its own name does nothing, as on main.
+	if from == to {
+		return nil
+	}
 
 	if from == "." || to == "." {
 		return os.ErrExist

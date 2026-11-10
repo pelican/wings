@@ -18,6 +18,10 @@ const (
 	ErrCodeUnknownError   ErrorCode = "E_UNKNOWN"
 	ErrNotExist           ErrorCode = "E_NOTEXIST"
 	ErrCodeNotRegular     ErrorCode = "E_NOTREGULAR"
+	// ErrCodeArchiveIsOutput is returned when decompressing a single-file archive
+	// would write over the archive itself. resolved holds the extension the
+	// archive should be renamed to end in.
+	ErrCodeArchiveIsOutput ErrorCode = "E_ARCHIVEISOUTPUT"
 )
 
 type Error struct {
@@ -47,6 +51,12 @@ func (e *Error) Code() ErrorCode {
 	return e.code
 }
 
+// Resolved returns the path, or for ErrCodeArchiveIsOutput the extension, the
+// error is about.
+func (e *Error) Resolved() string {
+	return e.resolved
+}
+
 // Returns a human-readable error string to identify the Error by.
 func (e *Error) Error() string {
 	switch e.code {
@@ -66,6 +76,8 @@ func (e *Error) Error() string {
 		return "filesystem: does not exist"
 	case ErrCodeNotRegular:
 		return fmt.Sprintf("filesystem: cannot perform action: [%s] is not a regular file", e.resolved)
+	case ErrCodeArchiveIsOutput:
+		return "filesystem: decompress: the decompressed file would overwrite the archive itself; rename the archive to end in " + e.resolved
 	case ErrCodeUnknownError:
 		fallthrough
 	default:

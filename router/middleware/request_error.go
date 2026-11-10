@@ -129,6 +129,11 @@ func (re *RequestError) asFilesystemError() (int, string) {
 	if filesystem.IsErrorCode(err, filesystem.ErrCodeNotRegular) {
 		return http.StatusBadRequest, "Cannot perform that action: not a regular file."
 	}
+	if filesystem.IsErrorCode(err, filesystem.ErrCodeArchiveIsOutput) {
+		var fserr *filesystem.Error
+		_ = errors.As(err, &fserr)
+		return http.StatusBadRequest, "The file cannot be decompressed over the archive itself. Rename the archive to end in " + fserr.Resolved() + " first."
+	}
 	if filesystem.IsErrorCode(err, filesystem.ErrCodeUnknownArchive) {
 		return http.StatusBadRequest, "The archive provided is in a format Wings does not understand."
 	}
