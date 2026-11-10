@@ -4,6 +4,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"path/filepath"
 	"time"
 
 	"emperror.dev/errors"
@@ -158,6 +159,17 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 	err = b.Restore(s.Context(), reader, func(file string, info fs.FileInfo, r io.ReadCloser) error {
 		defer r.Close()
 		s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
+		// Newer Wings versions store directories as entries of their own, so that
+		// empty directories survive a backup. Create those instead of trying to
+		// write them as files, which fails and aborts the restore part way.
+		if info.IsDir() {
+			return s.Filesystem().CreateDirectory(filepath.Clean(file), "")
+		}
+		// Symlinks, named pipes and devices have no content to write; writing them
+		// with Write would leave an empty file in their place.
+		if !info.Mode().IsRegular() {
+			return nil
+		}
 		// TODO: since this will be called a lot, it may be worth adding an optimized
 		// Write with Chtimes method to the UnixFS that is able to re-use the
 		// same dirfd and file name.
