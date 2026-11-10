@@ -68,27 +68,114 @@ func (f *ConfigurationFile) updateYaml(src []byte) ([]byte, bool, error) {
 		out, err := yaml.Marshal(normalizeYamlTypes(next))
 		return out, true, err
 	}
-	root := doc.Content[0]
 
-	if out, ok := patchYamlScalars(src, root, origValue, next); ok {
+	if out, ok := patchYamlScalars(src, doc.Content[0], origValue, next); ok {
 		return out, true, nil
 	}
 
-	mergeYamlNode(root, origValue, next)
+	// Re-encode the node tree. A change to an anchored node would otherwise also
+	// change the nodes using it through an alias, or leave an alias without its
+	// anchor, so if the result is not exactly what was intended the aliases are
+	// expanded into copies and the merge is retried.
+	for _, expand := range []bool{false, true} {
+		if out, ok := mergeYamlDocument(src, expand, origValue, next); ok {
+			return out, true, nil
+		}
+	}
+
+	// Last resort: write the whole document from the new values, as was always
+	// done before. Comments and key order are lost, but the values are correct.
+	out, err := yaml.Marshal(normalizeYamlTypes(next))
+	if err != nil {
+		return nil, false, err
+	}
+	return withLineEndings(src, out), true, nil
+}
+
+// mergeYamlDocument applies the changes to the parsed node tree of src and
+// re-encodes it. If expandAliases is set, every alias is first replaced by a copy
+// of the node it refers to. It returns false if the result does not decode to
+// next.
+func mergeYamlDocument(src []byte, expandAliases bool, orig, next interface{}) ([]byte, bool) {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(src, &doc); err != nil || len(doc.Content) == 0 {
+		return nil, false
+	}
+	root := doc.Content[0]
+	if expandAliases {
+		expandYamlAliases(root)
+		stripYamlAnchors(root)
+	}
+
+	mergeYamlNode(root, orig, next, true)
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(detectYamlIndent(src))
 	if err := enc.Encode(&doc); err != nil {
-		return nil, false, err
+		return nil, false
 	}
 	if err := enc.Close(); err != nil {
-		return nil, false, err
+		return nil, false
 	}
 	out := buf.Bytes()
-	if bytes.Contains(src, []byte("\r\n")) {
-		out = bytes.ReplaceAll(out, []byte("\n"), []byte("\r\n"))
+	if !yamlDecodesTo(out, next) {
+		return nil, false
 	}
-	return out, true, nil
+	return withLineEndings(src, out), true
+}
+
+// withLineEndings converts out to CRLF line endings if src uses them.
+func withLineEndings(src, out []byte) []byte {
+	if bytes.Contains(src, []byte("\r\n")) && !bytes.Contains(out, []byte("\r\n")) {
+		return bytes.ReplaceAll(out, []byte("\n"), []byte("\r\n"))
+	}
+	return out
+}
+
+// yamlDecodesTo reports whether the YAML document out decodes to want, in the
+// same representation the replacements were applied to.
+func yamlDecodesTo(out []byte, want interface{}) bool {
+	got, err := yamlToJsonValue(out)
+	if err != nil {
+		return false
+	}
+	gotJson, err := json.Marshal(got)
+	if err != nil {
+		return false
+	}
+	gotValue, err := decodeJsonValue(gotJson)
+	return err == nil && reflect.DeepEqual(gotValue, want)
+}
+
+// expandYamlAliases replaces every alias below n with a copy of the node it
+// refers to, keeping the comments that were on the alias.
+func expandYamlAliases(n *yaml.Node) {
+	for i, c := range n.Content {
+		if c.Kind == yaml.AliasNode && c.Alias != nil {
+			cp := cloneYamlNode(c.Alias)
+			cp.HeadComment, cp.LineComment, cp.FootComment = c.HeadComment, c.LineComment, c.FootComment
+			n.Content[i] = cp
+		}
+		expandYamlAliases(n.Content[i])
+	}
+}
+
+func cloneYamlNode(n *yaml.Node) *yaml.Node {
+	cp := *n
+	cp.Content = make([]*yaml.Node, len(n.Content))
+	for i, c := range n.Content {
+		cp.Content[i] = cloneYamlNode(c)
+	}
+	return &cp
+}
+
+// stripYamlAnchors removes the anchors below n, which are unused once every
+// alias has been expanded.
+func stripYamlAnchors(n *yaml.Node) {
+	n.Anchor = ""
+	for _, c := range n.Content {
+		stripYamlAnchors(c)
+	}
 }
 
 // yamlToJsonValue decodes the first YAML document in src into a value that can
@@ -114,8 +201,18 @@ func decodeJsonValue(data []byte) (interface{}, error) {
 }
 
 // yamlKey returns the key of a mapping entry as it appears in the JSON
-// representation of the document (see dyno.ConvertMapI2MapS).
-func yamlKey(n *yaml.Node) string {
+// representation of the document. The root mapping is decoded into a
+// map[string]interface{} (see yamlToJsonValue), so its keys are decoded as
+// strings: "01" stays "01". Nested keys are decoded into interface{} and then
+// converted with fmt.Sprint by dyno.ConvertMapI2MapS, so "01" becomes "1".
+func yamlKey(n *yaml.Node, root bool) string {
+	if root {
+		var s string
+		if err := n.Decode(&s); err != nil {
+			return n.Value
+		}
+		return s
+	}
 	var k interface{}
 	if err := n.Decode(&k); err != nil {
 		return n.Value
@@ -140,7 +237,7 @@ func patchYamlScalars(src []byte, root *yaml.Node, orig, next interface{}) ([]by
 	}
 
 	var patches []yamlPatch
-	if !collectYamlPatches(root, orig, next, false, runes, &patches) || len(patches) == 0 {
+	if !collectYamlPatches(root, orig, next, false, true, runes, &patches) || len(patches) == 0 {
 		return nil, false
 	}
 
@@ -165,22 +262,13 @@ func patchYamlScalars(src []byte, root *yaml.Node, orig, next interface{}) ([]by
 	out := []byte(strings.Join(lines, "\n"))
 
 	// Make sure the patched document means exactly what was intended.
-	got, err := yamlToJsonValue(out)
-	if err != nil {
-		return nil, false
-	}
-	gotJson, err := json.Marshal(got)
-	if err != nil {
-		return nil, false
-	}
-	gotValue, err := decodeJsonValue(gotJson)
-	if err != nil || !reflect.DeepEqual(gotValue, next) {
+	if !yamlDecodesTo(out, next) {
 		return nil, false
 	}
 	return out, true
 }
 
-func collectYamlPatches(n *yaml.Node, orig, next interface{}, inFlow bool, lines [][]rune, patches *[]yamlPatch) bool {
+func collectYamlPatches(n *yaml.Node, orig, next interface{}, inFlow, root bool, lines [][]rune, patches *[]yamlPatch) bool {
 	if reflect.DeepEqual(orig, next) {
 		return true
 	}
@@ -195,13 +283,13 @@ func collectYamlPatches(n *yaml.Node, orig, next interface{}, inFlow bool, lines
 		origMap, _ := orig.(map[string]interface{})
 		seen := make(map[string]bool, len(n.Content)/2)
 		for i := 0; i+1 < len(n.Content); i += 2 {
-			k := yamlKey(n.Content[i])
+			k := yamlKey(n.Content[i], root)
 			seen[k] = true
 			nv, ok := nextMap[k]
 			if !ok {
 				continue
 			}
-			if !collectYamlPatches(n.Content[i+1], origMap[k], nv, inFlow, lines, patches) {
+			if !collectYamlPatches(n.Content[i+1], origMap[k], nv, inFlow, false, lines, patches) {
 				return false
 			}
 		}
@@ -223,7 +311,7 @@ func collectYamlPatches(n *yaml.Node, orig, next interface{}, inFlow bool, lines
 			return false
 		}
 		for i, c := range n.Content {
-			if !collectYamlPatches(c, origArr[i], nextArr[i], inFlow, lines, patches) {
+			if !collectYamlPatches(c, origArr[i], nextArr[i], inFlow, false, lines, patches) {
 				return false
 			}
 		}
@@ -354,7 +442,7 @@ func renderYamlScalar(n *yaml.Node, v interface{}) (string, bool) {
 
 // mergeYamlNode applies the differences between orig and next to the node tree,
 // keeping key order and comments.
-func mergeYamlNode(n *yaml.Node, orig, next interface{}) {
+func mergeYamlNode(n *yaml.Node, orig, next interface{}, root bool) {
 	if reflect.DeepEqual(orig, next) {
 		return
 	}
@@ -365,10 +453,10 @@ func mergeYamlNode(n *yaml.Node, orig, next interface{}) {
 			origMap, _ := orig.(map[string]interface{})
 			seen := make(map[string]bool, len(n.Content)/2)
 			for i := 0; i+1 < len(n.Content); i += 2 {
-				k := yamlKey(n.Content[i])
+				k := yamlKey(n.Content[i], root)
 				seen[k] = true
 				if nv, ok := nextTyped[k]; ok {
-					mergeYamlNode(n.Content[i+1], origMap[k], nv)
+					mergeYamlNode(n.Content[i+1], origMap[k], nv, false)
 				}
 			}
 			var added []string
@@ -397,7 +485,7 @@ func mergeYamlNode(n *yaml.Node, orig, next interface{}) {
 					if i < len(origArr) {
 						ov = origArr[i]
 					}
-					mergeYamlNode(n.Content[i], ov, nv)
+					mergeYamlNode(n.Content[i], ov, nv, false)
 				} else {
 					n.Content = append(n.Content, buildYamlNode(nv))
 				}
