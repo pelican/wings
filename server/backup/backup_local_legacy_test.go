@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/pelican/wings/config"
@@ -63,6 +64,37 @@ func TestLocateLocal_MigratesLegacyArchive(t *testing.T) {
 	}
 	if _, err := os.Stat(current); !errors.Is(err, os.ErrNotExist) {
 		t.Errorf("expected backup to be removed, stat returned %v", err)
+	}
+}
+
+// Concurrent requests for the same legacy backup must all find it, including the
+// ones whose rename loses the race to another request.
+func TestLocateLocal_ConcurrentMigration(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		dir := setLegacyTestBackupDir(t)
+		writeFile(t, filepath.Join(dir, legacyTestBackup+".tar.gz"), "legacy archive")
+
+		const n = 8
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		errs := make(chan error, n)
+		for j := 0; j < n; j++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				_, _, err := LocateLocal(nil, legacyTestBackup, legacyTestServer)
+				errs <- err
+			}()
+		}
+		close(start)
+		wg.Wait()
+		close(errs)
+		for err := range errs {
+			if err != nil {
+				t.Fatalf("iteration %d: expected every concurrent request to locate the backup, got %v", i, err)
+			}
+		}
 	}
 }
 

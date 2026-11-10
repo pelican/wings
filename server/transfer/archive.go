@@ -47,10 +47,12 @@ func (a *Archive) StreamBackups(ctx context.Context, mp *multipart.Writer) error
 	}
 
 	// Move any of the requested backups still stored in the legacy location into
-	// the server's backup directory so they are included in the transfer.
+	// the server's backup directory so they are included in the transfer. If one
+	// cannot be moved the transfer fails, rather than completing without a backup
+	// the Panel expects to be on the new node.
 	for _, id := range a.transfer.BackupUUIDs {
 		if err := backup.NewLocal(nil, id, a.transfer.Server.ID(), "").MigrateLegacy(); err != nil {
-			a.transfer.Log().WithField("backup", id).WithField("error", err).Warn("failed to move backup from legacy location")
+			return fmt.Errorf("transfer: failed to move backup %s from legacy location: %w", id, err)
 		}
 	}
 

@@ -72,6 +72,14 @@ func (b *LocalBackup) MigrateLegacy() error {
 		return errors.Wrap(err, "backup: failed to create server backup directory")
 	}
 	if err := os.Rename(legacy, b.Path()); err != nil {
+		// Another request for the same backup may have moved it between the
+		// checks above and the rename. The rename is atomic, so if the source is
+		// gone and the backup now exists at its current location, it was moved.
+		if errors.Is(err, os.ErrNotExist) {
+			if _, statErr := os.Lstat(b.Path()); statErr == nil {
+				return nil
+			}
+		}
 		return errors.Wrap(err, "backup: failed to move backup from legacy location")
 	}
 
