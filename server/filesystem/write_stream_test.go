@@ -15,7 +15,7 @@ func TestFilesystem_WriteStream(t *testing.T) {
 		if err := fs.WriteStream("dir/Dockerfile", strings.NewReader("FROM scratch\n"), 0o644); err != nil {
 			t.Fatal(err)
 		}
-		b, err := os.ReadFile(filepath.Join(fs.tmpDir, "dir/Dockerfile"))
+		b, err := os.ReadFile(filepath.Join(fs.rootPath, "dir/Dockerfile"))
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -49,7 +49,7 @@ func TestFilesystem_WriteStream(t *testing.T) {
 		if !IsErrorCode(err, ErrCodeDiskSpace) {
 			t.Fatalf("expected disk space error, got %v", err)
 		}
-		if _, err := os.Stat(filepath.Join(fs.tmpDir, "too-big.txt")); !os.IsNotExist(err) {
+		if _, err := os.Stat(filepath.Join(fs.rootPath, "too-big.txt")); !os.IsNotExist(err) {
 			t.Errorf("expected partial file to be removed, got %v", err)
 		}
 		if usage := fs.CachedUsage(); usage != 3 {
