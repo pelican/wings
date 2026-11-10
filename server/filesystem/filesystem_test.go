@@ -297,6 +297,62 @@ func TestFilesystem_Writefile(t *testing.T) {
 			g.Assert(getFileContent(f)).Equal("new data")
 		})
 
+		g.It("can replace a file with contents of an unknown size", func() {
+			fs.SetDiskLimit(1024)
+
+			r := bytes.NewReader([]byte("original data"))
+			err := fs.Write("test.txt", r, r.Size(), 0o644)
+			g.Assert(err).IsNil()
+			g.Assert(fs.CachedUsage()).Equal(int64(13))
+
+			err = fs.Write("test.txt", bytes.NewBufferString("new data"), -1, 0o644)
+			g.Assert(err).IsNil()
+
+			f, _, err := fs.File("test.txt")
+			g.Assert(err).IsNil()
+			defer f.Close()
+			g.Assert(getFileContent(f)).Equal("new data")
+			g.Assert(fs.CachedUsage()).Equal(int64(8))
+
+			entries, err := fs.ReadDir("/")
+			g.Assert(err).IsNil()
+			g.Assert(len(entries)).Equal(1)
+		})
+
+		g.It("cannot write contents of an unknown size that exceed the disk limits", func() {
+			fs.SetDiskLimit(1024)
+
+			err := fs.Write("test.txt", bytes.NewReader(make([]byte, 2048)), -1, 0o644)
+			g.Assert(err).IsNotNil()
+			g.Assert(IsErrorCode(err, ErrCodeDiskSpace)).IsTrue()
+
+			_, err = rfs.StatServerFile("test.txt")
+			g.Assert(errors.Is(err, os.ErrNotExist)).IsTrue("err is not os.ErrNotExist")
+			g.Assert(fs.CachedUsage()).Equal(int64(0))
+		})
+
+		g.It("keeps the existing file when contents of an unknown size do not fit", func() {
+			fs.SetDiskLimit(1024)
+
+			r := bytes.NewReader([]byte("original data"))
+			err := fs.Write("test.txt", r, r.Size(), 0o644)
+			g.Assert(err).IsNil()
+
+			err = fs.Write("test.txt", bytes.NewReader(make([]byte, 1020)), -1, 0o644)
+			g.Assert(err).IsNotNil()
+			g.Assert(IsErrorCode(err, ErrCodeDiskSpace)).IsTrue()
+
+			f, _, err := fs.File("test.txt")
+			g.Assert(err).IsNil()
+			defer f.Close()
+			g.Assert(getFileContent(f)).Equal("original data")
+			g.Assert(fs.CachedUsage()).Equal(int64(13))
+
+			entries, err := fs.ReadDir("/")
+			g.Assert(err).IsNil()
+			g.Assert(len(entries)).Equal(1)
+		})
+
 		g.AfterEach(func() {
 			buf.Truncate(0)
 			_ = fs.TruncateRootDirectory()
