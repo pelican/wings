@@ -46,8 +46,12 @@ func (s *Stat) MarshalJSON() ([]byte, error) {
 // Stat stats a file or folder and returns the base stat object from go along
 // with the MIME data that can be used for editing files.
 func (fs *Filesystem) Stat(p string) (Stat, error) {
+	root, err := fs.openRoot()
+	if err != nil {
+		return Stat{}, err
+	}
 	p = normalize(p)
-	s, err := fs.root.Stat(p)
+	s, err := root.Stat(p)
 	if err != nil {
 		return Stat{}, errors.Wrap(err, "server/filesystem: stat: failed to stat file")
 	}
@@ -80,7 +84,11 @@ func (fs *Filesystem) Stat(p string) (Stat, error) {
 // openRegular opens a file for reading, returning an ErrCodeNotRegular error if
 // it is not a regular file. It never blocks, even if the file is a named pipe.
 func (fs *Filesystem) openRegular(p string) (*os.File, error) {
-	f, err := fs.root.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	root, err := fs.openRoot()
+	if err != nil {
+		return nil, err
+	}
+	f, err := root.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -97,7 +105,11 @@ func (fs *Filesystem) openRegular(p string) (*os.File, error) {
 }
 
 func (fs *Filesystem) Stat2(p string) (os.FileInfo, error) {
-	st, err := fs.root.Stat(normalize(p))
+	root, err := fs.openRoot()
+	if err != nil {
+		return nil, err
+	}
+	st, err := root.Stat(normalize(p))
 	if err != nil {
 		return st, errors.Wrap(err, "server/filesystem: stat2: failed to stat file")
 	}

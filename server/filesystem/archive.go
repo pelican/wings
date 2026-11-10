@@ -85,7 +85,11 @@ func NewArchive(r *os.Root, dir string, opts ...ArchiveOption) (*Archive, error)
 // NewArchive returns a new archive of the given directory within the server's
 // data directory.
 func (fs *Filesystem) NewArchive(dir string, opts ...ArchiveOption) (*Archive, error) {
-	return NewArchive(fs.root, dir, opts...)
+	root, err := fs.openRoot()
+	if err != nil {
+		return nil, err
+	}
+	return NewArchive(root, dir, opts...)
 }
 
 func WithProgress(p *progress.Progress) ArchiveOption {

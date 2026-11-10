@@ -202,7 +202,7 @@ func TestFilesystem_NamedPipesDoNotBlock(t *testing.T) {
 			return
 		}
 		defer f.Close()
-		a, _ := NewArchive(fs.root, ".")
+		a, _ := NewArchive(fs.root.Load(), ".")
 		if err := a.Create(context.Background(), f); err != nil {
 			t.Errorf("Archive.Create returned an error: %v", err)
 		}
@@ -323,7 +323,7 @@ func TestArchive_IgnoreAllowsReincludingFiles(t *testing.T) {
 	}
 	defer f.Close()
 
-	a, err := NewArchive(fs.root, ".", WithIgnored("build/\n!build/keep.txt\n"))
+	a, err := NewArchive(fs.root.Load(), ".", WithIgnored("build/\n!build/keep.txt\n"))
 	if err != nil {
 		t.Fatal(err)
 	}

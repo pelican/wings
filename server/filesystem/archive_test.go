@@ -45,7 +45,7 @@ func TestArchive_Stream(t *testing.T) {
 			}
 			defer f.Close()
 
-			a, err := NewArchive(fs.root, ".", WithMatching([]string{"test", "test_file.txt"}))
+			a, err := NewArchive(fs.root.Load(), ".", WithMatching([]string{"test", "test_file.txt"}))
 
 			g.Assert(a.Create(context.Background(), f)).IsNil()
 
@@ -88,7 +88,7 @@ func TestArchive_Stream(t *testing.T) {
 			g.Assert(err).IsNil()
 			defer f.Close()
 
-			a, err := NewArchive(fs.root, ".", WithIgnored("world (copy)/\n*.log\n"))
+			a, err := NewArchive(fs.root.Load(), ".", WithIgnored("world (copy)/\n*.log\n"))
 			g.Assert(err).IsNil()
 			g.Assert(a.Create(context.Background(), f)).IsNil()
 
@@ -106,7 +106,7 @@ func TestArchive_Stream(t *testing.T) {
 			r := strings.NewReader("hello, world!\n")
 			g.Assert(fs.Write("server.jar", r, r.Size(), 0o644)).IsNil()
 
-			_, err := NewArchive(fs.root, ".", WithIgnored(strings.Repeat("*a", MaxIgnorePatternWildcards+1)))
+			_, err := NewArchive(fs.root.Load(), ".", WithIgnored(strings.Repeat("*a", MaxIgnorePatternWildcards+1)))
 			g.Assert(err).IsNotNil()
 		})
 
@@ -122,7 +122,7 @@ func TestArchive_Stream(t *testing.T) {
 			g.Assert(err).IsNil()
 			defer f.Close()
 
-			a, err := NewArchive(fs.root, "/worlds")
+			a, err := NewArchive(fs.root.Load(), "/worlds")
 			g.Assert(err).IsNil()
 			g.Assert(a.Create(context.Background(), f)).IsNil()
 
@@ -160,7 +160,7 @@ func TestArchive_Stream(t *testing.T) {
 			}
 			defer f.Close()
 
-			a, err := NewArchive(fs.root, ".")
+			a, err := NewArchive(fs.root.Load(), ".")
 			if err != nil {
 				panic(err)
 			}

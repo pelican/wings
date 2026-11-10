@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"emperror.dev/errors"
 	ignore "github.com/sabhiram/go-gitignore"
 )
 
@@ -186,7 +187,7 @@ func TestFilesystem_SymlinkThroughSymlinkedParent(t *testing.T) {
 	if err := fs.Symlink("source.txt", "alias/link"); err != nil {
 		return // refusing is fine
 	}
-	if _, err := fs.root.Stat("link"); err != nil {
+	if _, err := fs.root.Load().Stat("link"); err != nil {
 		t.Fatalf("created a link that cannot be followed: %v", err)
 	}
 }
@@ -351,5 +352,68 @@ func TestFilesystem_SpaceAvailableForDecompression(t *testing.T) {
 	fs.write("notes.txt", []byte("not an archive"))
 	if err := fs.SpaceAvailableForDecompression(context.Background(), "/", "notes.txt"); !IsErrorCode(err, ErrCodeUnknownArchive) {
 		t.Errorf("expected ErrCodeUnknownArchive for a text file, got %v", err)
+	}
+}
+
+// Wings keeps the server folder open, but Docker mounts it by path. If the folder
+// is moved or deleted and then made again while Wings runs (by hand, by a
+// reinstall, or by mounting a disk over it), file operations must use the new
+// folder. Before this, writes went to the old folder and backups came out empty.
+func TestFilesystem_FollowsReplacedServerFolder(t *testing.T) {
+	fs := NewFs()
+	defer fs.reset()
+
+	names := func() []string {
+		entries, err := fs.ReadDir("/")
+		if err != nil {
+			t.Fatalf("read dir: %v", err)
+		}
+		var out []string
+		for _, e := range entries {
+			out = append(out, e.Name())
+		}
+		return out
+	}
+
+	fs.write("before.txt", []byte("before"))
+	if err := os.Rename(fs.rootPath, fs.rootPath+".old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(fs.rootPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fs.checked.Store(0) // as if rootCheckInterval had passed
+	if err := fs.Write("moved.txt", strings.NewReader("x"), 1, 0o644); err != nil {
+		t.Fatalf("write after the folder was moved: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(fs.rootPath, "moved.txt")); err != nil {
+		t.Errorf("write did not land in the new folder: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(fs.rootPath+".old", "moved.txt")); err == nil {
+		t.Error("write landed in the moved-away folder")
+	}
+	if got := names(); len(got) != 1 || got[0] != "moved.txt" {
+		t.Errorf("listing shows %v, want only moved.txt", got)
+	}
+	_ = os.RemoveAll(fs.rootPath + ".old")
+
+	// While nothing is at the path, operations fail as on main, rather than
+	// writing into a folder that no longer exists.
+	if err := os.RemoveAll(fs.rootPath); err != nil {
+		t.Fatal(err)
+	}
+	fs.checked.Store(0)
+	if err := fs.Write("lost.txt", strings.NewReader("x"), 1, 0o644); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("write with the folder deleted: got %v, want a not-exist error", err)
+	}
+	if err := os.Mkdir(fs.rootPath, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fs.checked.Store(0)
+	if err := fs.Write("recreated.txt", strings.NewReader("x"), 1, 0o644); err != nil {
+		t.Fatalf("write after the folder was made again: %v", err)
+	}
+	if got := names(); len(got) != 1 || got[0] != "recreated.txt" {
+		t.Errorf("listing shows %v, want only recreated.txt", got)
 	}
 }

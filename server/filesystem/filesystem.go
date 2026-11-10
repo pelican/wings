@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -33,9 +34,17 @@ type Filesystem struct {
 	// the maximum amount of disk space (in bytes) that it is allowed to use.
 	quota diskQuota
 
-	// The root data directory path for this Filesystem instance.
-	root     *os.Root
+	// The root data directory path for this Filesystem instance, and the folder
+	// open at that path. Use openRoot, not root, to get the folder.
+	root     atomic.Pointer[os.Root]
 	rootPath string
+	// rootMu guards reopening the folder, and replaced holds the folders that
+	// were open before, which stay open until Close.
+	rootMu   sync.Mutex
+	replaced []*os.Root
+	// checked is when openRoot last found the open folder still at rootPath, in
+	// Unix nanoseconds.
+	checked atomic.Int64
 
 	isTest bool
 }
@@ -48,16 +57,65 @@ func New(path string, size int64, denylist []string) (*Filesystem, error) {
 	}
 
 	fs := &Filesystem{
-		root:              r,
 		rootPath:          path,
 		diskCheckInterval: time.Duration(config.Get().System.DiskCheckInterval),
 		lastLookupTime:    &usageLookupTime{},
 		lookupInProgress:  system.NewAtomicBool(false),
 		denylist:          ignore.CompileIgnoreLines(denylist...),
 	}
+	fs.root.Store(r)
 	fs.quota.SetLimit(size)
 
 	return fs, nil
+}
+
+// rootCheckInterval is how long openRoot trusts its last check of the server folder.
+const rootCheckInterval = 50 * time.Millisecond
+
+// openRoot returns the server's folder. Wings keeps it open, but Docker mounts it
+// by path, so if the folder at rootPath is no longer the one that is open (it was
+// moved or deleted and then recreated, or a disk was mounted over it) the new one
+// is opened. internal/ufs got the same result by opening the path on every call.
+// If nothing is at rootPath, this returns an os.ErrNotExist error.
+//
+// The check costs two stat calls, and an archive extraction or a recursive delete
+// makes several calls per file, so it runs at most once per rootCheckInterval. A
+// replaced folder is picked up within that time.
+func (fs *Filesystem) openRoot() (*os.Root, error) {
+	r := fs.root.Load()
+	now := time.Now().UnixNano()
+	if now-fs.checked.Load() < int64(rootCheckInterval) {
+		return r, nil
+	}
+	open, err := r.Stat(".")
+	if err != nil {
+		return nil, errors.Wrap(err, "server/filesystem: failed to stat the open server folder")
+	}
+	current, err := os.Stat(fs.rootPath)
+	if err != nil {
+		return nil, errors.Wrap(err, "server/filesystem: failed to stat the server folder")
+	}
+	if os.SameFile(open, current) {
+		fs.checked.Store(now)
+		return r, nil
+	}
+
+	fs.rootMu.Lock()
+	defer fs.rootMu.Unlock()
+	if r2 := fs.root.Load(); r2 != r {
+		return r2, nil // another call already reopened it
+	}
+	nr, err := os.OpenRoot(fs.rootPath)
+	if err != nil {
+		return nil, errors.Wrap(err, "server/filesystem: failed to reopen the server folder")
+	}
+	// Operations that started before may still be using the old folder, so it is
+	// only closed by Close.
+	fs.replaced = append(fs.replaced, r)
+	fs.root.Store(nr)
+	fs.checked.Store(now)
+	log.WithField("path", fs.rootPath).Info("server/filesystem: server folder was replaced, opened the new one")
+	return nr, nil
 }
 
 // normalize takes the input path, runs it through filepath.Clean and trims any
@@ -77,9 +135,16 @@ func (fs *Filesystem) Path() string {
 	return fs.rootPath
 }
 
-// Close closes the underlying os.Root instance for the server.
+// Close closes the underlying os.Root instance for the server, and any folder
+// that was open before the server's folder was replaced.
 func (fs *Filesystem) Close() error {
-	if err := fs.root.Close(); err != nil {
+	fs.rootMu.Lock()
+	defer fs.rootMu.Unlock()
+	for _, r := range fs.replaced {
+		_ = r.Close()
+	}
+	fs.replaced = nil
+	if err := fs.root.Load().Close(); err != nil {
 		return errors.Wrap(err, "server/filesystem: failed to close root")
 	}
 	return nil
@@ -91,8 +156,12 @@ func (fs *Filesystem) Close() error {
 // ErrCodeNotRegular error without the file ever being opened. Opening a named
 // pipe for reading blocks until a writer appears, which would hang the caller.
 func (fs *Filesystem) File(p string) (*os.File, Stat, error) {
+	root, err := fs.openRoot()
+	if err != nil {
+		return nil, Stat{}, err
+	}
 	p = normalize(p)
-	st, err := fs.root.Stat(p)
+	st, err := root.Stat(p)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, Stat{}, newFilesystemError(ErrNotExist, err)
@@ -105,7 +174,7 @@ func (fs *Filesystem) File(p string) (*os.File, Stat, error) {
 	if !st.Mode().IsRegular() {
 		return nil, Stat{FileInfo: st}, &Error{code: ErrCodeNotRegular, resolved: p}
 	}
-	f, err := fs.root.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	f, err := root.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, Stat{}, errors.WithStackIf(err)
 	}
@@ -138,9 +207,13 @@ func (fs *Filesystem) File(p string) (*os.File, Stat, error) {
 // Writes made through the returned handle are accounted against the disk quota of
 // the server, and will fail once the server runs out of space.
 func (fs *Filesystem) Touch(p string, flag int, mode os.FileMode) (File, error) {
+	root, err := fs.openRoot()
+	if err != nil {
+		return nil, err
+	}
 	p = normalize(p)
 	var currentSize int64
-	st, err := fs.root.Stat(p)
+	st, err := root.Stat(p)
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return nil, errors.Wrap(err, "server/filesystem: touch: failed to stat file")
 	} else if err == nil && st.Mode().IsRegular() {
@@ -165,6 +238,10 @@ func (fs *Filesystem) Touch(p string, flag int, mode os.FileMode) (File, error) 
 // missing. Writes to the returned handle are NOT accounted against the quota;
 // callers must do that themselves.
 func (fs *Filesystem) touch(p string, flag int, mode os.FileMode) (*os.File, error) {
+	root, err := fs.openRoot()
+	if err != nil {
+		return nil, err
+	}
 	p = normalize(p)
 	if p == "." {
 		return nil, &Error{code: ErrCodeIsDirectory, resolved: p}
@@ -172,7 +249,7 @@ func (fs *Filesystem) touch(p string, flag int, mode os.FileMode) (*os.File, err
 	// Refuse to open anything that already exists and is not a regular file (or a
 	// symlink to one, which os.Root keeps inside the server directory). Opening a
 	// named pipe for writing would block, and writing to a device is never wanted.
-	if st, err := fs.root.Stat(p); err == nil {
+	if st, err := root.Stat(p); err == nil {
 		if st.IsDir() {
 			return nil, &Error{code: ErrCodeIsDirectory, resolved: p}
 		}
@@ -184,7 +261,7 @@ func (fs *Filesystem) touch(p string, flag int, mode os.FileMode) (*os.File, err
 	// O_NONBLOCK makes sure we never hang if the file is swapped for a named pipe
 	// after the check above; the handle is rejected below if it is not a regular file.
 	flag |= syscall.O_NONBLOCK
-	o := &fileOpener{root: fs.root}
+	o := &fileOpener{root: root}
 	f, err := o.open(p, flag, mode)
 	if err != nil {
 		// If the error is not because it doesn't exist then we just need to bail at this point.
@@ -245,8 +322,12 @@ func (fs *Filesystem) Writefile(p string, r io.Reader) error {
 
 // Mkdir creates a single directory, owned by the server user.
 func (fs *Filesystem) Mkdir(p string, mode os.FileMode) error {
+	root, err := fs.openRoot()
+	if err != nil {
+		return err
+	}
 	p = normalize(p)
-	if err := fs.root.Mkdir(p, mode); err != nil {
+	if err := root.Mkdir(p, mode); err != nil {
 		return errors.Wrap(err, "server/filesystem: mkdir: failed to make directory")
 	}
 	return fs.chownFile(p)
@@ -256,6 +337,10 @@ func (fs *Filesystem) Mkdir(p string, mode os.FileMode) error {
 // every directory it creates to the server user so they are not left owned by
 // the user Wings runs as.
 func (fs *Filesystem) mkdirAll(p string, mode os.FileMode) error {
+	root, err := fs.openRoot()
+	if err != nil {
+		return err
+	}
 	p = normalize(p)
 	if p == "." {
 		return nil
@@ -265,7 +350,7 @@ func (fs *Filesystem) mkdirAll(p string, mode os.FileMode) error {
 	// only those get their owner changed.
 	var missing []string
 	for dir := p; dir != "." && dir != string(filepath.Separator); dir = filepath.Dir(dir) {
-		if _, err := fs.root.Lstat(dir); err == nil {
+		if _, err := root.Lstat(dir); err == nil {
 			break
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return errors.Wrap(err, "server/filesystem: mkdir: failed to stat directory")
@@ -273,7 +358,7 @@ func (fs *Filesystem) mkdirAll(p string, mode os.FileMode) error {
 		missing = append(missing, dir)
 	}
 
-	if err := fs.root.MkdirAll(p, mode); err != nil {
+	if err := root.MkdirAll(p, mode); err != nil {
 		return errors.Wrap(err, "server/filesystem: mkdir: failed to create directory tree")
 	}
 
@@ -287,8 +372,12 @@ func (fs *Filesystem) mkdirAll(p string, mode os.FileMode) error {
 
 // Write writes a file to the disk.
 func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode os.FileMode) error {
+	root, err := fs.openRoot()
+	if err != nil {
+		return err
+	}
 	p = normalize(p)
-	st, err := fs.root.Stat(p)
+	st, err := root.Stat(p)
 	if err != nil {
 		if !errors.Is(err, os.ErrNotExist) {
 			return errors.Wrap(err, "server/filesystem: write: failed to stat file")
@@ -340,6 +429,10 @@ func (fs *Filesystem) CreateDirectory(name string, p string) error {
 
 // Rename moves (or renames) a file or directory.
 func (fs *Filesystem) Rename(from string, to string) error {
+	root, err := fs.openRoot()
+	if err != nil {
+		return err
+	}
 	to = normalize(to)
 	from = normalize(from)
 
@@ -350,7 +443,7 @@ func (fs *Filesystem) Rename(from string, to string) error {
 	// If the target file or directory already exists the rename function will
 	// fail, so just bail out now. Lstat is used so that a dangling symlink at
 	// the destination is not silently replaced.
-	if _, err := fs.root.Lstat(to); err == nil {
+	if _, err := root.Lstat(to); err == nil {
 		return os.ErrExist
 	}
 
@@ -360,7 +453,7 @@ func (fs *Filesystem) Rename(from string, to string) error {
 		return errors.Wrap(err, "server/filesystem: failed to create directory tree")
 	}
 
-	return fs.root.Rename(from, to)
+	return root.Rename(from, to)
 }
 
 // Begin looping up to 50 times to try and create a unique file name. This will take an input
@@ -373,6 +466,10 @@ func (fs *Filesystem) Rename(from string, to string) error {
 // pattern, and trying to find the highest number and then incrementing it by one rather than
 // looping endlessly.
 func (fs *Filesystem) findCopySuffix(dir string, name string, extension string) (string, error) {
+	root, err := fs.openRoot()
+	if err != nil {
+		return "", err
+	}
 	var i int
 	suffix := ""
 
@@ -388,7 +485,7 @@ func (fs *Filesystem) findCopySuffix(dir string, name string, extension string) 
 		n := name + suffix + extension
 		// If we stat the file and it does not exist that means we're good to create the copy. If it
 		// does exist, we'll just continue to the next loop and try again.
-		if _, err := fs.root.Lstat(normalize(path.Join(dir, n))); err != nil {
+		if _, err := root.Lstat(normalize(path.Join(dir, n))); err != nil {
 			if !errors.Is(err, os.ErrNotExist) {
 				return "", err
 			}
@@ -403,8 +500,12 @@ func (fs *Filesystem) findCopySuffix(dir string, name string, extension string) 
 // Copies a given file to the same location and appends a suffix to the file to indicate that
 // it has been copied.
 func (fs *Filesystem) Copy(p string) error {
+	root, err := fs.openRoot()
+	if err != nil {
+		return err
+	}
 	p = normalize(p)
-	s, err := fs.root.Stat(p)
+	s, err := root.Stat(p)
 	if err != nil {
 		return err
 	} else if s.IsDir() || !s.Mode().IsRegular() {
@@ -455,12 +556,16 @@ func (fs *Filesystem) Copy(p string) error {
 // and write in this package goes through os.Root, which refuses to follow it, and
 // within a container it would just point to something in the container filesystem.
 func (fs *Filesystem) Symlink(source, target string) error {
+	root, err := fs.openRoot()
+	if err != nil {
+		return err
+	}
 	source = normalize(source)
 	target = normalize(target)
 
 	// Just to avoid this propagating everywhere, *attempt* to block anything that
 	// would be pointing to a location outside the root directory.
-	if _, err := fs.root.Stat(source); err != nil {
+	if _, err := root.Stat(source); err != nil {
 		return errors.Wrap(err, "server/filesystem: symlink: failed to stat source")
 	}
 
@@ -474,7 +579,7 @@ func (fs *Filesystem) Symlink(source, target string) error {
 	// of them is a symlink the link would be relative to the wrong directory, so it
 	// is refused rather than created pointing somewhere else.
 	for d := filepath.Dir(target); d != "."; d = filepath.Dir(d) {
-		if st, err := fs.root.Lstat(d); err == nil && st.Mode()&os.ModeSymlink != 0 {
+		if st, err := root.Lstat(d); err == nil && st.Mode()&os.ModeSymlink != 0 {
 			return errors.New("server/filesystem: symlink: cannot create a symlink inside a symlinked directory")
 		}
 	}
@@ -483,7 +588,7 @@ func (fs *Filesystem) Symlink(source, target string) error {
 	if rel, err := filepath.Rel(filepath.Dir(target), source); err == nil {
 		link = rel
 	}
-	if err := fs.root.Symlink(link, target); err != nil {
+	if err := root.Symlink(link, target); err != nil {
 		return errors.Wrap(err, "server/filesystem: symlink: failed to create symlink")
 	}
 
@@ -550,7 +655,11 @@ func (e *errWriter) Write(p []byte) (int, error) {
 
 // ReadDir returns all the contents of the given directory.
 func (fs *Filesystem) ReadDir(p string) ([]fs2.DirEntry, error) {
-	e, err := fs2.ReadDir(rootDirFS{fs.root}, normalize(p))
+	root, err := fs.openRoot()
+	if err != nil {
+		return nil, err
+	}
+	e, err := fs2.ReadDir(rootDirFS{root}, normalize(p))
 	if err != nil {
 		return []fs2.DirEntry{}, errors.Wrap(err, "server/filesystem: readdir: failed to read directory")
 	}
@@ -561,10 +670,14 @@ func (fs *Filesystem) ReadDir(p string) ([]fs2.DirEntry, error) {
 // TruncateRootDirectory removes _all_ files and directories from a server's
 // data directory and resets the used disk space to zero.
 func (fs *Filesystem) TruncateRootDirectory() error {
-	entries, err := fs2.ReadDir(rootDirFS{fs.root}, ".")
+	root, err := fs.openRoot()
+	if err != nil {
+		return err
+	}
+	entries, err := fs2.ReadDir(rootDirFS{root}, ".")
 	if err == nil {
 		for _, e := range entries {
-			if err = fs.root.RemoveAll(e.Name()); err != nil {
+			if err = root.RemoveAll(e.Name()); err != nil {
 				break
 			}
 		}
@@ -589,12 +702,16 @@ func (fs *Filesystem) TruncateRootDirectory() error {
 // Delete removes a file or folder from the system. Prevents the user from
 // accidentally (or maliciously) removing their root server data directory.
 func (fs *Filesystem) Delete(p string) error {
+	root, err := fs.openRoot()
+	if err != nil {
+		return err
+	}
 	p = normalize(p)
 	if p == "." {
 		return errors.New("server/filesystem: delete: cannot delete root directory")
 	}
 
-	st, err := fs.root.Lstat(p)
+	st, err := root.Lstat(p)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -609,11 +726,11 @@ func (fs *Filesystem) Delete(p string) error {
 		size = st.Size()
 	}
 
-	if err := fs.root.RemoveAll(p); err != nil {
+	if err := root.RemoveAll(p); err != nil {
 		// Part of the tree may have been removed before the error. Stop counting
 		// what is gone, so the server is not refused writes for space it has back.
 		var remaining int64
-		if st, serr := fs.root.Lstat(p); serr == nil {
+		if st, serr := root.Lstat(p); serr == nil {
 			if st.IsDir() {
 				remaining, _ = fs.DirectorySize(p)
 			} else if st.Mode().IsRegular() {
@@ -634,12 +751,16 @@ func (fs *Filesystem) Delete(p string) error {
 // Denylisted files and directories are left in place, as is every directory that
 // still contains one of them.
 func (fs *Filesystem) SafeDeleteRecursively(p string) error {
+	root, err := fs.openRoot()
+	if err != nil {
+		return err
+	}
 	p = normalize(p)
 	if p == "." {
 		return errors.New("server/filesystem: delete: cannot delete root directory")
 	}
 
-	info, err := fs.root.Lstat(p)
+	info, err := root.Lstat(p)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil
@@ -667,7 +788,7 @@ func (fs *Filesystem) SafeDeleteRecursively(p string) error {
 		if err := fs.SafeDeleteRecursively(child); err != nil {
 			return err
 		}
-		if _, err := fs.root.Lstat(child); err == nil {
+		if _, err := root.Lstat(child); err == nil {
 			remaining = true
 		}
 	}
@@ -676,7 +797,7 @@ func (fs *Filesystem) SafeDeleteRecursively(p string) error {
 	if remaining {
 		return nil
 	}
-	if err := fs.root.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := root.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return errors.Wrap(err, "server/filesystem: delete: failed to remove directory")
 	}
 	return nil

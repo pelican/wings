@@ -135,6 +135,10 @@ func (fs *Filesystem) CompressFiles(ctx context.Context, dir string, name string
 // can be added, and symlinks are stored as links rather than followed. Files on
 // the server's denylist are skipped.
 func (fs *Filesystem) filesForArchive(dir string, paths []string) ([]archives.FileInfo, error) {
+	root, err := fs.openRoot()
+	if err != nil {
+		return nil, err
+	}
 	var out []archives.FileInfo
 	seen := make(map[string]struct{})
 
@@ -146,7 +150,7 @@ func (fs *Filesystem) filesForArchive(dir string, paths []string) ([]archives.Fi
 
 		// io/fs.WalkDir follows the starting path if it is a symlink, so only walk
 		// paths that really are directories.
-		st, err := fs.root.Lstat(base)
+		st, err := root.Lstat(base)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				continue
@@ -160,7 +164,7 @@ func (fs *Filesystem) filesForArchive(dir string, paths []string) ([]archives.Fi
 			}
 		}
 
-		err = walk(rootDirFS{fs.root}, base, func(full string, d iofs.DirEntry, err error) error {
+		err = walk(rootDirFS{root}, base, func(full string, d iofs.DirEntry, err error) error {
 			if err != nil {
 				if errors.Is(err, iofs.ErrNotExist) {
 					return nil
@@ -201,7 +205,7 @@ func (fs *Filesystem) filesForArchive(dir string, paths []string) ([]archives.Fi
 			switch mode := info.Mode(); {
 			case mode.IsDir():
 			case mode&os.ModeSymlink != 0:
-				target, err := fs.root.Readlink(full)
+				target, err := root.Readlink(full)
 				if err != nil {
 					return nil
 				}
@@ -231,8 +235,12 @@ func (fs *Filesystem) filesForArchive(dir string, paths []string) ([]archives.Fi
 // limiting the amount of data read to the size it had when it was added to the
 // archive's file list.
 func (fs *Filesystem) openForArchive(p string, size int64) (iofs.File, error) {
+	root, err := fs.openRoot()
+	if err != nil {
+		return nil, err
+	}
 	// O_NONBLOCK makes sure we never hang if the file was swapped for a named pipe.
-	f, err := fs.root.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	f, err := root.OpenFile(p, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		return nil, err
 	}
@@ -339,6 +347,10 @@ func (fs *Filesystem) DecompressFile(ctx context.Context, dir string, file strin
 }
 
 func (fs *Filesystem) extractStream(ctx context.Context, opts extractOptions) error {
+	root, err := fs.openRoot()
+	if err != nil {
+		return err
+	}
 	// See if it's a compressed archive, such as TAR or a ZIP
 	ex, ok := opts.format.(archives.Extractor)
 	if !ok {
@@ -363,7 +375,7 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractOptions) er
 		// read: that happens when the name has no extension to strip (a gzip file
 		// called "data"), or when the output name is a symlink to the archive.
 		if opts.src != nil {
-			if st, err := fs.root.Stat(normalize(p)); err == nil && os.SameFile(st, opts.src) {
+			if st, err := root.Stat(normalize(p)); err == nil && os.SameFile(st, opts.src) {
 				return errors.New("server/filesystem: decompress: the decompressed file would overwrite the archive itself; rename the archive to end in " + opts.format.Extension())
 			}
 		}
@@ -416,7 +428,7 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractOptions) er
 				if err := fs.mkdirAll(filepath.Dir(p2), 0o755); err != nil {
 					return nil
 				}
-				if err := fs.root.Symlink(f.LinkTarget, p2); err != nil {
+				if err := root.Symlink(f.LinkTarget, p2); err != nil {
 					if errors.Is(err, os.ErrNotExist) || errors.Is(err, os.ErrExist) || IsPathError(err) || IsLinkError(err) {
 						return nil
 					}

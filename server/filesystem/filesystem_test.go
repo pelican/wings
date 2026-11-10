@@ -67,7 +67,7 @@ func getFileContent(file *os.File) string {
 }
 
 func (tfs *testFs) reset() {
-	if err := tfs.root.Close(); err != nil {
+	if err := tfs.root.Load().Close(); err != nil {
 		panic(err)
 	}
 	if !strings.HasPrefix(tfs.tmpDir, filepath.Join(testTempDir(), "pelican")) {
@@ -94,7 +94,7 @@ func (tfs *testFs) reset() {
 		panic(err)
 	}
 
-	tfs.root = r
+	tfs.root.Store(r)
 }
 
 func (tfs *testFs) write(name string, data []byte) {

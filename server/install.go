@@ -473,9 +473,9 @@ func (ip *InstallationProcess) Execute() (string, error) {
 	// Ensure the root directory for the server exists properly before attempting
 	// to trigger the reinstall of the server. It is possible the directory would
 	// not exist when this runs if Wings boots with a missing directory and a user
-	// triggers a reinstall before trying to start the server.
-	// todo: verify, this might be wrong now that the FS requires the directory to
-	//  exist to boot it.
+	// triggers a reinstall before trying to start the server, or if the folder was
+	// deleted while Wings was running. The server's Filesystem opens the new folder
+	// on its next call (see Filesystem.openRoot).
 	if _, err := ip.Server.EnsureDataDirectoryExists(); err != nil {
 		return "", err
 	}
