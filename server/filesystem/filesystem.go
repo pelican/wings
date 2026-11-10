@@ -100,7 +100,9 @@ func (fs *Filesystem) openRoot() (*os.Root, error) {
 	if err != nil {
 		return nil, errors.Wrap(err, "server/filesystem: failed to stat the server folder")
 	}
-	if os.SameFile(open, current) {
+	// A deleted folder's inode number can be given straight to the new one, so
+	// SameFile alone can match a folder that is no longer at the path.
+	if os.SameFile(open, current) && !isUnlinked(open) {
 		fs.checked.Store(now)
 		return r, nil
 	}

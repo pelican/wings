@@ -80,11 +80,17 @@ func (fs *Filesystem) matchesDenylist(p string) bool {
 // resolveInRoot returns the path, relative to the server root, that p refers to
 // once every symlink in it has been followed the way os.Root follows them.
 //
+// p itself is cleaned first, as every caller cleans a path before os.Root sees
+// it. A link's target is not: os.Root applies ".." in a target to the folder the
+// parts before it lead to, so "jump/../config.yml" with "jump -> sub/x" is
+// "sub/config.yml". The parts of a target are therefore resolved one at a time,
+// and ".." drops the last folder resolved so far, which is never a symlink.
+//
 // Resolving stops at the first part of the path that does not exist, at an
 // absolute symlink (os.Root refuses to follow those) and after maxSymlinkHops
-// links; whatever is left of the path is then joined on as it is. A link that
-// climbs above the root is kept at the root, as with every other path here, and
-// os.Root refuses to follow it anyway.
+// links; whatever is left of the path is then joined on as it is. ".." at the
+// root stays at the root, as with every other path here, and os.Root refuses to
+// go above it anyway.
 func (fs *Filesystem) resolveInRoot(p string) string {
 	r, err := fs.openRoot()
 	if err != nil {
@@ -96,31 +102,34 @@ func (fs *Filesystem) resolveInRoot(p string) string {
 	for len(rest) > 0 {
 		part := rest[0]
 		rest = rest[1:]
-		if part == "." || part == "" {
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			if len(done) > 0 {
+				done = done[:len(done)-1]
+			}
 			continue
 		}
 		cur := path.Join(append(done, part)...)
 		st, err := r.Lstat(cur)
-		if err != nil || st.Mode()&os.ModeSymlink == 0 {
+		if err != nil {
+			done = append(append(done, part), rest...)
+			break
+		}
+		if st.Mode()&os.ModeSymlink == 0 {
 			done = append(done, part)
-			if err != nil {
-				done = append(done, rest...)
-				break
-			}
 			continue
 		}
 		target, err := r.Readlink(cur)
 		hops++
 		if err != nil || path.IsAbs(target) || hops > maxSymlinkHops {
-			done = append(done, part)
-			done = append(done, rest...)
+			done = append(append(done, part), rest...)
 			break
 		}
-		// Replace the link with its target, relative to the directory holding it,
-		// and start again from the root so ".." in the target is handled.
-		joined := normalize("/" + path.Join(append(append([]string{}, done...), target)...))
-		rest = append(strings.Split(joined, "/"), rest...)
-		done = done[:0]
+		// Carry on from the folder holding the link, with the target's parts,
+		// unresolved, in front of what is left.
+		rest = append(strings.Split(target, "/"), rest...)
 	}
 	return normalize("/" + path.Join(done...))
 }

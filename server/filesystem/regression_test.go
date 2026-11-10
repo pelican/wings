@@ -7,6 +7,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 
 	ignore "github.com/sabhiram/go-gitignore"
@@ -248,5 +249,86 @@ func TestFilesystem_ChmodAppliesSpecialBitsFromUnixMode(t *testing.T) {
 		if got != tc.want {
 			t.Errorf("chmod %s %o: got %v, want %v", tc.path, tc.unix, got, tc.want)
 		}
+	}
+}
+
+// os.Root applies ".." in a link's target after following the links before it,
+// so "alias -> jump/../config.yml" with "jump -> sub/x" reaches sub/config.yml.
+// The denylist check must resolve it the same way, both when reading and when an
+// archive tries to plant such a link.
+func TestFilesystem_IsIgnoredDotDotAfterSymlink(t *testing.T) {
+	fs := NewFs()
+	defer fs.reset()
+	fs.setDenylist("/sub/config.yml")
+
+	if err := os.MkdirAll(filepath.Join(fs.rootPath, "sub/x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fs.write("sub/config.yml", []byte("secret"))
+	fs.symlink("sub/x", "jump")
+	fs.symlink("jump/../config.yml", "alias")
+
+	r, err := fs.openRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, err := r.ReadFile("alias"); err != nil || string(b) != "secret" {
+		t.Fatalf("test setup: os.Root should reach sub/config.yml through alias, got %q, %v", b, err)
+	}
+	if got := fs.resolveInRoot("alias"); got != "sub/config.yml" {
+		t.Errorf("resolveInRoot(alias) = %q, want sub/config.yml", got)
+	}
+	if err := fs.IsIgnored("alias"); !IsErrorCode(err, ErrCodeDenylistFile) {
+		t.Errorf("IsIgnored(alias) = %v, want a denylist error", err)
+	}
+
+	var buf bytes.Buffer
+	gz := gzip.NewWriter(&buf)
+	tw := tar.NewWriter(gz)
+	if err := tw.WriteHeader(&tar.Header{Name: "planted", Typeflag: tar.TypeSymlink, Linkname: "jump/../config.yml", Mode: 0o777}); err != nil {
+		t.Fatal(err)
+	}
+	_ = tw.Close()
+	_ = gz.Close()
+	if err := fs.ExtractStreamUnsafe(context.Background(), "/", &buf); err != nil {
+		t.Fatalf("extract: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(fs.rootPath, "planted")); err == nil {
+		t.Error("decompression kept a link that reaches a denylisted file")
+	}
+}
+
+// openRoot reopens the server folder when the open one has been deleted, even if
+// the new folder got the same inode number. isUnlinked is what tells them apart.
+func TestIsUnlinked(t *testing.T) {
+	// macOS doesn't report a link count of 0 for a removed folder that is still
+	// open, so there openRoot only has SameFile to go on. Wings runs on Linux.
+	if runtime.GOOS != "linux" {
+		t.Skip("link count of a removed open folder is only reliable on Linux")
+	}
+	d := filepath.Join(t.TempDir(), "d")
+	if err := os.Mkdir(d, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r, err := os.OpenRoot(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	st, err := r.Stat(".")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if isUnlinked(st) {
+		t.Error("a folder that still exists is reported as unlinked")
+	}
+	if err := os.Remove(d); err != nil {
+		t.Fatal(err)
+	}
+	if st, err = r.Stat("."); err != nil {
+		t.Fatal(err)
+	}
+	if !isUnlinked(st) {
+		t.Error("a removed folder that is still open is not reported as unlinked")
 	}
 }

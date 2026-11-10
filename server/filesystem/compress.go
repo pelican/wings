@@ -441,11 +441,6 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractOptions) er
 			// outside the server's data directory.
 			if f.LinkTarget != "" {
 				p2 := normalize(p)
-				// Leave out a link that would point at a denylisted file. Using
-				// the link is refused anyway, but there is no reason to create it.
-				if !filepath.IsAbs(f.LinkTarget) && fs.IsIgnored(filepath.Join(filepath.Dir(p2), f.LinkTarget)) != nil {
-					return nil
-				}
 				if err := fs.mkdirAll(filepath.Dir(p2), 0o755); err != nil {
 					return nil
 				}
@@ -454,6 +449,13 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractOptions) er
 						return nil
 					}
 					return errors.Wrap(err, "server/filesystem: decompress: failed to create symlink")
+				}
+				// Leave out a link that points at a denylisted file. Using the link is
+				// refused anyway, but there is no reason to keep it. This is checked on
+				// the link itself, so its target is resolved as os.Root resolves it.
+				if fs.IsIgnored(p2) != nil {
+					_ = root.Remove(p2)
+					return nil
 				}
 				_ = fs.chownFile(p2)
 			}
