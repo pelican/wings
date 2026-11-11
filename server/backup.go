@@ -10,6 +10,7 @@ import (
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/docker/docker/client"
+	"github.com/mholt/archives"
 
 	"github.com/pelican/wings/environment"
 	"github.com/pelican/wings/remote"
@@ -202,6 +203,16 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 			dirs = append(dirs, restoredDir{name: file, mode: mode, mtime: info.ModTime()})
 			return nil
 		} else {
+			// Symbolic links have no content, so recreate the link itself.
+			if info.Mode()&fs.ModeSymlink != 0 {
+				fi, ok := info.(archives.FileInfo)
+				if !ok || fi.LinkTarget == "" {
+					s.Log().WithField("file", file).Warn("skipping symlink without a target during backup restoration")
+					return nil
+				}
+				return errors.WithStack(s.Filesystem().RestoreSymlink(file, fi.LinkTarget))
+			}
+			// Named pipes and devices are skipped.
 			if !info.Mode().IsRegular() {
 				return nil
 			}
