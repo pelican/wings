@@ -113,6 +113,7 @@ func mergeYamlDocument(src []byte, expandAliases bool, orig, next interface{}) (
 	}
 
 	mergeYamlNode(root, orig, next, true)
+	clearYamlMergeTags(root)
 	var buf bytes.Buffer
 	enc := yaml.NewEncoder(&buf)
 	enc.SetIndent(detectYamlIndent(src))
@@ -276,6 +277,23 @@ func stripYamlAnchors(n *yaml.Node) {
 	n.Anchor = ""
 	for _, c := range n.Content {
 		stripYamlAnchors(c)
+	}
+}
+
+// clearYamlMergeTags removes the explicit !!merge tag yaml.v3 sets on merge keys
+// when decoding. The encoder does not recognise "<<" as implicitly resolving to
+// !!merge and writes "!!merge <<: *anchor", which some parsers, such as js-yaml,
+// fail to read. A plain "<<" key decodes as a merge key again.
+func clearYamlMergeTags(n *yaml.Node) {
+	if n.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(n.Content); i += 2 {
+			if k := n.Content[i]; k.Kind == yaml.ScalarNode && k.Value == "<<" && k.Tag == "!!merge" && k.Style&yaml.TaggedStyle == 0 {
+				k.Tag = ""
+			}
+		}
+	}
+	for _, c := range n.Content {
+		clearYamlMergeTags(c)
 	}
 }
 
