@@ -8,6 +8,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -388,7 +389,7 @@ func (ip *InstallationProcess) AfterExecute(containerId string) error {
 |
 | Environment Variables
 | ------------------------------
-{{ range $key, $value := .Server.GetEnvironmentVariables }}  {{ $value }}
+{{ range $key, $value := .Environment }}  {{ $value }}
 {{ end }}
 
 |
@@ -403,9 +404,11 @@ func (ip *InstallationProcess) AfterExecute(containerId string) error {
 	data := struct {
 		*InstallationProcess
 		KernelVersion string
+		Environment   []string
 	}{
 		InstallationProcess: ip,
 		KernelVersion:       v.String(),
+		Environment:         redactEnvironment(ip.Server.GetEnvironmentVariables()),
 	}
 
 	if err := tmpl.Execute(f, data); err != nil {
@@ -636,4 +639,75 @@ func (s *Server) SyncInstallState(successful, reinstall bool) error {
 		Successful: successful,
 		Reinstall:  reinstall,
 	})
+}
+
+// redactedValue replaces the value of a sensitive variable in the installation log.
+const redactedValue = "********"
+
+// minSearchedSecretLength is the length a sensitive value needs before it is also searched
+// for in the other variables: shorter values ("1", "true", "false") would hide unrelated text.
+const minSearchedSecretLength = 6
+
+// sensitiveKeyWords are matched anywhere in a variable name, sensitiveKeyParts only as a
+// whole part of it (RCON_PASS, API_KEY, STEAM_ACC for the Steam game server token), so names
+// like BYPASS_CHECK or MONKEY_MODE are kept.
+var (
+	sensitiveKeyWords = []string{"PASSWORD", "PASSWD", "TOKEN", "SECRET", "CREDENTIAL", "LICENSE", "PRIVATE", "APIKEY"}
+	sensitiveKeyParts = []string{"PASS", "PWD", "KEY", "AUTH", "ACC", "GSLT"}
+)
+
+// isSensitiveVariable reports whether the value of the environment variable with this
+// name looks like a password, a token or a key.
+func isSensitiveVariable(name string) bool {
+	name = strings.ToUpper(name)
+	for _, word := range sensitiveKeyWords {
+		if strings.Contains(name, word) {
+			return true
+		}
+	}
+	for _, part := range strings.FieldsFunc(name, func(r rune) bool { return r == '_' || r == '-' || r == '.' }) {
+		for _, p := range sensitiveKeyParts {
+			if part == p {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// redactEnvironment hides the values of sensitive variables before they are written to the
+// installation log. Those values are also hidden wherever they appear in another variable,
+// such as STARTUP, which holds the start command with every variable already replaced.
+func redactEnvironment(env []string) []string {
+	var secrets []string
+	out := make([]string, len(env))
+	for i, e := range env {
+		name, value, ok := strings.Cut(e, "=")
+		if ok && value != "" && isSensitiveVariable(name) {
+			if len(value) >= minSearchedSecretLength {
+				secrets = append(secrets, value)
+			}
+			out[i] = name + "=" + redactedValue
+			continue
+		}
+		out[i] = e
+	}
+	if len(secrets) == 0 {
+		return out
+	}
+
+	// Replace the longest values first, so a secret that contains another one is fully hidden.
+	sort.Slice(secrets, func(a, b int) bool { return len(secrets[a]) > len(secrets[b]) })
+	pairs := make([]string, 0, len(secrets)*2)
+	for _, secret := range secrets {
+		pairs = append(pairs, secret, redactedValue)
+	}
+	replacer := strings.NewReplacer(pairs...)
+	for i, e := range out {
+		name, value, ok := strings.Cut(e, "=")
+		if ok && value != redactedValue {
+			out[i] = name + "=" + replacer.Replace(value)
+		}
+	}
+	return out
 }

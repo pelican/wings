@@ -98,3 +98,87 @@ func TestWaitForInstallationContainerPublishesWaitFailure(t *testing.T) {
 		t.Fatal("waitForInstallationContainer() did not publish a failure event")
 	}
 }
+
+func TestIsSensitiveVariable(t *testing.T) {
+	sensitive := []string{"RCON_PASSWORD", "SERVER_PASSWORD", "STEAM_PASS", "STEAM_AUTH", "SRCDS_TOKEN", "API_KEY", "FIVEM_LICENSE", "DB_PWD", "client_secret", "SERVERPASSWORD", "STEAM_WEBAPIKEY", "STEAM_ACC", "GSLT"}
+	for _, name := range sensitive {
+		if !isSensitiveVariable(name) {
+			t.Errorf("isSensitiveVariable(%q) = false, expected true", name)
+		}
+	}
+
+	kept := []string{"SERVER_MEMORY", "SERVER_PORT", "STARTUP", "BYPASS_CHECK", "MONKEY_MODE", "MAX_PLAYERS", "PASSIVE_MODE", "ACCESS_MODE", "TZ"}
+	for _, name := range kept {
+		if isSensitiveVariable(name) {
+			t.Errorf("isSensitiveVariable(%q) = true, expected false", name)
+		}
+	}
+}
+
+func TestRedactEnvironment(t *testing.T) {
+	env := []string{
+		"TZ=UTC",
+		"STARTUP=./srcds_run +rcon_password hunter22 +sv_setsteamaccount ABCD1234TOKEN -port 27015",
+		"SERVER_MEMORY=1024",
+		"RCON_PASSWORD=hunter22",
+		"STEAM_ACC=ABCD1234TOKEN",
+		"SRCDS_TOKEN=ABCD1234TOKEN",
+		"SERVER_PASSWORD=",
+		"MAX_PLAYERS=16",
+	}
+
+	got := redactEnvironment(env)
+	want := []string{
+		"TZ=UTC",
+		"STARTUP=./srcds_run +rcon_password ******** +sv_setsteamaccount ******** -port 27015",
+		"SERVER_MEMORY=1024",
+		"RCON_PASSWORD=********",
+		"STEAM_ACC=********",
+		"SRCDS_TOKEN=********",
+		"SERVER_PASSWORD=",
+		"MAX_PLAYERS=16",
+	}
+
+	if len(got) != len(want) {
+		t.Fatalf("redactEnvironment() returned %d variables, expected %d", len(got), len(want))
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("redactEnvironment()[%d] = %q, expected %q", i, got[i], want[i])
+		}
+	}
+	if env[3] != "RCON_PASSWORD=hunter22" {
+		t.Errorf("redactEnvironment() changed its input: %q", env[3])
+	}
+}
+
+func TestRedactEnvironmentLongestSecretFirst(t *testing.T) {
+	got := redactEnvironment([]string{
+		"STARTUP=run --key abcdef --password abcdefgh",
+		"API_KEY=abcdef",
+		"ADMIN_PASSWORD=abcdefgh",
+	})
+	if got[0] != "STARTUP=run --key ******** --password ********" {
+		t.Errorf("redactEnvironment()[0] = %q", got[0])
+	}
+}
+
+func TestRedactEnvironmentShortValues(t *testing.T) {
+	got := redactEnvironment([]string{
+		"STARTUP=./start --memory 1024 --auth true",
+		"SERVER_MEMORY=1024",
+		"AUTH_REQUIRED=true",
+		"SERVER_PASSWORD=1",
+	})
+	want := []string{
+		"STARTUP=./start --memory 1024 --auth true",
+		"SERVER_MEMORY=1024",
+		"AUTH_REQUIRED=********",
+		"SERVER_PASSWORD=********",
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("redactEnvironment()[%d] = %q, expected %q", i, got[i], want[i])
+		}
+	}
+}
