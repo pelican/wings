@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
@@ -219,8 +220,16 @@ type postUpdateConfigurationResponse struct {
 	Applied bool `json:"applied"`
 }
 
+// updateConfigMu serializes the whole configuration update, from reading the
+// current config through writing it to disk, setting it globally and rotating
+// the Panel client credentials. Without it, overlapping requests can leave the
+// global config on one token while the shared client uses another.
+var updateConfigMu sync.Mutex
+
 // Updates the running configuration for this Wings instance.
 func postUpdateConfiguration(c *gin.Context) {
+	updateConfigMu.Lock()
+	defer updateConfigMu.Unlock()
 	cfg := config.Get()
 
 	if cfg.IgnorePanelConfigUpdates {
@@ -244,6 +253,29 @@ func postUpdateConfiguration(c *gin.Context) {
 		cfg.Api.Ssl.CertificateFile = config.Get().Api.Ssl.CertificateFile
 	}
 
+	// The token that everything authenticates against is a derived value that is
+	// not part of the payload sent by the Panel, so it has to be re-resolved from
+	// the new token values.
+	if err := cfg.ResolveToken(true); err != nil {
+		if !errors.Is(err, config.ErrTokenEnvMismatch) {
+			middleware.CaptureAndAbort(c, err)
+			return
+		}
+		// An environment override pins the credentials and keeps winning at
+		// runtime. Rejecting the push would leave the Panel and Wings permanently
+		// out of sync after a token reset, so accept and persist the Panel's
+		// configuration and tell the operator that the override is stale.
+		log.WithField("error", err).Warn("the Panel pushed a token that differs from the WINGS_TOKEN/WINGS_TOKEN_ID environment override; the override is still in use, update or remove it to use the new token")
+	}
+
+	// Refuse to go any further with a token we could never authenticate against.
+	if cfg.Token.ID == "" || cfg.Token.Token == "" {
+		middleware.CaptureAndAbort(c, errors.New("config: refusing to apply an update with an empty authentication token"))
+		return
+	}
+
+	tokenId, token := cfg.Token.ID, cfg.Token.Token
+
 	// Try to write this new configuration to the disk before updating our global
 	// state with it.
 	if err := config.WriteToDisk(cfg); err != nil {
@@ -253,6 +285,11 @@ func postUpdateConfiguration(c *gin.Context) {
 	// Since we wrote it to the disk successfully now update the global configuration
 	// state to use this new configuration struct.
 	config.Set(cfg)
+
+	// Requests we make back to the Panel use credentials that were captured when
+	// the client was created at boot, so they have to be rotated explicitly.
+	middleware.ExtractManager(c).Client().SetCredentials(tokenId, token)
+
 	c.JSON(http.StatusOK, postUpdateConfigurationResponse{
 		Applied: true,
 	})
