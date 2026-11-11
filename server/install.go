@@ -98,19 +98,68 @@ func (s *Server) Reinstall() error {
 	return s.install(true)
 }
 
+// Installer executes the installation script of a server. The default
+// implementation runs the script inside a Docker container; alternative
+// implementations are registered on the server manager with WithInstaller.
+//
+// Run is invoked with the server's installation lock held (IsInstalling
+// returns true) and must block until the script has finished. Returning an
+// error marks the installation as failed towards the Panel.
+type Installer interface {
+	Run(s *Server, script *remote.InstallationScript) error
+}
+
+// dockerInstaller is the default Installer and runs the installation script in
+// a Docker container using InstallationProcess.
+type dockerInstaller struct{}
+
+// Run runs the installation script in a Docker container and blocks until it
+// has finished.
+func (dockerInstaller) Run(s *Server, script *remote.InstallationScript) error {
+	p, err := NewInstallationProcess(s, script)
+	if err != nil {
+		return err
+	}
+	// internalInstall already holds the installation lock.
+	return p.run()
+}
+
+// lockInstallation takes the installation lock and cancels the server's SFTP
+// sessions. The returned function releases the lock.
+func (s *Server) lockInstallation() (func(), error) {
+	s.Log().Debug("acquiring installation process lock")
+	if !s.installing.SwapIf(true) {
+		return nil, errors.New("install: cannot obtain installation lock")
+	}
+	s.Sftp().CancelAll()
+	return func() {
+		s.Log().Debug("releasing installation process lock")
+		s.installing.Store(false)
+	}, nil
+}
+
 // Internal installation function used to simplify reporting back to the Panel.
 func (s *Server) internalInstall() error {
 	script, err := s.client.GetInstallationScript(s.Context(), s.ID())
 	if err != nil {
 		return err
 	}
-	p, err := NewInstallationProcess(s, &script)
+
+	// Take an exclusive lock on this installation process and release it once the process has
+	// finished, so that other processes can be executed without encountering a wait timeout.
+	unlock, err := s.lockInstallation()
 	if err != nil {
 		return err
 	}
+	defer unlock()
+
+	var installer Installer = dockerInstaller{}
+	if s.installer != nil {
+		installer = s.installer
+	}
 
 	s.Log().Info("beginning installation process for server")
-	if err := p.Run(); err != nil {
+	if err := installer.Run(s, &script); err != nil {
 		return err
 	}
 
@@ -198,19 +247,16 @@ func (ip *InstallationProcess) RemoveContainer() error {
 // installation container. Once the container finishes installing the results
 // are stored in an installation log in the server's configuration directory.
 func (ip *InstallationProcess) Run() error {
-	ip.Server.Log().Debug("acquiring installation process lock")
-	if !ip.Server.installing.SwapIf(true) {
-		return errors.New("install: cannot obtain installation lock")
+	unlock, err := ip.Server.lockInstallation()
+	if err != nil {
+		return err
 	}
-	ip.Server.Sftp().CancelAll()
-	// We now have an exclusive lock on this installation process. Ensure that whenever this
-	// process is finished that the semaphore is released so that other processes and be executed
-	// without encountering a wait timeout.
-	defer func() {
-		ip.Server.Log().Debug("releasing installation process lock")
-		ip.Server.installing.Store(false)
-	}()
+	defer unlock()
+	return ip.run()
+}
 
+// run is Run for callers that already hold the installation lock.
+func (ip *InstallationProcess) run() error {
 	if err := ip.BeforeExecute(); err != nil {
 		return err
 	}

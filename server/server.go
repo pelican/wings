@@ -68,6 +68,10 @@ type Server struct {
 	transferring *system.AtomicBool
 	restoring    *system.AtomicBool
 
+	// installer runs the egg installation script for this server. A nil value
+	// selects the default Docker based installer.
+	installer Installer
+
 	// The console throttler instance used to control outputs.
 	throttler    *ConsoleThrottle
 	throttleOnce sync.Once
