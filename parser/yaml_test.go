@@ -251,3 +251,17 @@ func TestUpdateYaml_WholeFloat(t *testing.T) {
 		}
 	}
 }
+
+// A timestamp decodes as a time.Time but reaches the replacements as a string.
+// Verification must treat the two as equal, or changing any other key falls
+// back to writing the whole document, quoting the date and dropping comments.
+func TestUpdateYaml_Timestamps(t *testing.T) {
+	src := "# dates\ncreated: 2024-01-01\nupdated: 2024-01-01T10:00:00.5+02:00\ntagged: !!timestamp 2024-01-01\nname: a # keep\n"
+	out, changed := updateYamlString(t, `[{"match": "name", "replace_with": "b"}]`, src)
+	if !changed {
+		t.Fatal("expected the document to change")
+	}
+	if want := strings.Replace(src, "name: a", "name: b", 1); out != want {
+		t.Fatalf("unexpected output\n--- got ---\n%s\n--- want ---\n%s", out, want)
+	}
+}

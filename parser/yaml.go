@@ -197,7 +197,18 @@ func yamlValueEqual(got, want interface{}) bool {
 			return false
 		}
 	default:
-		return reflect.DeepEqual(got, want)
+		if reflect.DeepEqual(got, want) {
+			return true
+		}
+		// Other values reached want through JSON: a timestamp such as 2024-01-01
+		// decodes as a time.Time, and is a string in want. Compare them in the
+		// same form.
+		data, err := json.Marshal(got)
+		if err != nil {
+			return false
+		}
+		v, err := decodeJsonValue(data)
+		return err == nil && reflect.DeepEqual(v, want)
 	}
 }
 
