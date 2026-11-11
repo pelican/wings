@@ -13,6 +13,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
@@ -26,6 +27,13 @@ import (
 	"github.com/pelican/wings/server/installer"
 	"github.com/pelican/wings/server/transfer"
 )
+
+// failedIncomingCleanups holds the IDs of servers whose failed incoming transfer
+// is still being removed from this node. The source node tells the Panel about a
+// failed transfer on its own, so a retry can arrive while the old container and
+// files are still being deleted, and that deletion would remove the retry's copy.
+// A new transfer of such a server is refused until the cleanup has finished.
+var failedIncomingCleanups sync.Map
 
 // postTransfers .
 func postTransfers(c *gin.Context) {
@@ -63,6 +71,13 @@ func postTransfers(c *gin.Context) {
 	)
 	trnsfr := transfer.Incoming().Get(u.String())
 	if trnsfr == nil {
+		if _, busy := failedIncomingCleanups.Load(u.String()); busy {
+			c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+				"error": "A failed transfer of this server is still being cleaned up on this node, try again shortly.",
+			})
+			return
+		}
+
 		// TODO: should this use the request context?
 		trnsfr = transfer.New(c, nil)
 
@@ -105,26 +120,40 @@ func postTransfers(c *gin.Context) {
 	// Everything this request writes to disk is tracked so that a failed transfer
 	// can be removed again. When the server lives on a shared storage pool its data
 	// directory belongs to the source as well, and must never be deleted here.
+	//
+	// Received backups are written to temporary files (stagedBackups maps each
+	// final path to its temporary file) and only moved into place once the whole
+	// transfer has been verified, so a backup already on this node is never left
+	// half overwritten. receivedBackups lists every backup file this transfer has
+	// created, temporary or final.
 	var (
 		successful      bool
 		pooled          bool
+		stagedBackups   = make(map[string]string)
 		receivedBackups []string
 		installLogPath  string
 	)
 	defer func(ctx context.Context, trnsfr *transfer.Transfer) {
+		id := trnsfr.Server.ID()
+		if !successful {
+			// Mark the cleanup as running before the transfer stops being listed as
+			// incoming, so that no retry can be admitted in between.
+			failedIncomingCleanups.Store(id, struct{}{})
+		}
+
 		// Remove the transfer from the list of incoming transfers.
 		transfer.Incoming().Remove(trnsfr)
 
 		if !successful {
 			trnsfr.Server.Events().Publish(server.TransferStatusEvent, "failure")
 			manager.Remove(func(match *server.Server) bool {
-				return match.ID() == trnsfr.Server.ID()
+				return match.ID() == id
 			})
 			// The source node keeps its copy of the server when a transfer fails, so
-			// the transfer can be retried or the server moved by hand. Remove the partial
-			// copy from this node before telling the Panel, so that a retry cannot start
-			// while the files are still being deleted.
+			// the transfer can be retried or the server moved by hand. Remove the
+			// partial copy from this node; a retry is refused until this is done.
 			cleanupFailedIncomingTransfer(trnsfr, pooled, receivedBackups, installLogPath)
+			failedIncomingCleanups.Delete(id)
 		}
 
 		if err := manager.Client().SetTransferStatus(context.Background(), trnsfr.Server.ID(), successful); err != nil {
@@ -252,6 +281,11 @@ out:
 					break
 				}
 				installLogPath = logPath
+				// OpenFile only applies the mode to new files, so also tighten a log
+				// left by an earlier transfer.
+				if err := installLogFile.Chmod(0o640); err != nil {
+					trnsfr.Log().WithError(err).Warn("failed to set permissions on install log file")
+				}
 
 				// Stream the install logs to file
 				if _, err := io.Copy(installLogFile, p); err != nil {
@@ -272,6 +306,10 @@ out:
 				backupNameUnsafe := strings.TrimPrefix(name, "backup_")
 				// Strip all directory components
 				backupName := filepath.Base(backupNameUnsafe)
+				if backupName == "." || backupName == ".." || backupName == string(filepath.Separator) {
+					middleware.CaptureAndAbort(c, fmt.Errorf("invalid backup name %q", backupNameUnsafe))
+					return
+				}
 				trnsfr.Log().WithField("backup", backupName).Debug("received backup file")
 
 				// Create backup directory if it doesn't exist
@@ -289,41 +327,20 @@ out:
 				}
 
 				backupPath := filepath.Join(backupDir, backupName)
-				// A backup with this name that is already on this node (from an earlier
-				// transfer) is the same backup, so it must survive a failed transfer.
-				_, statErr := os.Lstat(backupPath)
-				existedBefore := statErr == nil
-
-				// Create the backup file and stream directly to disk
-				backupFile, err := os.OpenFile(backupPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+				tmpPath, checksum, err := stageReceivedBackup(backupDir, backupName, p)
 				if err != nil {
-					middleware.CaptureAndAbort(c, fmt.Errorf("failed to create backup file %s: %w", backupPath, err))
+					middleware.CaptureAndAbort(c, fmt.Errorf("failed to receive backup file %s: %w", backupName, err))
 					return
 				}
-				if !existedBefore {
-					receivedBackups = append(receivedBackups, backupPath)
-				} else if err := backupFile.Chmod(0o600); err != nil {
-					// OpenFile only applies the mode to new files.
-					trnsfr.Log().WithField("backup", backupName).WithError(err).Warn("failed to set permissions on backup file")
+				receivedBackups = append(receivedBackups, tmpPath)
+				if previous, ok := stagedBackups[backupPath]; ok {
+					// The same backup was sent twice, keep the last copy.
+					_ = os.Remove(previous)
 				}
-
-				// Stream and calculate checksum simultaneously
-				hasher := sha256.New()
-				tee := io.TeeReader(p, hasher)
-
-				if _, err := io.Copy(backupFile, tee); err != nil {
-					backupFile.Close()
-					middleware.CaptureAndAbort(c, fmt.Errorf("failed to stream backup file %s: %w", backupName, err))
-					return
-				}
-
-				if err := backupFile.Close(); err != nil {
-					middleware.CaptureAndAbort(c, fmt.Errorf("failed to close backup file %s: %w", backupName, err))
-					return
-				}
+				stagedBackups[backupPath] = tmpPath
 
 				// Store the checksum for later verification
-				backupChecksumsCalculated[backupName] = hex.EncodeToString(hasher.Sum(nil))
+				backupChecksumsCalculated[backupName] = checksum
 
 				trnsfr.Log().WithField("backup", backupName).Debug("backup streamed to disk successfully")
 
@@ -397,6 +414,14 @@ out:
 		return
 	}
 
+	// Everything has been verified, so move the received backups into place.
+	created, err := commitReceivedBackups(stagedBackups)
+	receivedBackups = append(receivedBackups, created...)
+	if err != nil {
+		middleware.CaptureAndAbort(c, fmt.Errorf("failed to store received backups: %w", err))
+		return
+	}
+
 	// Changing this causes us to notify the panel about a successful transfer,
 	// rather than failing the transfer like we do by default.
 	successful = true
@@ -437,7 +462,8 @@ func deleteTransfer(c *gin.Context) {
 // The source node keeps its own copy when a transfer fails, so nothing here is the
 // only copy of the server. The exception is a shared storage pool, where the data
 // directory is the source's own data, so it is left alone when pooled is true.
-// Backups that were already on this node before the transfer are kept.
+// receivedBackups lists only the backup files the transfer created, so backups
+// that were already on this node are kept.
 func cleanupFailedIncomingTransfer(trnsfr *transfer.Transfer, pooled bool, receivedBackups []string, installLogPath string) {
 	s := trnsfr.Server
 	if s == nil {
@@ -461,6 +487,48 @@ func cleanupFailedIncomingTransfer(trnsfr *transfer.Transfer, pooled bool, recei
 	}
 
 	removeFailedTransferFiles(l, s.ID(), dataDir, pooled, receivedBackups, installLogPath)
+}
+
+// stageReceivedBackup writes a backup received from the source to a new temporary
+// file in backupDir and returns that file's path and the backup's SHA-256 checksum.
+// The file is only readable by Wings. On error nothing is left behind.
+//
+// A backup with the same name that is already on this node stays untouched until
+// commitReceivedBackups moves the temporary file into place.
+func stageReceivedBackup(backupDir, name string, r io.Reader) (string, string, error) {
+	// CreateTemp creates the file with mode 0600.
+	f, err := os.CreateTemp(backupDir, ".transfer-"+name+"-*")
+	if err != nil {
+		return "", "", err
+	}
+	hasher := sha256.New()
+	_, err = io.Copy(f, io.TeeReader(r, hasher))
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err != nil {
+		_ = os.Remove(f.Name())
+		return "", "", err
+	}
+	return f.Name(), hex.EncodeToString(hasher.Sum(nil)), nil
+}
+
+// commitReceivedBackups moves each staged backup (keyed by its final path) into
+// place, replacing a backup of the same name that is already on this node, which
+// is the same backup. It returns the final paths that did not exist before, which
+// a failed transfer must remove again, including when it returns an error.
+func commitReceivedBackups(staged map[string]string) ([]string, error) {
+	var created []string
+	for final, tmp := range staged {
+		_, statErr := os.Lstat(final)
+		if err := os.Rename(tmp, final); err != nil {
+			return created, err
+		}
+		if statErr != nil {
+			created = append(created, final)
+		}
+	}
+	return created, nil
 }
 
 // removeFailedTransferFiles deletes the files written for a failed incoming
