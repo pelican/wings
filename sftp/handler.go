@@ -153,7 +153,7 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 	if !h.can(permission) {
 		return nil, sftp.ErrSSHFxPermissionDenied
 	}
-	f, err := h.fs.Touch(request.Filepath, os.O_RDWR|os.O_TRUNC)
+	f, err := h.fs.Touch(request.Filepath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		l.WithField("flags", request.Flags).WithField("error", err).Error("failed to open existing file on system")
 		return nil, sftp.ErrSSHFxFailure
@@ -203,21 +203,26 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		l = l.WithField("target", request.Target)
 	}
 
-	// Enforce the egg file denylist on the source path before performing any
-	// operation. Without this, a user with file.update/file.delete could modify,
-	// rename, delete or symlink denylisted files.
-	if err := h.fs.IsIgnored(request.Filepath); err != nil {
-		return sftp.ErrSSHFxNoSuchFile
+	// Enforce the egg file denylist before performing any operation. Without this,
+	// a user with file.update/file.delete could modify, rename, delete or symlink
+	// denylisted files. Renaming and deleting act on the entry itself, so a symlink
+	// at the end of the path is not followed: a link to a denylisted file can still
+	// be removed.
+	check := h.fs.IsIgnored
+	if request.Method == "Rename" || request.Method == "Rmdir" || request.Method == "Remove" {
+		check = h.fs.IsIgnoredNoFollow
+	}
+	if err := check(request.Filepath); err != nil {
+		return err
 	}
 
-	// Also check the target path (Rename/Symlink). Otherwise a denylisted file could be
-	// renamed to a non-matching path, which would defeat the Fileread/Filewrite checks.
+	// Also check the target path (Rename/Symlink). Otherwise a file could be renamed
+	// or linked onto a denylisted path, bypassing the Fileread/Filewrite checks.
 	if request.Target != "" {
-		if err := h.fs.IsIgnored(request.Target); err != nil {
-			return sftp.ErrSSHFxPermissionDenied
+		if err := check(request.Target); err != nil {
+			return err
 		}
 	}
-
 
 	switch request.Method {
 	// Allows a user to make changes to the permissions of a given file or directory
@@ -331,14 +336,23 @@ func (h *Handler) Filelist(request *sftp.Request) (sftp.ListerAt, error) {
 
 	switch request.Method {
 	case "List":
-		entries, err := h.fs.ReadDirStat(request.Filepath)
+		d, err := h.fs.ReadDir(request.Filepath)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, sftp.ErrSSHFxNoSuchFile
+			}
 			h.logger.WithField("source", request.Filepath).WithField("error", err).Error("error while listing directory")
 			return nil, sftp.ErrSSHFxFailure
 		}
-		return ListerAt(entries), nil
+		files := make([]os.FileInfo, 0, len(d))
+		for _, entry := range d {
+			if i, err := entry.Info(); err == nil {
+				files = append(files, i)
+			}
+		}
+		return ListerAt(files), nil
 	case "Stat":
-		st, err := h.fs.Stat(request.Filepath)
+		st, err := h.fs.Stat2(request.Filepath)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil, sftp.ErrSSHFxNoSuchFile
@@ -346,7 +360,7 @@ func (h *Handler) Filelist(request *sftp.Request) (sftp.ListerAt, error) {
 			h.logger.WithField("source", request.Filepath).WithField("error", err).Error("error performing stat on file")
 			return nil, sftp.ErrSSHFxFailure
 		}
-		return ListerAt([]os.FileInfo{st.FileInfo}), nil
+		return ListerAt([]os.FileInfo{st}), nil
 	default:
 		return nil, sftp.ErrSSHFxOpUnsupported
 	}

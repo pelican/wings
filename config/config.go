@@ -256,8 +256,6 @@ type SystemConfiguration struct {
 	Backups Backups `yaml:"backups"`
 
 	Transfers Transfers `yaml:"transfers"`
-
-	OpenatMode string `default:"auto" yaml:"openat_mode"`
 }
 
 type CrashDetection struct {
