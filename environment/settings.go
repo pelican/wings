@@ -31,6 +31,11 @@ type Mount struct {
 	// Whether the directory is being mounted as read-only. It is up to the environment to
 	// handle this value correctly and ensure security expectations are met with its usage.
 	ReadOnly bool `json:"read_only"`
+
+	// Whether the source is a device node (or a directory of device nodes, such as /dev/dri)
+	// rather than a regular file or directory. Devices are passed through to the environment
+	// as devices in addition to the regular mount so that the container is granted access to them.
+	Device bool `json:"-"`
 }
 
 // Limits is the build settings for a given server that impact docker container
