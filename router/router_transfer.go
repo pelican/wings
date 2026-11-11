@@ -22,6 +22,7 @@ import (
 	"github.com/pelican/wings/router/middleware"
 	"github.com/pelican/wings/router/tokens"
 	"github.com/pelican/wings/server"
+	"github.com/pelican/wings/server/filesystem/quotas"
 	"github.com/pelican/wings/server/installer"
 	"github.com/pelican/wings/server/transfer"
 )
@@ -101,7 +102,15 @@ func postTransfers(c *gin.Context) {
 	// Any errors past this point (until the transfer is complete) will abort
 	// the transfer.
 
-	successful := false
+	// Everything this request writes to disk is tracked so that a failed transfer
+	// can be removed again. When the server lives on a shared storage pool its data
+	// directory belongs to the source as well, and must never be deleted here.
+	var (
+		successful      bool
+		pooled          bool
+		receivedBackups []string
+		installLogPath  string
+	)
 	defer func(ctx context.Context, trnsfr *transfer.Transfer) {
 		// Remove the transfer from the list of incoming transfers.
 		transfer.Incoming().Remove(trnsfr)
@@ -111,37 +120,29 @@ func postTransfers(c *gin.Context) {
 			manager.Remove(func(match *server.Server) bool {
 				return match.ID() == trnsfr.Server.ID()
 			})
-			// The server is no longer managed by this node, release its filesystem root.
-			defer func() { _ = trnsfr.Server.Filesystem().Close() }()
+			// The source node keeps its copy of the server when a transfer fails, so
+			// the transfer can be retried or the server moved by hand. Remove the partial
+			// copy from this node before telling the Panel, so that a retry cannot start
+			// while the files are still being deleted.
+			cleanupFailedIncomingTransfer(trnsfr, pooled, receivedBackups, installLogPath)
 		}
 
 		if err := manager.Client().SetTransferStatus(context.Background(), trnsfr.Server.ID(), successful); err != nil {
-			// Only delete the files if the transfer actually failed, otherwise we could have
-			// unrecoverable data-loss.
-			if !successful && err != nil {
-				// Delete all extracted files.
-				go func(trnsfr *transfer.Transfer) {
-					_ = trnsfr.Server.Filesystem().Close()
-					if err := os.RemoveAll(trnsfr.Server.Filesystem().Path()); err != nil {
-						if !errors.Is(err, os.ErrNotExist) {
-							trnsfr.Log().WithError(err).Warn("failed to delete local server files")
-						}
-					}
-				}(trnsfr)
-			}
-
 			trnsfr.Log().WithField("status", successful).WithError(err).Error("failed to set transfer status on panel")
 			return
 		}
 
-		trnsfr.Server.SetTransferring(false)
-		trnsfr.Server.Events().Publish(server.TransferStatusEvent, "success")
+		if successful {
+			trnsfr.Server.SetTransferring(false)
+			trnsfr.Server.Events().Publish(server.TransferStatusEvent, "success")
+		}
 	}(ctx, trnsfr)
 
 	{
 		remotePool := config.Get().System.Transfers.StoragePool
 		sourcePool := c.GetHeader("X-Storage-Pool")
 		if remotePool.Enabled && remotePool.PoolName != "" && sourcePool != "" && strings.EqualFold(remotePool.PoolName, sourcePool) {
+			pooled = true
 			if err := trnsfr.Server.CreateEnvironment(); err != nil {
 				middleware.CaptureAndAbort(c, err)
 				return
@@ -241,15 +242,16 @@ out:
 				}
 
 				// Use the correct install log path with server UUID
-				installLogPath := filepath.Join(installLogDir, trnsfr.Server.ID()+".log")
+				logPath := filepath.Join(installLogDir, trnsfr.Server.ID()+".log")
 
 				// Create the install log file
-				installLogFile, err := os.Create(installLogPath)
+				installLogFile, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o640)
 				if err != nil {
 					// Don't fail transfer for install logs, just log and continue
 					trnsfr.Log().WithError(err).Warn("failed to create install log file, skipping")
 					break
 				}
+				installLogPath = logPath
 
 				// Stream the install logs to file
 				if _, err := io.Copy(installLogFile, p); err != nil {
@@ -275,18 +277,34 @@ out:
 				// Create backup directory if it doesn't exist
 				cfg := config.Get()
 				backupDir := filepath.Join(cfg.System.BackupDirectory, trnsfr.Server.ID())
-				if err := os.MkdirAll(backupDir, 0755); err != nil {
+				// Backups are only readable by Wings, the same as backups created on this
+				// node (see backup.LocalBackup.Generate). MkdirAll leaves the mode of an
+				// existing directory alone, so tighten one left by an older transfer.
+				if err := os.MkdirAll(backupDir, 0o700); err != nil {
 					middleware.CaptureAndAbort(c, fmt.Errorf("failed to create backup directory: %w", err))
 					return
 				}
+				if err := os.Chmod(backupDir, 0o700); err != nil {
+					trnsfr.Log().WithError(err).Warn("failed to set permissions on backup directory")
+				}
 
 				backupPath := filepath.Join(backupDir, backupName)
+				// A backup with this name that is already on this node (from an earlier
+				// transfer) is the same backup, so it must survive a failed transfer.
+				_, statErr := os.Lstat(backupPath)
+				existedBefore := statErr == nil
 
 				// Create the backup file and stream directly to disk
-				backupFile, err := os.Create(backupPath)
+				backupFile, err := os.OpenFile(backupPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
 				if err != nil {
 					middleware.CaptureAndAbort(c, fmt.Errorf("failed to create backup file %s: %w", backupPath, err))
 					return
+				}
+				if !existedBefore {
+					receivedBackups = append(receivedBackups, backupPath)
+				} else if err := backupFile.Chmod(0o600); err != nil {
+					// OpenFile only applies the mode to new files.
+					trnsfr.Log().WithField("backup", backupName).WithError(err).Warn("failed to set permissions on backup file")
 				}
 
 				// Stream and calculate checksum simultaneously
@@ -410,4 +428,77 @@ func deleteTransfer(c *gin.Context) {
 	trnsfr.Cancel()
 
 	c.Status(http.StatusAccepted)
+}
+
+// cleanupFailedIncomingTransfer removes everything a failed incoming transfer left
+// on this node: the server's container, its data directory, the backups and the
+// install log received as part of the transfer, its quota and its machine-id file.
+//
+// The source node keeps its own copy when a transfer fails, so nothing here is the
+// only copy of the server. The exception is a shared storage pool, where the data
+// directory is the source's own data, so it is left alone when pooled is true.
+// Backups that were already on this node before the transfer are kept.
+func cleanupFailedIncomingTransfer(trnsfr *transfer.Transfer, pooled bool, receivedBackups []string, installLogPath string) {
+	s := trnsfr.Server
+	if s == nil {
+		return
+	}
+	l := trnsfr.Log()
+
+	if s.Environment != nil {
+		if err := s.Environment.Destroy(); err != nil {
+			l.WithError(err).Warn("failed to remove the container of a failed transfer")
+		}
+	}
+
+	dataDir := ""
+	if fs := s.Filesystem(); fs != nil {
+		dataDir = fs.Path()
+		// Release the filesystem root before its directory is removed.
+		if err := fs.Close(); err != nil {
+			l.WithError(err).Warn("failed to close the filesystem of a failed transfer")
+		}
+	}
+
+	removeFailedTransferFiles(l, s.ID(), dataDir, pooled, receivedBackups, installLogPath)
+}
+
+// removeFailedTransferFiles deletes the files written for a failed incoming
+// transfer of the server with the given ID. See cleanupFailedIncomingTransfer.
+func removeFailedTransferFiles(l *log.Entry, id, dataDir string, pooled bool, receivedBackups []string, installLogPath string) {
+	cfg := config.Get()
+
+	if !pooled && dataDir != "" {
+		if err := os.RemoveAll(dataDir); err != nil {
+			l.WithError(err).Warn("failed to delete the server files of a failed transfer")
+		}
+		if cfg.System.Quotas.Enabled {
+			if err := quotas.DelQuota(id); err != nil {
+				l.WithError(err).Warn("failed to remove the quota of a failed transfer")
+			}
+		}
+	}
+
+	for _, p := range receivedBackups {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			l.WithField("backup", filepath.Base(p)).WithError(err).Warn("failed to delete a backup received by a failed transfer")
+		}
+	}
+	// Only removed when empty, so backups this node already had are kept.
+	if cfg.System.BackupDirectory != "" {
+		_ = os.Remove(filepath.Join(cfg.System.BackupDirectory, id))
+	}
+
+	if installLogPath != "" {
+		if err := os.Remove(installLogPath); err != nil && !errors.Is(err, os.ErrNotExist) {
+			l.WithError(err).Warn("failed to delete the install log of a failed transfer")
+		}
+	}
+	if cfg.System.MachineID.Enable && cfg.System.MachineID.Directory != "" {
+		if err := os.Remove(filepath.Join(cfg.System.MachineID.Directory, id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+			l.WithError(err).Warn("failed to delete the machine-id file of a failed transfer")
+		}
+	}
+
+	l.WithField("pooled", pooled).Info("removed the partial copy of a failed incoming transfer")
 }
