@@ -58,7 +58,7 @@ func TestArchive_IncludesSymlinks(t *testing.T) {
 	if err := fs.Symlink("libraries/neoforge/unix_args.txt", "unix_args.txt"); err != nil {
 		t.Fatal(err)
 	}
-	if err := fs.Symlink("unix_args.txt", "libraries/neoforge/link.txt"); err != nil {
+	if err := fs.Symlink("/unix_args.txt", "libraries/neoforge/link.txt"); err != nil {
 		t.Fatal(err)
 	}
 
