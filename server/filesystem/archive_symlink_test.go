@@ -151,6 +151,34 @@ func TestFilesystem_RestoreSymlink(t *testing.T) {
 	}
 }
 
+// A link restored through a symlinked parent directory is refused without
+// creating any directories at the parent link's target.
+func TestFilesystem_RestoreSymlinkThroughSymlinkedParent(t *testing.T) {
+	fs := NewFs()
+	defer fs.TruncateRootDirectory()
+
+	if err := fs.CreateDirectory("real", "/"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("real", filepath.Join(fs.rootPath, "alias")); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := fs.RestoreSymlink("alias/new/link", "target.txt"); err == nil {
+		t.Fatal("expected an error when restoring a link through a symlinked directory")
+	}
+	if _, err := os.Lstat(filepath.Join(fs.rootPath, "real", "new")); !os.IsNotExist(err) {
+		t.Errorf("expected real/new not to be created, got err %v", err)
+	}
+
+	if err := fs.RestoreSymlink("alias/link", "target.txt"); err == nil {
+		t.Error("expected an error when restoring a link directly inside a symlinked directory")
+	}
+	if _, err := os.Lstat(filepath.Join(fs.rootPath, "real", "link")); !os.IsNotExist(err) {
+		t.Errorf("expected real/link not to be created, got err %v", err)
+	}
+}
+
 // Replacing a regular file with a link releases its size from the disk usage.
 func TestFilesystem_RestoreSymlinkQuota(t *testing.T) {
 	fs := NewFs()
