@@ -40,6 +40,11 @@ func LocateLocal(client remote.Client, uuid string, suuid string) (*LocalBackup,
 	if err := b.validateIdentifier(); err != nil {
 		return nil, nil, err
 	}
+	// Backups created before local backups were stored per server are moved
+	// into place when they are first accessed.
+	if err := b.MigrateLegacy(); err != nil {
+		return nil, nil, err
+	}
 	st, err := os.Stat(b.Path())
 	if err != nil {
 		return nil, nil, err
