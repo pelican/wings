@@ -232,3 +232,22 @@ func TestUpdateYaml_AddedMappingWithNumber(t *testing.T) {
 		t.Fatalf("unexpected output\n--- got ---\n%s\n--- want ---\n%s", out, want)
 	}
 }
+
+// A whole float such as 1.0 is patched in place and stays a float. Checking the
+// patched document through JSON would read it back as the integer 1, reject the
+// patch and fall back to writing the whole document without its comments.
+func TestUpdateYaml_WholeFloat(t *testing.T) {
+	src := "# rates\nrate: 2 # per tick\nscale: 1.0\nname: x\n"
+	for _, replace := range []string{
+		`[{"match": "rate", "replace_with": 1.0}]`,
+		`[{"match": "rate", "replace_with": "1.0"}]`,
+	} {
+		out, changed := updateYamlString(t, replace, src)
+		if !changed {
+			t.Fatalf("%s: expected the document to change", replace)
+		}
+		if want := strings.Replace(src, "rate: 2", "rate: 1.0", 1); out != want {
+			t.Fatalf("%s: unexpected output\n--- got ---\n%s\n--- want ---\n%s", replace, out, want)
+		}
+	}
+}

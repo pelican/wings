@@ -135,18 +135,60 @@ func withLineEndings(src, out []byte) []byte {
 }
 
 // yamlDecodesTo reports whether the YAML document out decodes to want, in the
-// same representation the replacements were applied to.
+// same representation the replacements were applied to. The decoded value is
+// compared directly rather than through JSON, which would turn a float such as
+// 1.0 into the integer 1.
 func yamlDecodesTo(out []byte, want interface{}) bool {
 	got, err := yamlToJsonValue(out)
 	if err != nil {
 		return false
 	}
-	gotJson, err := json.Marshal(got)
-	if err != nil {
-		return false
+	return yamlValueEqual(got, want)
+}
+
+// yamlValueEqual compares a decoded YAML value with a JSON value decoded with
+// UseNumber. A number that is written as a float in want must decode as a
+// float. One written as an integer may decode as either, since floats from the
+// original document reach want through JSON, which writes 1.0 as 1.
+func yamlValueEqual(got, want interface{}) bool {
+	switch w := want.(type) {
+	case map[string]interface{}:
+		g, ok := got.(map[string]interface{})
+		if !ok || len(g) != len(w) {
+			return false
+		}
+		for k, wv := range w {
+			gv, ok := g[k]
+			if !ok || !yamlValueEqual(gv, wv) {
+				return false
+			}
+		}
+		return true
+	case []interface{}:
+		g, ok := got.([]interface{})
+		if !ok || len(g) != len(w) {
+			return false
+		}
+		for i := range w {
+			if !yamlValueEqual(g[i], w[i]) {
+				return false
+			}
+		}
+		return true
+	case json.Number:
+		s := w.String()
+		switch g := got.(type) {
+		case float64:
+			f, err := w.Float64()
+			return err == nil && f == g
+		case int, int64, uint64:
+			return !strings.ContainsAny(s, ".eE") && fmt.Sprint(g) == s
+		default:
+			return false
+		}
+	default:
+		return reflect.DeepEqual(got, want)
 	}
-	gotValue, err := decodeJsonValue(gotJson)
-	return err == nil && reflect.DeepEqual(gotValue, want)
 }
 
 // expandYamlAliases replaces every alias below n with a copy of the node it
