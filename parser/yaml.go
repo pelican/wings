@@ -3,6 +3,8 @@ package parser
 import (
 	"bytes"
 	"fmt"
+	"math"
+	"math/big"
 	"reflect"
 	"sort"
 	"strings"
@@ -103,7 +105,8 @@ func mergeYamlDocument(src []byte, expandAliases bool, orig, next interface{}) (
 	}
 	root := doc.Content[0]
 	if expandAliases {
-		if !expandYamlAliases(root, make(map[*yaml.Node]bool)) {
+		budget := maxYamlAliasExpansion
+		if !expandYamlAliases(root, make(map[*yaml.Node]bool), &budget) {
 			return nil, false
 		}
 		stripYamlAnchors(root)
@@ -179,8 +182,15 @@ func yamlValueEqual(got, want interface{}) bool {
 		s := w.String()
 		switch g := got.(type) {
 		case float64:
-			f, err := w.Float64()
-			return err == nil && f == g
+			if strings.ContainsAny(s, ".eE") {
+				f, err := w.Float64()
+				return err == nil && f == g
+			}
+			// Compare an integer exactly: converting it to a float64 would round
+			// integers above 2^53, so 9007199254740993 would match the float
+			// 9007199254740992.0.
+			i, ok := new(big.Int).SetString(s, 10)
+			return ok && !math.IsInf(g, 0) && !math.IsNaN(g) && new(big.Float).SetFloat64(g).Cmp(new(big.Float).SetInt(i)) == 0
 		case int, int64, uint64:
 			return !strings.ContainsAny(s, ".eE") && fmt.Sprint(g) == s
 		default:
@@ -191,15 +201,23 @@ func yamlValueEqual(got, want interface{}) bool {
 	}
 }
 
+// maxYamlAliasExpansion is the number of nodes expandYamlAliases may copy. Each
+// alias is replaced by a full copy of its target, so a small document whose
+// aliases refer to other aliases expands to a very large tree. The YAML decoder
+// limits this too, but its limit still allows a document of a few KB to expand
+// to hundreds of thousands of nodes. Real configuration files use far fewer.
+const maxYamlAliasExpansion = 10000
+
 // expandYamlAliases replaces every alias below n with a copy of the node it
 // refers to, keeping the comments that were on the alias. expanding holds the
-// alias targets whose copies are being expanded. It returns false if an alias
-// refers to a node that contains it: the decoder accepts that when an explicit
-// key shadows the merged one, but expanding it would never end.
-func expandYamlAliases(n *yaml.Node, expanding map[*yaml.Node]bool) bool {
+// alias targets whose copies are being expanded, and budget the number of nodes
+// that may still be copied. It returns false if an alias refers to a node that
+// contains it, which the decoder accepts when an explicit key shadows the merged
+// one but which would never finish expanding, or if the budget runs out.
+func expandYamlAliases(n *yaml.Node, expanding map[*yaml.Node]bool, budget *int) bool {
 	for i, c := range n.Content {
 		if c.Kind != yaml.AliasNode || c.Alias == nil {
-			if !expandYamlAliases(c, expanding) {
+			if !expandYamlAliases(c, expanding, budget) {
 				return false
 			}
 			continue
@@ -208,11 +226,14 @@ func expandYamlAliases(n *yaml.Node, expanding map[*yaml.Node]bool) bool {
 		if expanding[target] {
 			return false
 		}
-		cp := cloneYamlNode(target)
+		cp := cloneYamlNode(target, budget)
+		if cp == nil {
+			return false
+		}
 		cp.HeadComment, cp.LineComment, cp.FootComment = c.HeadComment, c.LineComment, c.FootComment
 		n.Content[i] = cp
 		expanding[target] = true
-		ok := expandYamlAliases(cp, expanding)
+		ok := expandYamlAliases(cp, expanding, budget)
 		delete(expanding, target)
 		if !ok {
 			return false
@@ -221,11 +242,19 @@ func expandYamlAliases(n *yaml.Node, expanding map[*yaml.Node]bool) bool {
 	return true
 }
 
-func cloneYamlNode(n *yaml.Node) *yaml.Node {
+// cloneYamlNode returns a deep copy of n, or nil if it has more nodes than the
+// budget allows. Each copied node is taken from the budget.
+func cloneYamlNode(n *yaml.Node, budget *int) *yaml.Node {
+	if *budget <= 0 {
+		return nil
+	}
+	*budget--
 	cp := *n
 	cp.Content = make([]*yaml.Node, len(n.Content))
 	for i, c := range n.Content {
-		cp.Content[i] = cloneYamlNode(c)
+		if cp.Content[i] = cloneYamlNode(c, budget); cp.Content[i] == nil {
+			return nil
+		}
 	}
 	return &cp
 }

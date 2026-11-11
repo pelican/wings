@@ -1,9 +1,12 @@
 package parser
 
 import (
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Changing a value inside an anchored node must not change the nodes that use
@@ -91,5 +94,59 @@ func TestUpdateYaml_RootKeyNotResolvedAsNumber(t *testing.T) {
 				t.Errorf("unexpected result %v\n%s", got, out)
 			}
 		})
+	}
+}
+
+// An integer above 2^53 is compared exactly when verifying the output. Through a
+// float64 the alias copy's 9007199254740993 rounds to the replacement
+// 9007199254740992.0, so the in-place patch that changes it through the alias
+// would be accepted.
+func TestUpdateYaml_AliasedLargeInteger(t *testing.T) {
+	src := "base: &b\n  id: 9007199254740993\ncopy: *b\n"
+	out, _ := updateYamlString(t, `[{"match": "base.id", "replace_with": 9007199254740992.0}]`, src)
+	got := decodeYamlString(t, out)
+	if !reflect.DeepEqual(got["base"], map[string]interface{}{"id": 9007199254740992.0}) {
+		t.Errorf("unexpected base %#v\n%s", got["base"], out)
+	}
+	if !reflect.DeepEqual(got["copy"], map[string]interface{}{"id": 9007199254740993}) {
+		t.Errorf("alias user changed: copy = %#v\n%s", got["copy"], out)
+	}
+}
+
+// aliasFanOutYaml returns a document whose last key, through aliases of
+// aliases, expands to 10^3 copies of a list of leaf items. The padding comes
+// first so the YAML decoder's alias ratio limit accepts it.
+func aliasFanOutYaml(leaf, pad int) string {
+	var b strings.Builder
+	b.WriteString("pad: [p" + strings.Repeat(", p", pad-1) + "]\n")
+	b.WriteString("v: &a0 [x" + strings.Repeat(", x", leaf-1) + "]\n")
+	for i := 1; i <= 3; i++ {
+		ref := fmt.Sprintf("*a%d", i-1)
+		fmt.Fprintf(&b, "l%d: &a%d [%s%s]\n", i, i, ref, strings.Repeat(", "+ref, 9))
+	}
+	return b.String()
+}
+
+// Expanding aliases stops once it has copied maxYamlAliasExpansion nodes, and
+// the document is then written from the new values.
+func TestUpdateYaml_AliasExpansionLimit(t *testing.T) {
+	src := aliasFanOutYaml(100, 2000)
+
+	var doc yaml.Node
+	if err := yaml.Unmarshal([]byte(src), &doc); err != nil {
+		t.Fatal(err)
+	}
+	budget := maxYamlAliasExpansion
+	if expandYamlAliases(doc.Content[0], make(map[*yaml.Node]bool), &budget) {
+		t.Fatal("expected the expansion to exceed the limit")
+	}
+
+	out, _ := updateYamlString(t, `[{"match": "v.0", "replace_with": "y"}]`, src)
+	got := decodeYamlString(t, out)
+	if v := got["v"].([]interface{}); v[0] != "y" || len(v) != 100 {
+		t.Errorf("unexpected v %v", v[:2])
+	}
+	if l1 := got["l1"].([]interface{}); len(l1) != 10 || l1[0].([]interface{})[0] != "x" {
+		t.Errorf("alias user changed: l1[0][0] = %v", l1[0].([]interface{})[0])
 	}
 }
