@@ -2,8 +2,10 @@ package router
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -20,6 +22,7 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/pelican/wings/config"
+	"github.com/pelican/wings/remote"
 	"github.com/pelican/wings/router/middleware"
 	"github.com/pelican/wings/router/tokens"
 	wserver "github.com/pelican/wings/server"
@@ -220,16 +223,46 @@ func TestCommitReceivedBackups(t *testing.T) {
 	}
 }
 
-func TestPostTransfers_RefusedWhileFailedTransferIsCleanedUp(t *testing.T) {
-	gin.SetMode(gin.TestMode)
-	config.Set(&config.Configuration{AuthenticationToken: "transfer-test-token"})
+// transferTestClient is a Panel client that returns a minimal configuration for
+// the transfer test server.
+type transferTestClient struct {
+	backupTestRemoteClient
+}
 
-	client := backupTestRemoteClient{}
+func (transferTestClient) GetServerConfiguration(context.Context, string) (remote.ServerConfigurationResponse, error) {
+	return remote.ServerConfigurationResponse{
+		Settings: json.RawMessage(`{"uuid":"` + transferTestServer + `"}`),
+	}, nil
+}
+
+// newTransferTestRouter returns a router serving POST /api/transfers with an empty
+// server manager, and the node's data directory.
+func newTransferTestRouter(t *testing.T, configure func(*config.Configuration)) (*gin.Engine, *wserver.Manager, string) {
+	t.Helper()
+	gin.SetMode(gin.TestMode)
+
+	root := t.TempDir()
+	cfg := &config.Configuration{AuthenticationToken: "transfer-test-token"}
+	cfg.System.Data = filepath.Join(root, "volumes")
+	cfg.System.BackupDirectory = filepath.Join(root, "backups")
+	cfg.System.LogDirectory = filepath.Join(root, "logs")
+	if configure != nil {
+		configure(cfg)
+	}
+	config.Set(cfg)
+
+	client := transferTestClient{}
 	m := wserver.NewEmptyManager(client)
 	r := gin.New()
 	r.Use(middleware.AttachRequestID(), middleware.CaptureErrors(), middleware.AttachServerManager(m), middleware.AttachApiClient(client))
 	r.POST("/api/transfers", postTransfers)
+	return r, m, cfg.System.Data
+}
 
+// postTransfer sends a transfer request for the test server with a valid token
+// and no body.
+func postTransfer(t *testing.T, r *gin.Engine, header map[string]string) *httptest.ResponseRecorder {
+	t.Helper()
 	payload := tokens.TransferPayload{
 		Payload: jwt.Payload{
 			Subject:        transferTestServer,
@@ -243,18 +276,179 @@ func TestPostTransfers_RefusedWhileFailedTransferIsCleanedUp(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	failedIncomingCleanups.Store(transferTestServer, struct{}{})
-	defer failedIncomingCleanups.Delete(transferTestServer)
-
 	req := httptest.NewRequest(http.MethodPost, "/api/transfers", bytes.NewReader(nil))
 	req.Header.Set("Authorization", "Bearer "+string(token))
+	for k, v := range header {
+		req.Header.Set(k, v)
+	}
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
+	return w
+}
 
-	if w.Code != http.StatusConflict {
-		t.Fatalf("expected 409 while a failed transfer is being cleaned up, got %d: %s", w.Code, w.Body.String())
+// assertUnclaimed fails the test if the test server is still claimed.
+func assertUnclaimed(t *testing.T) {
+	t.Helper()
+	if !incomingClaims.claim(transferTestServer) {
+		t.Error("expected the request to release its claim on the server")
+		return
+	}
+	incomingClaims.release(transferTestServer)
+}
+
+func TestTransferClaims(t *testing.T) {
+	tc := transferClaims{ids: make(map[string]struct{})}
+	if !tc.claim("a") {
+		t.Fatal("expected a free ID to be claimed")
+	}
+	if tc.claim("a") {
+		t.Fatal("expected a claimed ID to be refused")
+	}
+	if !tc.claim("b") {
+		t.Fatal("claims must be per server")
+	}
+	tc.release("a")
+	if !tc.claim("a") {
+		t.Fatal("expected a released ID to be claimable again")
+	}
+}
+
+func TestTransferClaims_ConcurrentRequestsAdmitOne(t *testing.T) {
+	tc := transferClaims{ids: make(map[string]struct{})}
+	const n = 32
+	results := make(chan bool, n)
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		go func() {
+			<-start
+			results <- tc.claim(transferTestServer)
+		}()
+	}
+	close(start)
+	admitted := 0
+	for i := 0; i < n; i++ {
+		if <-results {
+			admitted++
+		}
+	}
+	if admitted != 1 {
+		t.Fatalf("expected exactly one of %d concurrent requests to be admitted, got %d", n, admitted)
+	}
+}
+
+func TestPostTransfers_RefusedWhileClaimed(t *testing.T) {
+	r, m, dataDir := newTransferTestRouter(t, nil)
+
+	if !incomingClaims.claim(transferTestServer) {
+		t.Fatal("the test server is already claimed")
+	}
+	defer incomingClaims.release(transferTestServer)
+
+	if w := postTransfer(t, r, nil); w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 while another request holds the server, got %d: %s", w.Code, w.Body.String())
 	}
 	if _, ok := m.Get(transferTestServer); ok {
-		t.Error("no server must be created while the failed transfer is being cleaned up")
+		t.Error("no server must be created while another request holds the server")
 	}
+	if exists(filepath.Join(dataDir, transferTestServer)) {
+		t.Error("no data directory must be created while another request holds the server")
+	}
+}
+
+func TestPostTransfers_RefusesServerAlreadyOnNode(t *testing.T) {
+	r, m, dataDir := newTransferTestRouter(t, nil)
+
+	// A server that an earlier transfer moved here successfully.
+	s, err := wserver.New(transferTestClient{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	s.Config().Uuid = transferTestServer
+	m.Add(s)
+	live := filepath.Join(dataDir, transferTestServer, "world", "level.dat")
+	if err := os.MkdirAll(filepath.Dir(live), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(live, []byte("live"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	// The same token is used again, and the request would then fail (it has no body).
+	if w := postTransfer(t, r, nil); w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 for a server that is already on this node, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := readFile(t, live); got != "live" {
+		t.Errorf("the live server's files must be untouched, got %q", got)
+	}
+	if got := len(m.Filter(func(match *wserver.Server) bool { return match.ID() == transferTestServer })); got != 1 {
+		t.Errorf("expected the live server to stay registered exactly once, found %d", got)
+	}
+	assertUnclaimed(t)
+}
+
+func TestPostTransfers_RefusesExistingDataDirectory(t *testing.T) {
+	r, m, dataDir := newTransferTestRouter(t, nil)
+	leftover := filepath.Join(dataDir, transferTestServer, "keep.txt")
+	if err := os.MkdirAll(filepath.Dir(leftover), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(leftover, []byte("x"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	if w := postTransfer(t, r, nil); w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 when files for the server already exist, got %d: %s", w.Code, w.Body.String())
+	}
+	if !exists(leftover) {
+		t.Error("files that were on the node before the transfer must be kept")
+	}
+	if _, ok := m.Get(transferTestServer); ok {
+		t.Error("no server must be created when files for it already exist")
+	}
+	assertUnclaimed(t)
+}
+
+func TestPostTransfers_PooledTransferAllowsExistingDataDirectory(t *testing.T) {
+	r, _, dataDir := newTransferTestRouter(t, func(cfg *config.Configuration) {
+		cfg.System.Transfers.StoragePool.Enabled = true
+		cfg.System.Transfers.StoragePool.PoolName = "shared"
+		// Stops the request while initializing the server, see
+		// TestPostTransfers_InitFailureRemovesDataDirectory.
+		cfg.System.Quotas.Enabled = true
+	})
+	shared := filepath.Join(dataDir, transferTestServer, "world", "level.dat")
+	if err := os.MkdirAll(filepath.Dir(shared), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(shared, []byte("shared"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	w := postTransfer(t, r, map[string]string{"X-Storage-Pool": "shared"})
+	if w.Code == http.StatusConflict {
+		t.Fatalf("a pooled transfer must not be refused because the shared data directory exists: %s", w.Body.String())
+	}
+	if got := readFile(t, shared); got != "shared" {
+		t.Errorf("the shared data directory belongs to the source and must be untouched, got %q", got)
+	}
+	assertUnclaimed(t)
+}
+
+func TestPostTransfers_InitFailureRemovesDataDirectory(t *testing.T) {
+	// With quotas enabled on a filesystem without quota support, initializing the
+	// server fails after its data directory has been created.
+	r, m, dataDir := newTransferTestRouter(t, func(cfg *config.Configuration) {
+		cfg.System.Quotas.Enabled = true
+	})
+
+	if w := postTransfer(t, r, nil); w.Code < 400 || w.Code == http.StatusConflict {
+		t.Fatalf("expected the transfer to fail while initializing the server, got %d: %s", w.Code, w.Body.String())
+	}
+	if exists(filepath.Join(dataDir, transferTestServer)) {
+		t.Error("expected the data directory created while initializing the server to be removed")
+	}
+	if _, ok := m.Get(transferTestServer); ok {
+		t.Error("no server must be registered after a failed initialization")
+	}
+	assertUnclaimed(t)
 }

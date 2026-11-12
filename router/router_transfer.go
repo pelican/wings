@@ -28,12 +28,46 @@ import (
 	"github.com/pelican/wings/server/transfer"
 )
 
-// failedIncomingCleanups holds the IDs of servers whose failed incoming transfer
-// is still being removed from this node. The source node tells the Panel about a
-// failed transfer on its own, so a retry can arrive while the old container and
-// files are still being deleted, and that deletion would remove the retry's copy.
-// A new transfer of such a server is refused until the cleanup has finished.
-var failedIncomingCleanups sync.Map
+// incomingClaims holds the IDs of servers an incoming transfer request is working
+// on, from the moment the request is admitted until a failed transfer has been
+// removed again. Only one request per server is admitted at a time.
+//
+// The source node tells the Panel about a failed transfer on its own, so a retry
+// can arrive while the old container and files are still being deleted, and that
+// deletion would otherwise remove the retry's copy.
+var incomingClaims = transferClaims{ids: make(map[string]struct{})}
+
+type transferClaims struct {
+	mu  sync.Mutex
+	ids map[string]struct{}
+}
+
+// claim reserves id and reports whether it was free.
+func (tc *transferClaims) claim(id string) bool {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	if _, taken := tc.ids[id]; taken {
+		return false
+	}
+	tc.ids[id] = struct{}{}
+	return true
+}
+
+// release frees id again.
+func (tc *transferClaims) release(id string) {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+	delete(tc.ids, id)
+}
+
+// isPooledTransfer reports whether the source and this node share the storage
+// pool named in the request. The server's data directory then belongs to the
+// source as well, and already exists on this node.
+func isPooledTransfer(c *gin.Context) bool {
+	remotePool := config.Get().System.Transfers.StoragePool
+	sourcePool := c.GetHeader("X-Storage-Pool")
+	return remotePool.Enabled && remotePool.PoolName != "" && sourcePool != "" && strings.EqualFold(remotePool.PoolName, sourcePool)
+}
 
 // postTransfers .
 func postTransfers(c *gin.Context) {
@@ -64,55 +98,79 @@ func postTransfers(c *gin.Context) {
 		return
 	}
 
-	// Get or create a new transfer instance for this server.
-	var (
-		ctx    context.Context
-		cancel context.CancelFunc
-	)
-	trnsfr := transfer.Incoming().Get(u.String())
-	if trnsfr == nil {
-		if _, busy := failedIncomingCleanups.Load(u.String()); busy {
+	id := u.String()
+	if !incomingClaims.claim(id) {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "A transfer of this server is already running on this node, or a failed one is still being cleaned up.",
+		})
+		return
+	}
+	// The claim is released once this request is done, including the cleanup of a
+	// failed transfer. A cleanup that could not remove everything keeps it.
+	keepClaim := false
+	defer func() {
+		if !keepClaim {
+			incomingClaims.release(id)
+		}
+	}()
+
+	pooled := isPooledTransfer(c)
+
+	// A transfer must never touch a server this node already has. Transfer tokens
+	// can be used until they expire, and a repeated request would otherwise extract
+	// over the live server and, if it failed, delete it. Refusing an existing data
+	// directory also means that a failed transfer only removes what it created.
+	if _, exists := manager.Get(id); exists {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "This server already exists on this node.",
+		})
+		return
+	}
+	dataDir := filepath.Join(config.Get().System.Data, id)
+	if !pooled {
+		if _, err := os.Lstat(dataDir); err == nil {
+			log.WithField("server", id).WithField("path", dataDir).
+				Warn("refusing incoming transfer: files for this server already exist on this node")
 			c.AbortWithStatusJSON(http.StatusConflict, gin.H{
-				"error": "A failed transfer of this server is still being cleaned up on this node, try again shortly.",
+				"error": "Files for this server already exist on this node.",
 			})
 			return
-		}
-
-		// TODO: should this use the request context?
-		trnsfr = transfer.New(c, nil)
-
-		ctx, cancel = context.WithCancel(trnsfr.Context())
-		defer cancel()
-
-		i, err := installer.New(ctx, manager, installer.ServerDetails{
-			UUID:              u.String(),
-			StartOnCompletion: false,
-		})
-		if err != nil {
-			if trnsfr.Server != nil {
-				if err := manager.Client().SetTransferStatus(context.Background(), trnsfr.Server.ID(), false); err != nil {
-					trnsfr.Log().WithField("status", false).WithError(err).Error("failed to set transfer status")
-				}
-			} else {
-				// No server instance yet, so just log the failure without trying to update status
-				// Else this will cause: invalid memory address or nil pointer dereference
-				trnsfr.Log().WithError(err).Error("failed to initialize transfer; no server instance created")
-			}
-
-			middleware.CaptureAndAbort(c, err)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			middleware.CaptureAndAbort(c, fmt.Errorf("failed to check for existing server files: %w", err))
 			return
 		}
-
-		i.Server().SetTransferring(true)
-		manager.Add(i.Server())
-
-		// We add the transfer to the list of transfers once we have a server instance to use.
-		trnsfr.Server = i.Server()
-		transfer.Incoming().Add(trnsfr)
-	} else {
-		ctx, cancel = context.WithCancel(trnsfr.Context())
-		defer cancel()
 	}
+
+	// TODO: should this use the request context?
+	trnsfr := transfer.New(c, nil)
+
+	ctx, cancel := context.WithCancel(trnsfr.Context())
+	defer cancel()
+
+	i, err := installer.New(ctx, manager, installer.ServerDetails{
+		UUID:              id,
+		StartOnCompletion: false,
+	})
+	if err != nil {
+		trnsfr.Log().WithError(err).Error("failed to initialize transfer; no server instance created")
+		// Initializing the server can fail after its data directory and quota were
+		// created. Neither existed before (see above), so remove them again.
+		if _, statErr := os.Lstat(dataDir); !pooled && statErr == nil {
+			if !removeFailedTransferFiles(trnsfr.Log(), id, dataDir, false, nil, "") {
+				keepClaim = true
+				trnsfr.Log().Error("could not remove the files of a failed transfer; new transfers of this server are refused until Wings is restarted")
+			}
+		}
+		middleware.CaptureAndAbort(c, err)
+		return
+	}
+
+	i.Server().SetTransferring(true)
+	manager.Add(i.Server())
+
+	// We add the transfer to the list of transfers once we have a server instance to use.
+	trnsfr.Server = i.Server()
+	transfer.Incoming().Add(trnsfr)
 
 	// Any errors past this point (until the transfer is complete) will abort
 	// the transfer.
@@ -128,32 +186,28 @@ func postTransfers(c *gin.Context) {
 	// created, temporary or final.
 	var (
 		successful      bool
-		pooled          bool
 		stagedBackups   = make(map[string]string)
 		receivedBackups []string
 		installLogPath  string
 	)
 	defer func(ctx context.Context, trnsfr *transfer.Transfer) {
-		id := trnsfr.Server.ID()
-		if !successful {
-			// Mark the cleanup as running before the transfer stops being listed as
-			// incoming, so that no retry can be admitted in between.
-			failedIncomingCleanups.Store(id, struct{}{})
-		}
-
 		// Remove the transfer from the list of incoming transfers.
 		transfer.Incoming().Remove(trnsfr)
 
 		if !successful {
 			trnsfr.Server.Events().Publish(server.TransferStatusEvent, "failure")
+			// Only this request's instance can have this ID, see the checks above.
 			manager.Remove(func(match *server.Server) bool {
 				return match.ID() == id
 			})
 			// The source node keeps its copy of the server when a transfer fails, so
 			// the transfer can be retried or the server moved by hand. Remove the
-			// partial copy from this node; a retry is refused until this is done.
-			cleanupFailedIncomingTransfer(trnsfr, pooled, receivedBackups, installLogPath)
-			failedIncomingCleanups.Delete(id)
+			// partial copy from this node; the claim refuses a retry until this is
+			// done, and for good if the container or the files could not be removed.
+			if !cleanupFailedIncomingTransfer(trnsfr, pooled, receivedBackups, installLogPath) {
+				keepClaim = true
+				trnsfr.Log().Error("could not remove everything a failed transfer left on this node; new transfers of this server are refused until Wings is restarted")
+			}
 		}
 
 		if err := manager.Client().SetTransferStatus(context.Background(), trnsfr.Server.ID(), successful); err != nil {
@@ -167,19 +221,14 @@ func postTransfers(c *gin.Context) {
 		}
 	}(ctx, trnsfr)
 
-	{
-		remotePool := config.Get().System.Transfers.StoragePool
-		sourcePool := c.GetHeader("X-Storage-Pool")
-		if remotePool.Enabled && remotePool.PoolName != "" && sourcePool != "" && strings.EqualFold(remotePool.PoolName, sourcePool) {
-			pooled = true
-			if err := trnsfr.Server.CreateEnvironment(); err != nil {
-				middleware.CaptureAndAbort(c, err)
-				return
-			}
-			successful = true
-			c.Status(http.StatusOK)
+	if pooled {
+		if err := trnsfr.Server.CreateEnvironment(); err != nil {
+			middleware.CaptureAndAbort(c, err)
 			return
 		}
+		successful = true
+		c.Status(http.StatusOK)
+		return
 	}
 
 	mediaType, params, err := mime.ParseMediaType(c.GetHeader("Content-Type"))
@@ -464,16 +513,21 @@ func deleteTransfer(c *gin.Context) {
 // directory is the source's own data, so it is left alone when pooled is true.
 // receivedBackups lists only the backup files the transfer created, so backups
 // that were already on this node are kept.
-func cleanupFailedIncomingTransfer(trnsfr *transfer.Transfer, pooled bool, receivedBackups []string, installLogPath string) {
+//
+// It reports whether the container and the data directory are gone. If either is
+// left, a new transfer of the server would reuse it, so the caller must refuse one.
+func cleanupFailedIncomingTransfer(trnsfr *transfer.Transfer, pooled bool, receivedBackups []string, installLogPath string) bool {
 	s := trnsfr.Server
 	if s == nil {
-		return
+		return true
 	}
 	l := trnsfr.Log()
+	ok := true
 
 	if s.Environment != nil {
 		if err := s.Environment.Destroy(); err != nil {
 			l.WithError(err).Warn("failed to remove the container of a failed transfer")
+			ok = false
 		}
 	}
 
@@ -486,7 +540,10 @@ func cleanupFailedIncomingTransfer(trnsfr *transfer.Transfer, pooled bool, recei
 		}
 	}
 
-	removeFailedTransferFiles(l, s.ID(), dataDir, pooled, receivedBackups, installLogPath)
+	if !removeFailedTransferFiles(l, s.ID(), dataDir, pooled, receivedBackups, installLogPath) {
+		ok = false
+	}
+	return ok
 }
 
 // stageReceivedBackup writes a backup received from the source to a new temporary
@@ -532,13 +589,16 @@ func commitReceivedBackups(staged map[string]string) ([]string, error) {
 }
 
 // removeFailedTransferFiles deletes the files written for a failed incoming
-// transfer of the server with the given ID. See cleanupFailedIncomingTransfer.
-func removeFailedTransferFiles(l *log.Entry, id, dataDir string, pooled bool, receivedBackups []string, installLogPath string) {
+// transfer of the server with the given ID, and reports whether the data directory
+// is gone (always true when pooled). See cleanupFailedIncomingTransfer.
+func removeFailedTransferFiles(l *log.Entry, id, dataDir string, pooled bool, receivedBackups []string, installLogPath string) bool {
 	cfg := config.Get()
+	ok := true
 
 	if !pooled && dataDir != "" {
 		if err := os.RemoveAll(dataDir); err != nil {
 			l.WithError(err).Warn("failed to delete the server files of a failed transfer")
+			ok = false
 		}
 		if cfg.System.Quotas.Enabled {
 			if err := quotas.DelQuota(id); err != nil {
@@ -569,4 +629,5 @@ func removeFailedTransferFiles(l *log.Entry, id, dataDir string, pooled bool, re
 	}
 
 	l.WithField("pooled", pooled).Info("removed the partial copy of a failed incoming transfer")
+	return ok
 }
