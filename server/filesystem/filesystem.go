@@ -561,10 +561,13 @@ func (fs *Filesystem) Copy(p string) error {
 	return fs.Write(path.Join(dir, n), source, s.Size(), s.Mode().Perm())
 }
 
-// Symlink creates a symbolic link at "target" pointing to "source". Both paths
-// are relative to the root of the server; the link is written as a path relative
-// to the directory it is created in so that it resolves to the same file both on
-// the host and inside the server container.
+// Symlink creates a symbolic link at "target" pointing to "source". "target" is
+// relative to the root of the server. A relative "source" is relative to the
+// directory the link is created in, as with symlink(2); an absolute "source" is
+// relative to the root of the server. The link is written as a path relative to
+// the directory it is created in so that it resolves to the same file both on the
+// host and inside the server container. Sources that do not exist, or that are
+// outside the root of the server, are refused.
 //
 // [os.Root].Symlink allows for the creation of a symlink that targets a file
 // outside the root directory. This isn't the end of the world because every read
@@ -575,8 +578,20 @@ func (fs *Filesystem) Symlink(source, target string) error {
 	if err != nil {
 		return err
 	}
-	source = normalize(source)
 	target = normalize(target)
+	// Refuse a link outside the root before resolving the source against its
+	// directory, with the same error os.Root returns when creating it.
+	if !filepath.IsLocal(target) {
+		return &os.LinkError{Op: "symlinkat", Old: source, New: target, Err: errors.New("path escapes from parent")}
+	}
+	// A relative source is relative to the directory the link is created in, like
+	// symlink(2) and `ln -s`, and like the target an SFTP client sends. An absolute
+	// source is relative to the server root.
+	if filepath.IsAbs(source) {
+		source = normalize(source)
+	} else {
+		source = normalize(filepath.Join(filepath.Dir(target), source))
+	}
 
 	// Just to avoid this propagating everywhere, *attempt* to block anything that
 	// would be pointing to a location outside the root directory.

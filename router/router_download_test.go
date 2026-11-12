@@ -2,6 +2,7 @@ package router
 
 import (
 	"bytes"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -159,8 +160,38 @@ func TestGetDownloadBackup_RejectsExpiredToken(t *testing.T) {
 	r, _ := newDownloadTestRouter(t)
 	token := signBackupToken(t, time.Now().Add(-time.Minute))
 
-	if w := doDownload(r, http.MethodGet, token, nil); w.Code == http.StatusOK {
-		t.Fatal("expected an expired token to be rejected")
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		if w := doDownload(r, method, token, nil); w.Code != http.StatusUnauthorized {
+			t.Fatalf("%s: expected 401 for an expired token, got %d", method, w.Code)
+		}
+	}
+}
+
+func TestGetDownloadBackup_RejectsInvalidToken(t *testing.T) {
+	r, _ := newDownloadTestRouter(t)
+	token := signBackupToken(t, time.Now().Add(15*time.Minute))
+
+	for name, bad := range map[string]string{
+		"bad signature": token[:len(token)-4] + "AAAA",
+		"malformed":     "not-a-jwt",
+		"empty":         "",
+	} {
+		if w := doDownload(r, http.MethodGet, bad, nil); w.Code != http.StatusUnauthorized {
+			t.Errorf("%s: expected 401, got %d", name, w.Code)
+		}
+	}
+}
+
+func TestParseToken_WrapsJwtErrors(t *testing.T) {
+	newDownloadTestRouter(t)
+	var payload tokens.BackupPayload
+	err := tokens.ParseToken([]byte(signBackupToken(t, time.Now().Add(-time.Minute))), &payload)
+	if !errors.Is(err, tokens.ErrInvalidToken) || !errors.Is(err, jwt.ErrExpValidation) {
+		t.Fatalf("expected the error to match both ErrInvalidToken and jwt.ErrExpValidation, got %v", err)
+	}
+	// The message is sent to websocket clients and must stay the jwt error's.
+	if err.Error() != jwt.ErrExpValidation.Error() {
+		t.Errorf("expected the jwt error message %q, got %q", jwt.ErrExpValidation.Error(), err.Error())
 	}
 }
 

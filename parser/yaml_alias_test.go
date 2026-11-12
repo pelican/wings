@@ -61,6 +61,37 @@ func TestUpdateYaml_MergeKeyAlias(t *testing.T) {
 	}
 }
 
+// Changes that go through the node tree must write merge keys as a plain "<<",
+// not "!!merge <<", which parsers such as js-yaml cannot read.
+func TestUpdateYaml_MergeKeyWrittenWithoutTag(t *testing.T) {
+	src := "# settings\ndefaults: &d\n  port: 1\nworlds:\n  world:\n    <<: *d\n    seed: 1\n  nether:\n    <<: *d\n    seed: 2\n"
+	for name, rules := range map[string]string{
+		"new key":           `[{"match": "worlds.world.extra", "replace_with": "added"}]`,
+		"new nested key":    `[{"match": "new.section.key", "replace_with": "added"}]`,
+		"wildcard on merge": `[{"match": "worlds.*.enabled", "replace_with": true}]`,
+	} {
+		out, changed := updateYamlString(t, rules, src)
+		if !changed {
+			t.Errorf("%s: expected the document to change", name)
+			continue
+		}
+		if strings.Contains(out, "!!merge") {
+			t.Errorf("%s: merge key written with an explicit tag:\n%s", name, out)
+		}
+		if !strings.Contains(out, "\n    <<: *d\n") {
+			t.Errorf("%s: expected the merge key to be kept as \"<<: *d\":\n%s", name, out)
+		}
+		if !strings.Contains(out, "# settings") {
+			t.Errorf("%s: expected comments to be kept:\n%s", name, out)
+		}
+		got := decodeYamlString(t, out)
+		worlds := got["worlds"].(map[string]interface{})
+		if port := worlds["nether"].(map[string]interface{})["port"]; port != 1 {
+			t.Errorf("%s: merge key no longer merges, nether.port = %v\n%s", name, port, out)
+		}
+	}
+}
+
 // A merge alias back into its own anchor decodes, because the explicit key
 // shadows the merged one, but can never be expanded. The update must still
 // finish with the right values instead of recursing until the stack overflows.
