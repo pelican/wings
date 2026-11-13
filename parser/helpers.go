@@ -7,7 +7,6 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
-	"github.com/buger/jsonparser"
 	"github.com/iancoleman/strcase"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -171,10 +170,10 @@ func (cfr *ConfigurationFileReplacement) setValueWithSjson(jsonStr string, path 
 
 	var setValue interface{}
 	switch {
-	case cfr.ReplaceWith.Type() == jsonparser.Boolean:
+	case cfr.ReplaceWith.Type() == BooleanValue:
 		// Explicit boolean type declared in the egg definition.
 		return cfr.setBool(jsonStr, path, value)
-	case cfr.ReplaceWith.Type() == jsonparser.Number:
+	case cfr.ReplaceWith.Type() == NumberValue:
 		// Explicit numeric type declared in the egg definition.
 		return cfr.setNumber(jsonStr, path, value)
 	default:
@@ -241,7 +240,7 @@ func (f *ConfigurationFile) LookupConfigurationValue(cfr ConfigurationFileReplac
 	// If this is not something that we can do a regex lookup on then just continue
 	// on our merry way. If the value isn't a string, we're not going to be doing anything
 	// with it anyways.
-	if cfr.ReplaceWith.Type() != jsonparser.String || !configMatchRegex.Match(cfr.ReplaceWith.Value()) {
+	if cfr.ReplaceWith.Type() != StringValue || !configMatchRegex.Match(cfr.ReplaceWith.Value()) {
 		return cfr.ReplaceWith.String(), nil
 	}
 
@@ -260,22 +259,24 @@ func (f *ConfigurationFile) LookupConfigurationValue(cfr ConfigurationFileReplac
 		}
 
 		// Look for the key in the Wings configuration and substitute the placeholder.
-		match, dataType, _, err := jsonparser.Get(f.configuration, path...)
-		if err != nil {
-			if err != jsonparser.KeyPathNotFoundError {
-				return placeholder
-			}
+		// The parts come from strcase.ToSnake on [\w.-] input, so they never
+		// contain gjson path syntax and can be joined without escaping.
+		match := gjson.GetBytes(f.configuration, strings.Join(path, "."))
+		if !match.Exists() {
 			log.WithFields(log.Fields{"path": path, "filename": f.FileName}).Debug("attempted to load a configuration value that does not exist")
 			// Leave placeholder intact so the misconfiguration is visible.
 			return placeholder
 		}
 
 		// Only substitute scalar values, not whole objects or arrays.
-		if dataType == jsonparser.Object || dataType == jsonparser.Array {
+		if match.IsObject() || match.IsArray() {
 			return placeholder
 		}
 
-		return string(match)
+		if match.Type == gjson.String {
+			return match.Str
+		}
+		return match.Raw
 	})
 
 	return result, err

@@ -2,7 +2,6 @@ package router
 
 import (
 	"context"
-	"encoding/json"
 	"net/http"
 	"time"
 
@@ -144,8 +143,8 @@ func getServerWebsocket(c *gin.Context) {
 		// Discard and JSON parse errors into the void and don't continue processing this
 		// specific socket request. If we did a break here the client would get disconnected
 		// from the socket, which is NOT what we want to do.
-		var j websocket.Message
-		if err := json.Unmarshal(p, &j); err != nil {
+		j, err := websocket.DecodeMessage(p)
+		if err != nil {
 			continue
 		}
 

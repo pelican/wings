@@ -16,7 +16,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-22.04]
-        go: ["1.26.8", "1.27.3"]
+        go: ["1.27.4"]
         goos: [linux]
         goarch: [amd64, arm64]
 
@@ -64,14 +64,14 @@ jobs:
 
       - name: Upload Release Artifact
         uses: actions/upload-artifact@v7
-        if: ${{ (github.ref == 'refs/heads/main' || github.event_name == 'pull_request') && matrix.go == '1.26.8' }}
+        if: ${{ (github.ref == 'refs/heads/main' || github.event_name == 'pull_request') && matrix.go == '1.27.4' }}
         with:
           name: wings_linux_${{ matrix.goarch }}
           path: dist/wings
 
       - name: Upload Debug Artifact
         uses: actions/upload-artifact@v7
-        if: ${{ (github.ref == 'refs/heads/main' || github.event_name == 'pull_request') && matrix.go == '1.26.8' }}
+        if: ${{ (github.ref == 'refs/heads/main' || github.event_name == 'pull_request') && matrix.go == '1.27.4' }}
         with:
           name: wings_linux_${{ matrix.goarch }}_debug
           path: dist/wings_debug
@@ -82,7 +82,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        go: ["1.26.8", "1.27.3"]
+        go: ["1.27.4"]
 
     steps:
       - name: Setup Go

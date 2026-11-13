@@ -3,6 +3,8 @@ package parser
 import (
 	"bufio"
 	"bytes"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"io"
 	"os"
 	"strconv"
@@ -12,7 +14,6 @@ import (
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/beevik/etree"
-	"github.com/buger/jsonparser"
 	"github.com/goccy/go-json"
 	"github.com/icza/dyno"
 	"github.com/magiconair/properties"
@@ -51,45 +52,79 @@ const maxTextScanTokenSize = 64 * 1024 * 1024
 // maxConfigFileSize caps how large a configuration file we'll attempt to parse.
 const maxConfigFileSize = 64 * 1024 * 1024
 
-type ReplaceValue struct {
-	value     []byte
-	valueType jsonparser.ValueType
+// ValueType is the JSON type of a replacement value as written in the egg.
+type ValueType int
+
+const (
+	InvalidValue ValueType = iota
+	StringValue
+	NumberValue
+	BooleanValue
+	NullValue
+	ObjectValue
+	ArrayValue
+)
+
+// valueTypeOf maps a JSON value's kind to its ValueType.
+func valueTypeOf(k jsontext.Kind) ValueType {
+	switch k {
+	case '"':
+		return StringValue
+	case '0':
+		return NumberValue
+	case 't', 'f':
+		return BooleanValue
+	case 'n':
+		return NullValue
+	case '{':
+		return ObjectValue
+	case '[':
+		return ArrayValue
+	default:
+		return InvalidValue
+	}
 }
 
-// Value returns the underlying value of the replacement. Be aware that this
-// can include escaped UTF-8 sequences that will need to be handled by the caller
-// in order to avoid accidentally injecting invalid sequences into the running
-// process.
-//
-// For example the expected value may be "§Foo" but you'll be working directly
-// with "\u00a7FOo" for this value. This will cause user pain if not solved since
-// that is clearly not the value they were expecting to be using.
+type ReplaceValue struct {
+	value     []byte
+	valueType ValueType
+}
+
+// newReplaceValue builds a ReplaceValue from a raw JSON value. Strings are
+// unescaped up front, so an escaped section sign is stored as "§Foo"; every
+// other type keeps its raw JSON bytes.
+func newReplaceValue(v jsontext.Value) ReplaceValue {
+	rv := ReplaceValue{valueType: valueTypeOf(v.Kind())}
+	if rv.valueType == StringValue {
+		// The decoder has already checked v's syntax, so the only error
+		// AppendUnquote can still report is invalid UTF-8, which it has
+		// already replaced with U+FFFD, just as encoding/json v1 did.
+		rv.value, _ = jsontext.AppendUnquote(nil, v)
+	} else {
+		rv.value = bytes.Clone(v)
+	}
+	return rv
+}
+
+// Value returns the underlying value of the replacement. Strings are already
+// unescaped, so a section sign sent as a JSON escape comes back as "§Foo".
+// Other types are returned as their raw JSON text.
 func (cv *ReplaceValue) Value() []byte {
 	return cv.value
 }
 
 // Type returns the underlying data type for the Value field.
-func (cv *ReplaceValue) Type() jsonparser.ValueType {
+func (cv *ReplaceValue) Type() ValueType {
 	return cv.valueType
 }
 
-// String returns the value as a string representation. This will automatically
-// handle casting the UTF-8 sequence into the expected value, switching something
-// like "\u00a7Foo" into "§Foo".
+// String returns the value as a string representation.
 func (cv *ReplaceValue) String() string {
 	switch cv.Type() {
-	case jsonparser.String:
-		str, err := jsonparser.ParseString(cv.value)
-		if err != nil {
-			panic(errors.Wrap(err, "parser: could not parse value"))
-		}
-		return str
-	case jsonparser.Null:
+	case StringValue, BooleanValue, NumberValue:
+		return string(cv.value)
+	case NullValue:
 		return "<nil>"
-	case jsonparser.Boolean:
-		return string(cv.value)
-	case jsonparser.Number:
-		return string(cv.value)
 	default:
 		return "<invalid>"
 	}
@@ -97,19 +132,10 @@ func (cv *ReplaceValue) String() string {
 
 func (cv *ReplaceValue) Bytes() []byte {
 	switch cv.Type() {
-	case jsonparser.String:
-		var stackbuf [64]byte
-		bU, err := jsonparser.Unescape(cv.value, stackbuf[:])
-		if err != nil {
-			panic(errors.Wrap(err, "parser: could not parse value"))
-		}
-		return bU
-	case jsonparser.Null:
+	case StringValue, BooleanValue, NumberValue:
+		return cv.value
+	case NullValue:
 		return []byte("<nil>")
-	case jsonparser.Boolean:
-		return cv.value
-	case jsonparser.Number:
-		return cv.value
 	default:
 		return []byte("<invalid>")
 	}
@@ -139,43 +165,153 @@ type ConfigurationFile struct {
 // just log a global warning so someone can find the issue, and return an empty
 // array of replacements.
 func (f *ConfigurationFile) UnmarshalJSON(data []byte) error {
-	var m map[string]*json.RawMessage
-	if err := json.Unmarshal(data, &m); err != nil {
+	return jsonv2.Unmarshal(data, f, legacyDecodeOptions)
+}
+
+// legacyDecodeOptions keeps encoding/json v1 behaviour for egg JSON coming
+// from the Panel: the last of any duplicate keys wins and invalid UTF-8 is
+// accepted instead of failing the whole server configuration.
+var legacyDecodeOptions = jsonv2.JoinOptions(
+	jsontext.AllowDuplicateNames(true),
+	jsontext.AllowInvalidUTF8(true),
+)
+
+// readObject reads a JSON object from dec in a single pass, calling fn with
+// each member's name. fn must consume exactly one value from dec. A null
+// object is treated as empty.
+func readObject(dec *jsontext.Decoder, fn func(key string) error) error {
+	tok, err := dec.ReadToken()
+	if err != nil {
+		return err
+	}
+	switch tok.Kind() {
+	case 'n':
+		return nil
+	case '{':
+	default:
+		return errors.Errorf("parser: expected a JSON object, got %s", tok.Kind())
+	}
+	for dec.PeekKind() != '}' {
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		// tok is voided by the next decoder call, so the name is copied out
+		// before fn reads the value.
+		if err := fn(tok.String()); err != nil {
+			return err
+		}
+	}
+	_, err = dec.ReadToken()
+	return err
+}
+
+// stringField holds the last value seen for a string member. A wrong type is
+// recorded rather than returned straight away, so a later duplicate of the key
+// can still replace it: the last occurrence wins, as with encoding/json v1.
+type stringField struct {
+	s   string
+	set bool // false when the member was missing or null
+	err error
+}
+
+// read consumes one value from dec into f, replacing anything read before.
+func (f *stringField) read(dec *jsontext.Decoder, key string) error {
+	*f = stringField{}
+	switch k := dec.PeekKind(); k {
+	case '"':
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		f.s, f.set = tok.String(), true
+	case 'n':
+		_, err := dec.ReadToken()
+		return err
+	default:
+		f.err = errors.Errorf("parser: '%s' must be a string, got %s", key, k)
+		return dec.SkipValue()
+	}
+	return nil
+}
+
+// UnmarshalJSONFrom decodes a configuration file in a single pass. A key whose
+// value is null is treated as missing.
+func (f *ConfigurationFile) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	var file, parser stringField
+	var haveCreate bool
+	var replace []ConfigurationFileReplacement
+	var replaceErr, createErr error
+	f.AllowCreateFile = true
+	err := readObject(dec, func(key string) error {
+		switch key {
+		case "file":
+			return file.read(dec, key)
+		case "parser":
+			return parser.read(dec, key)
+		case "replace":
+			val, err := dec.ReadValue()
+			if err != nil {
+				return err
+			}
+			// Decode from the already-read value so a bad replacement is
+			// reported after the loop without desyncing the decoder.
+			replace, replaceErr = nil, nil
+			if val.Kind() != 'n' {
+				replaceErr = jsonv2.Unmarshal(val, &replace, dec.Options())
+			}
+		case "create_file":
+			val, err := dec.ReadValue()
+			if err != nil {
+				return err
+			}
+			haveCreate, createErr = true, nil
+			switch val.Kind() {
+			case 't':
+				f.AllowCreateFile = true
+			case 'f':
+				f.AllowCreateFile = false
+			case 'n':
+				haveCreate, f.AllowCreateFile = false, true
+			default:
+				f.AllowCreateFile = true
+				createErr = errors.Errorf("expected a boolean, got %s", val.Kind())
+			}
+		default:
+			return dec.SkipValue()
+		}
+		return nil
+	})
+	if err != nil {
 		return err
 	}
 
-	fileRaw, ok := m["file"]
-	if !ok || fileRaw == nil {
+	if file.err != nil {
+		return file.err
+	}
+	if !file.set {
 		return errors.New("parser: configuration file missing required 'file' key")
 	}
-	if err := json.Unmarshal(*fileRaw, &f.FileName); err != nil {
-		return err
+	if parser.err != nil {
+		return parser.err
 	}
-
-	parserRaw, ok := m["parser"]
-	if !ok || parserRaw == nil {
+	if !parser.set {
 		return errors.New("parser: configuration file missing required 'parser' key")
 	}
-	if err := json.Unmarshal(*parserRaw, &f.Parser); err != nil {
-		return err
-	}
+	f.FileName, f.Parser = file.s, ConfigurationParser(parser.s)
 
 	f.Replace = []ConfigurationFileReplacement{}
-	if replaceRaw, ok := m["replace"]; ok && replaceRaw != nil {
-		if err := json.Unmarshal(*replaceRaw, &f.Replace); err != nil {
-			log.WithField("file", f.FileName).WithField("error", err).Warn("failed to unmarshal configuration file replacement")
-		}
+	if replaceErr != nil {
+		log.WithField("file", f.FileName).WithField("error", replaceErr).Warn("failed to unmarshal configuration file replacement")
+	} else if replace != nil {
+		f.Replace = replace
 	}
 
-	// test if "create_file" exists, if not just assume true
-	if val, exists := m["create_file"]; exists && val != nil {
-		if err := json.Unmarshal(*val, &f.AllowCreateFile); err != nil {
-			log.WithField("file", f.FileName).WithField("error", err).Warn("create_file unmarshal failed")
-			f.AllowCreateFile = true
-		}
-	} else {
+	// create_file is assumed true when it is missing or invalid.
+	if createErr != nil {
+		log.WithField("file", f.FileName).WithField("error", createErr).Warn("create_file unmarshal failed")
+	} else if !haveCreate {
 		log.WithField("file", f.FileName).Debug("create_file not specified assumed true")
-		f.AllowCreateFile = true
 	}
 
 	return nil
@@ -192,38 +328,59 @@ type ConfigurationFileReplacement struct {
 // UnmarshalJSON handles unmarshaling the JSON representation into a struct that
 // provides more useful data to this functionality.
 func (cfr *ConfigurationFileReplacement) UnmarshalJSON(data []byte) error {
-	m, err := jsonparser.GetString(data, "match")
+	return jsonv2.Unmarshal(data, cfr, legacyDecodeOptions)
+}
+
+// UnmarshalJSONFrom decodes a single replacement in one pass. "match" and
+// "replace_with" are required; "if_value" is optional. Eggs that predate
+// "replace_with" use the old "value" key, which is accepted as a fallback.
+func (cfr *ConfigurationFileReplacement) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	var match, ifValue stringField
+	var haveReplace, haveLegacy bool
+	var replaceWith, legacyValue ReplaceValue
+	err := readObject(dec, func(key string) error {
+		switch key {
+		case "match":
+			return match.read(dec, key)
+		case "if_value":
+			return ifValue.read(dec, key)
+		case "replace_with", "value":
+			val, err := dec.ReadValue()
+			if err != nil {
+				return err
+			}
+			if key == "replace_with" {
+				replaceWith, haveReplace = newReplaceValue(val), true
+			} else {
+				legacyValue, haveLegacy = newReplaceValue(val), true
+			}
+		default:
+			return dec.SkipValue()
+		}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
 
-	cfr.Match = m
-
-	iv, err := jsonparser.GetString(data, "if_value")
-	// We only check keypath here since match & replace_with should be present on all of
-	// them, however if_value is optional.
-	if err != nil && !errors.Is(err, jsonparser.KeyPathNotFoundError) {
-		return err
+	if match.err != nil {
+		return match.err
 	}
-	cfr.IfValue = iv
-
-	rw, dt, _, err := jsonparser.Get(data, "replace_with")
-	if err != nil {
-		if !errors.Is(err, jsonparser.KeyPathNotFoundError) {
-			return err
-		}
-
-		// Okay, likely dealing with someone who forgot to upgrade their eggs, so in
-		// that case, fallback to using the old key which was "value".
-		rw, dt, _, err = jsonparser.Get(data, "value")
-		if err != nil {
-			return err
-		}
+	if !match.set {
+		return errors.New("parser: replacement missing required 'match' key")
 	}
-
-	cfr.ReplaceWith = ReplaceValue{
-		value:     rw,
-		valueType: dt,
+	// if_value is optional, and null means it is not set.
+	if ifValue.err != nil {
+		return ifValue.err
+	}
+	cfr.Match, cfr.IfValue = match.s, ifValue.s
+	switch {
+	case haveReplace:
+		cfr.ReplaceWith = replaceWith
+	case haveLegacy:
+		cfr.ReplaceWith = legacyValue
+	default:
+		return errors.New("parser: replacement missing required 'replace_with' key")
 	}
 
 	return nil
