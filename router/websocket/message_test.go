@@ -20,8 +20,18 @@ func TestDecodeMessageMatchesV1(t *testing.T) {
 		`{"event":"send command","args":["a","b","c"],"extra":{"ignored":true}}`,
 		// Duplicate keys: the last one wins.
 		`{"event":"set state","event":"send command","args":["x"]}`,
-		// Field names match regardless of case.
+		// Field names match regardless of case...
 		`{"Event":"send command","ARGS":["x"]}`,
+		// ...but dashes and underscores must still match.
+		`{"event":"send command","args":["say hi"],"a-rgs":["stop"]}`,
+		`{"event":"auth","args":["token"],"a-rgs":0}`,
+		`{"e_vent":"set state","event":"send command","args":["x"]}`,
+		// A later null leaves an already decoded field unchanged.
+		`{"event":"auth","event":null,"args":["token"]}`,
+		`{"event":"send command","args":["x"],"args":null}`,
+		`{"event":null,"args":null}`,
+		// A later list replaces an earlier one.
+		`{"event":"send command","args":["a","b"],"args":["c"]}`,
 		// Invalid UTF-8 is replaced, not rejected.
 		"{\"event\":\"send command\",\"args\":[\"caf\xe9 \xff\xfe\"]}",
 		`null`,
