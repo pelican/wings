@@ -12,12 +12,13 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
-	"github.com/buger/jsonparser"
+	"github.com/containerd/errdefs"
 	"github.com/docker/docker/api/types/container"
 	dockerImage "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
+	"github.com/dustin/go-humanize"
+	"github.com/goccy/go-json"
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
@@ -116,7 +117,7 @@ func (e *Environment) InSituUpdate() error {
 		// to the disk.
 		//
 		// We'll let a boot process make modifications to the container if needed at this point.
-		if client.IsErrNotFound(err) {
+		if errdefs.IsNotFound(err) {
 			return nil
 		}
 		return errors.Wrap(err, "environment/docker: could not inspect container")
@@ -152,7 +153,7 @@ func (e *Environment) Create() error {
 	// container anyways.
 	if _, err := e.ContainerInspect(ctx); err == nil {
 		return nil
-	} else if !client.IsErrNotFound(err) {
+	} else if !errdefs.IsNotFound(err) {
 		return errors.WrapIf(err, "environment/docker: failed to inspect container")
 	}
 
@@ -217,7 +218,7 @@ func (e *Environment) Create() error {
 			networkMode = container.NetworkMode(networkName)
 
 			if _, err := e.client.NetworkInspect(ctx, networkName, network.InspectOptions{}); err != nil {
-				if !client.IsErrNotFound(err) {
+				if !errdefs.IsNotFound(err) {
 					return err
 				}
 
@@ -321,7 +322,7 @@ func (e *Environment) Destroy() error {
 	// exist on the system. We're just a step ahead of ourselves in that case.
 	//
 	// @see https://github.com/pterodactyl/panel/issues/2001
-	if err != nil && client.IsErrNotFound(err) {
+	if err != nil && errdefs.IsNotFound(err) {
 		return nil
 	}
 
@@ -404,7 +405,10 @@ func (e *Environment) ensureImageExists(image string) error {
 	}
 
 	// Get the ImagePullOptions.
-	imagePullOptions := dockerImage.PullOptions{All: false, Platform: runtime.GOOS + "/" + runtime.GOARCH}
+	imagePullOptions := dockerImage.PullOptions{
+		All:      false,
+		Platform: runtime.GOOS + "/" + runtime.GOARCH,
+	}
 	if registryAuth != nil {
 		b64, err := registryAuth.Base64()
 		if err != nil {
@@ -420,7 +424,7 @@ func (e *Environment) ensureImageExists(image string) error {
 		images, ierr := e.client.ImageList(ctx, dockerImage.ListOptions{})
 		if ierr != nil {
 			// Well damn, something has gone really wrong here, just go ahead and abort there
-			// isn't much anything we can do to try and self-recover from this.
+			// isn't much anything we can do to try and self-recover from this.			
 			return errors.Wrap(ierr, "environment/docker: failed to list images")
 		}
 
@@ -442,30 +446,41 @@ func (e *Environment) ensureImageExists(image string) error {
 			}
 		}
 
-		return errors.Wrapf(err, "environment/docker: failed to pull \"%s\" image for server", image)
+		return errors.Wrapf(err, "environment/docker: failed to pull %q image for server", image)
 	}
 	defer out.Close()
 
 	log.WithField("image", image).Debug("pulling docker image... this could take a bit of time")
 
-	// I'm not sure what the best approach here is, but this will block execution until the image
-	// is done being pulled, which is what we need.
-	scanner := bufio.NewScanner(out)
+	decoder := json.NewDecoder(out)
+	for {
+		var msg imagePullMessage
+		if err := decoder.Decode(&msg); err != nil {
+			if errors.Cause(err) == io.EOF || err == io.EOF {
+				break
+			}
+			return errors.Wrap(err, "environment/docker: failed to read image pull progress")
+		}
 
-	for scanner.Scan() {
-		b := scanner.Bytes()
-		status, _ := jsonparser.GetString(b, "status")
-		progress, _ := jsonparser.GetString(b, "progress")
+		if msg.ErrorDetail != nil {
+			return fmt.Errorf("environment/docker: image pull failed: %s", msg.ErrorDetail.Message)
+		}
+		if msg.Error != "" {
+			return fmt.Errorf("environment/docker: image pull failed: %s", msg.Error)
+		}
 
-		e.Events().Publish(environment.DockerImagePullStatus, status+" "+progress)
-	}
+		progress := msg.Progress
+		if p := msg.ProgressDetail; p != nil {
+			progress = formatDockerProgress(p.Current, p.Total, p.Units)
+		}
 
-	if err := scanner.Err(); err != nil {
-		return err
+		status := strings.TrimSpace(strings.Join([]string{msg.ID, msg.Status, progress}, " "))
+		if status != "" {
+			e.Events().Publish(environment.DockerImagePullStatus, status)
+		}
 	}
 
 	log.WithField("image", image).Debug("completed docker image pull")
-
 	return nil
 }
 
@@ -481,4 +496,56 @@ func (e *Environment) convertMounts() []mount.Mount {
 		}
 	}
 	return out
+}
+
+type imagePullMessage struct {
+	ID             string `json:"id"`
+	Status         string `json:"status"`
+	Progress       string `json:"progress"` // Fallback for older daemons
+	ProgressDetail *struct {
+		Current int64 `json:"current"`
+		Total   int64 `json:"total"`
+		Units string `json:"units"`
+	} `json:"progressDetail"`
+	Error       string `json:"error"`
+	ErrorDetail *struct {
+		Message string `json:"message"`
+	} `json:"errorDetail"`
+}
+
+func formatDockerProgress(current, total int64, units string) string {
+	const width = 30
+
+	if current < 0 {
+		current = 0
+	}
+
+	if units == "s" {
+		return fmt.Sprintf("%ds elapsed", current)
+	}
+	if units != "" && units != "bytes" {
+		return fmt.Sprintf("%d %s", current, units)
+	}
+	if total <= 0 {
+		if current > 0 {
+			return humanize.IBytes(uint64(current))
+		}
+		return ""
+	}
+	if current > total {
+		current = total
+	}
+
+	ratio := float64(current) / float64(total)
+	filled := int(ratio * width)
+	bar := strings.Repeat("=", filled)
+	if filled < width {
+		bar += ">" + strings.Repeat(" ", width-filled-1)
+	}
+
+	return fmt.Sprintf("[%s] %d%% (%s/%s)",
+		bar, int(ratio*100),
+		humanize.IBytes(uint64(current)),
+		humanize.IBytes(uint64(total)),
+	)
 }
