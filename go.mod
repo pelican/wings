@@ -28,7 +28,6 @@ require (
 	github.com/iancoleman/strcase v0.3.0
 	github.com/icza/dyno v0.0.0-20260912175837-51f8ab52fd15
 	github.com/juju/ratelimit v1.0.2
-	github.com/klauspost/compress v1.20.1
 	github.com/klauspost/pgzip v1.2.7
 	github.com/magiconair/properties v1.18.12
 	github.com/mattn/go-colorable v0.1.15
@@ -72,6 +71,7 @@ require (
 	github.com/erikgeiser/coninput v0.0.0-20211004153227-1c3628e74d0f // indirect
 	github.com/goccy/go-yaml v1.19.2 // indirect
 	github.com/hashicorp/go-version v1.9.0 // indirect
+	github.com/klauspost/compress v1.20.1 // indirect
 	github.com/lucasb-eyer/go-colorful v1.4.0 // indirect
 	github.com/mattn/go-localereader v0.0.1 // indirect
 	github.com/mattn/go-runewidth v0.0.24 // indirect
@@ -104,13 +104,13 @@ require (
 	github.com/bytedance/sonic/loader v0.5.1 // indirect
 	github.com/charmbracelet/huh v1.0.0
 	github.com/cloudwego/base64x v0.1.7 // indirect
-	github.com/containerd/errdefs v1.0.0 // indirect
+	github.com/containerd/errdefs v1.0.0
 	github.com/containerd/errdefs/pkg v0.3.0 // indirect
 	github.com/containerd/log v0.1.0 // indirect
 	github.com/distribution/reference v0.6.0
 	github.com/docker/go-units v0.5.0 // indirect
 	github.com/dsnet/compress v0.0.2-0.20230904184137-39efe44ab707 // indirect
-	github.com/dustin/go-humanize v1.0.1 // indirect
+	github.com/dustin/go-humanize v1.0.1
 	github.com/felixge/httpsnoop v1.1.0 // indirect
 	github.com/gammazero/deque v1.2.1 // indirect
 	github.com/gin-contrib/sse v1.1.1 // indirect
