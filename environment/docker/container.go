@@ -404,7 +404,6 @@ func (e *Environment) ensureImageExists(image string) error {
 		log.WithField("registry", registry).Debug("using authentication for registry")
 	}
 
-	// Get the ImagePullOptions.
 	imagePullOptions := dockerImage.PullOptions{
 		All:      false,
 		Platform: runtime.GOOS + "/" + runtime.GOARCH,
@@ -419,25 +418,22 @@ func (e *Environment) ensureImageExists(image string) error {
 		imagePullOptions.RegistryAuth = b64
 	}
 
-	out, err := e.client.ImagePull(ctx, image, imagePullOptions)
-	if err != nil {
-		images, ierr := e.client.ImageList(ctx, dockerImage.ListOptions{})
-		if ierr != nil {
-			// Well damn, something has gone really wrong here, just go ahead and abort there
-			// isn't much anything we can do to try and self-recover from this.			
-			return errors.Wrap(ierr, "environment/docker: failed to list images")
+	fallbackToLocal := func(pullErr error) error {
+		images, err := e.client.ImageList(ctx, dockerImage.ListOptions{})
+		if err != nil {
+			return errors.Wrap(err, "environment/docker: failed to list images")
 		}
 
 		for _, img := range images {
-			for _, t := range img.RepoTags {
-				if t != image {
+			for _, tag := range img.RepoTags {
+				if tag != image {
 					continue
 				}
 
 				log.WithFields(log.Fields{
 					"image":        image,
 					"container_id": e.Id,
-					"err":          err.Error(),
+					"err":          pullErr.Error(),
 				}).Warn("unable to pull requested image from remote source, however the image exists locally")
 
 				// Okay, we found a matching container image, in that case just go ahead and return
@@ -446,7 +442,12 @@ func (e *Environment) ensureImageExists(image string) error {
 			}
 		}
 
-		return errors.Wrapf(err, "environment/docker: failed to pull %q image for server", image)
+		return errors.Wrapf(pullErr, "environment/docker: failed to pull %q image for server", image)
+	}
+
+	out, err := e.client.ImagePull(ctx, image, imagePullOptions)
+	if err != nil {
+		return fallbackToLocal(err)
 	}
 	defer out.Close()
 
@@ -462,11 +463,14 @@ func (e *Environment) ensureImageExists(image string) error {
 			return errors.Wrap(err, "environment/docker: failed to read image pull progress")
 		}
 
-		if msg.ErrorDetail != nil {
-			return fmt.Errorf("environment/docker: image pull failed: %s", msg.ErrorDetail.Message)
+		if msg.ErrorDetail != nil && msg.ErrorDetail.Message != "" {
+			return fallbackToLocal(fmt.Errorf("%s", msg.ErrorDetail.Message))
 		}
 		if msg.Error != "" {
-			return fmt.Errorf("environment/docker: image pull failed: %s", msg.Error)
+			return fallbackToLocal(fmt.Errorf("%s", msg.Error))
+		}
+		if msg.ErrorDetail != nil {
+			return fallbackToLocal(fmt.Errorf("image pull failed without an error message"))
 		}
 
 		progress := msg.Progress
