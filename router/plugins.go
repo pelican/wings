@@ -77,7 +77,7 @@ func requestUser(c *gin.Context) string {
 // request: the operation itself will produce the real error a moment later, and
 // reporting it from here would attribute it to the plugin subsystem.
 func statForGate(s *server.Server, path string) (int64, bool) {
-	st, err := s.Filesystem().UnixFS().Stat(path)
+	st, err := s.Filesystem().Stat2(path)
 	if err != nil {
 		return -1, false
 	}

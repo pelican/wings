@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -18,11 +19,20 @@ import (
 	"github.com/pelletier/go-toml/v2"
 	"github.com/tidwall/pretty"
 	"gopkg.in/ini.v1"
-	"gopkg.in/yaml.v3"
 
 	"github.com/pelican/wings/config"
-	"github.com/pelican/wings/internal/ufs"
 )
+
+// ConfigFile is the handle to a configuration file that is parsed and then rewritten
+// in place. It is satisfied by both *os.File and filesystem.File.
+type ConfigFile interface {
+	io.Reader
+	io.Writer
+	io.Seeker
+	Name() string
+	Stat() (os.FileInfo, error)
+	Truncate(size int64) error
+}
 
 // The file parsing options that are available for a server configuration file.
 const (
@@ -192,14 +202,14 @@ func (cfr *ConfigurationFileReplacement) UnmarshalJSON(data []byte) error {
 	iv, err := jsonparser.GetString(data, "if_value")
 	// We only check keypath here since match & replace_with should be present on all of
 	// them, however if_value is optional.
-	if err != nil && err != jsonparser.KeyPathNotFoundError {
+	if err != nil && !errors.Is(err, jsonparser.KeyPathNotFoundError) {
 		return err
 	}
 	cfr.IfValue = iv
 
 	rw, dt, _, err := jsonparser.Get(data, "replace_with")
 	if err != nil {
-		if err != jsonparser.KeyPathNotFoundError {
+		if !errors.Is(err, jsonparser.KeyPathNotFoundError) {
 			return err
 		}
 
@@ -237,7 +247,7 @@ func newTemplatableConfig(c *config.Configuration) templatableConfig {
 
 // Parse parses a given configuration file and updates all the values within
 // as defined in the API response from the Panel.
-func (f *ConfigurationFile) Parse(file ufs.File) error {
+func (f *ConfigurationFile) Parse(file ConfigFile) error {
 	//log.WithField("path", path).WithField("parser", f.Parser.String()).Debug("parsing server configuration file")
 
 	// Refuse to parse files larger than the cap. Every parser below buffers the
@@ -279,7 +289,7 @@ func (f *ConfigurationFile) Parse(file ufs.File) error {
 }
 
 // Parses an xml file.
-func (f *ConfigurationFile) parseXmlFile(file ufs.File) error {
+func (f *ConfigurationFile) parseXmlFile(file ConfigFile) error {
 	doc := etree.NewDocument()
 	if _, err := doc.ReadFrom(io.LimitReader(file, maxConfigFileSize)); err != nil {
 		return err
@@ -359,7 +369,7 @@ func (f *ConfigurationFile) parseXmlFile(file ufs.File) error {
 }
 
 // Parses an ini file.
-func (f *ConfigurationFile) parseIniFile(file ufs.File) error {
+func (f *ConfigurationFile) parseIniFile(file ConfigFile) error {
 	// Wrap the file in a NopCloser so the ini package doesn't close the file.
 	cfg, err := ini.Load(io.NopCloser(io.LimitReader(file, maxConfigFileSize)))
 	if err != nil {
@@ -444,7 +454,7 @@ func (f *ConfigurationFile) parseIniFile(file ufs.File) error {
 // Parses a json file updating any matching key/value pairs. If a match is not found, the
 // value is set regardless in the file. See the commentary in parseYamlFile for more details
 // about what is happening during this process.
-func (f *ConfigurationFile) parseJsonFile(file ufs.File) error {
+func (f *ConfigurationFile) parseJsonFile(file ConfigFile) error {
 	b, err := io.ReadAll(io.LimitReader(file, maxConfigFileSize))
 	if err != nil {
 		return err
@@ -477,43 +487,20 @@ func (f *ConfigurationFile) parseJsonFile(file ufs.File) error {
 
 // Parses a yaml file and updates any matching key/value pairs before persisting
 // it back to the disk.
-func (f *ConfigurationFile) parseYamlFile(file ufs.File) error {
+func (f *ConfigurationFile) parseYamlFile(file ConfigFile) error {
 	b, err := io.ReadAll(io.LimitReader(file, maxConfigFileSize))
 	if err != nil {
 		return err
 	}
 
-	i := make(map[string]interface{})
-	if err := yaml.Unmarshal(b, &i); err != nil {
-		return err
-	}
-
-	// Unmarshal the yaml data into a JSON interface such that we can work with
-	// any arbitrary data structure. This allows us to use gjson/sjson for
-	// working with unknown JSON significantly easier.
-	jsonBytes, err := json.Marshal(dyno.ConvertMapI2MapS(i))
+	// Apply the replacements while preserving the layout, comments and key order
+	// of the original file. See updateYaml for details.
+	marshaled, changed, err := f.updateYaml(b)
 	if err != nil {
 		return err
 	}
-
-	// Now that the data is converted, treat it just like JSON and pass it to the
-	// iterator function to update values as necessary.
-	data, err := f.IterateOverJson(jsonBytes)
-	if err != nil {
-		return err
-	}
-
-	var jsonData interface{}
-	yamlDecoder := json.NewDecoder(bytes.NewReader(data))
-	yamlDecoder.UseNumber()
-	if err := yamlDecoder.Decode(&jsonData); err != nil {
-		return err
-	}
-	jsonData = normalizeYamlTypes(jsonData)
-
-	marshaled, err := yaml.Marshal(jsonData)
-	if err != nil {
-		return err
+	if !changed {
+		return nil
 	}
 
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
@@ -532,7 +519,7 @@ func (f *ConfigurationFile) parseYamlFile(file ufs.File) error {
 
 // Parses a toml file and updates any matching key/value pairs before persisting
 // it back to the disk.
-func (f *ConfigurationFile) parseTomlFile(file ufs.File) error {
+func (f *ConfigurationFile) parseTomlFile(file ConfigFile) error {
 	b, err := io.ReadAll(io.LimitReader(file, maxConfigFileSize))
 	if err != nil {
 		return err
@@ -654,7 +641,7 @@ func normalizeTomlTypes(value interface{}) interface{} {
 // Parses a text file using basic find and replace. This is a highly inefficient method of
 // scanning a file and performing a replacement. You should attempt to use anything other
 // than this function where possible.
-func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
+func (f *ConfigurationFile) parseTextFile(file ConfigFile) error {
 	b := bytes.NewBuffer(nil)
 	s := bufio.NewScanner(io.LimitReader(file, maxConfigFileSize))
 	s.Buffer(make([]byte, 0, 64*1024), maxTextScanTokenSize)
@@ -720,7 +707,7 @@ func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
 //
 // @see https://github.com/pterodactyl/panel/issues/2308 (original)
 // @see https://github.com/pterodactyl/panel/issues/3009 ("bug" introduced as result)
-func (f *ConfigurationFile) parsePropertiesFile(file ufs.File) error {
+func (f *ConfigurationFile) parsePropertiesFile(file ConfigFile) error {
 	b, err := io.ReadAll(io.LimitReader(file, maxConfigFileSize))
 	if err != nil {
 		return err

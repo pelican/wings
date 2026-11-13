@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	gopath "path"
+	"os"
 	"runtime"
 	"strings"
 	"sync"
@@ -25,7 +26,6 @@ import (
 	"github.com/pelican/wings/environment"
 	"github.com/pelican/wings/environment/docker"
 	"github.com/pelican/wings/internal/models"
-	"github.com/pelican/wings/internal/ufs"
 	"github.com/pelican/wings/plugins"
 	"github.com/pelican/wings/plugins/api"
 	"github.com/pelican/wings/server"
@@ -264,7 +264,7 @@ func (b *Bridge) FileChmod(uuid, path string, mode uint32) error {
 	if err != nil {
 		return err
 	}
-	return s.Filesystem().Chmod(path, ufs.FileMode(mode))
+	return s.Filesystem().Chmod(path, os.FileMode(mode))
 }
 
 func (b *Bridge) FileList(uuid, path string) ([]api.DirEntry, error) {
@@ -285,7 +285,7 @@ func (b *Bridge) FileList(uuid, path string) ([]api.DirEntry, error) {
 			Size:         st.Size(),
 			Mode:         uint32(st.Mode().Perm()),
 			Directory:    st.IsDir(),
-			Symlink:      st.Mode()&ufs.ModeSymlink != 0,
+			Symlink:      st.Mode()&os.ModeSymlink != 0,
 			MimeType:     st.Mimetype,
 			ModifiedUnix: st.ModTime().Unix(),
 		})
@@ -299,11 +299,11 @@ func (b *Bridge) FileExists(uuid, path string) (bool, error) {
 		return false, err
 	}
 
-	if _, err := s.Filesystem().UnixFS().Stat(path); err != nil {
+	if _, err := s.Filesystem().Stat2(path); err != nil {
 		// A path that is not there is the answer, not a failure. Anything else
 		// is a real problem the plugin should hear about rather than read as
 		// "the file is missing".
-		if errors.Is(err, ufs.ErrNotExist) {
+		if errors.Is(err, os.ErrNotExist) {
 			return false, nil
 		}
 		return false, err
@@ -429,7 +429,7 @@ func (b *Bridge) FileStat(uuid, path string) (api.DirEntry, error) {
 		Size:         st.Size(),
 		Mode:         uint32(st.Mode().Perm()),
 		Directory:    st.IsDir(),
-		Symlink:      st.Mode()&ufs.ModeSymlink != 0,
+		Symlink:      st.Mode()&os.ModeSymlink != 0,
 		MimeType:     st.Mimetype,
 		ModifiedUnix: st.ModTime().Unix(),
 	}, nil
@@ -502,7 +502,7 @@ func (b *Bridge) FileCompress(uuid, directory string, names []string, opts api.C
 	// Wings owns naming and format selection, including falling back to a
 	// gzipped tar for anything it does not recognise, so both are passed
 	// straight through rather than second-guessed here.
-	info, _, err := s.Filesystem().CompressFiles(directory, opts.Name, names, opts.Format)
+	info, _, err := s.Filesystem().CompressFiles(context.Background(), directory, opts.Name, names, opts.Format)
 	if err != nil {
 		return "", err
 	}

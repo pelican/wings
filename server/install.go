@@ -24,6 +24,7 @@ import (
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
+	"github.com/pelican/wings/environment/docker"
 	"github.com/pelican/wings/plugins"
 	"github.com/pelican/wings/plugins/api"
 	"github.com/pelican/wings/remote"
@@ -502,8 +503,10 @@ func (ip *InstallationProcess) Execute() (string, error) {
 	// Ensure the root directory for the server exists properly before attempting
 	// to trigger the reinstall of the server. It is possible the directory would
 	// not exist when this runs if Wings boots with a missing directory and a user
-	// triggers a reinstall before trying to start the server.
-	if err := ip.Server.EnsureDataDirectoryExists(); err != nil {
+	// triggers a reinstall before trying to start the server, or if the folder was
+	// deleted while Wings was running. The server's Filesystem opens the new folder
+	// on its next call (see Filesystem.openRoot).
+	if _, err := ip.Server.EnsureDataDirectoryExists(); err != nil {
 		return "", err
 	}
 
@@ -544,6 +547,8 @@ func (ip *InstallationProcess) Execute() (string, error) {
 	if err := ip.client.ContainerStart(ctx, r.ID, container.StartOptions{}); err != nil {
 		return "", err
 	}
+
+	docker.SetCpuBurst(ctx, ip.client, r.ID, hostConf.Resources.CPUQuota)
 
 	// Process the install event in the background by listening to the stream output until the
 	// container has stopped, at which point we'll disconnect from it.

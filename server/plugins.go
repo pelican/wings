@@ -7,8 +7,8 @@ import (
 
 	"emperror.dev/errors"
 
-	"github.com/pelican/wings/internal/ufs"
 	"github.com/pelican/wings/parser"
+	"github.com/pelican/wings/server/filesystem"
 	"github.com/pelican/wings/plugins"
 	"github.com/pelican/wings/plugins/api"
 )
@@ -98,7 +98,7 @@ func (s *Server) PluginSnapshot() api.Server {
 // A plugin that fails is reported rather than silently falling back. Falling
 // back would boot the server with a configuration file the operator believes
 // their plugin rewrote, which is a worse outcome than a visible error.
-func (s *Server) parseWithPlugin(f parser.ConfigurationFile, filename string, file ufs.File) (bool, error) {
+func (s *Server) parseWithPlugin(f parser.ConfigurationFile, filename string, file filesystem.File) (bool, error) {
 	m := plugins.Active()
 	if m == nil || !m.Enabled() {
 		return false, nil

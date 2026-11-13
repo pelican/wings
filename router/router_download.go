@@ -1,11 +1,12 @@
 package router
 
 import (
-	"bufio"
 	"errors"
+	"io"
 	"net/http"
 	"os"
 	"strconv"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -14,6 +15,13 @@ import (
 	"github.com/pelican/wings/router/tokens"
 	"github.com/pelican/wings/server/backup"
 )
+
+// Download tokens are not single-use. Browsers (e.g. Chromium's download
+// protection), antivirus software and download managers commonly request the
+// same signed URL more than once, and a resumed or parallel download is a new
+// request as well. Treating the token as single-use made those requests fail
+// with a 404 partway through large downloads. A download token stays valid until
+// the expiry set by the Panel, and is still subject to the user denylist.
 
 // Handle a download request for a server backup.
 func getDownloadBackup(c *gin.Context) {
@@ -28,7 +36,7 @@ func getDownloadBackup(c *gin.Context) {
 	}
 
 	// Get the server using the UUID from the token.
-	if _, ok := manager.Get(token.ServerUuid); !ok || token.Denylisted() || !token.IsUniqueRequest() || !token.HasScope(tokens.BackupDownload) {
+	if _, ok := manager.Get(token.ServerUuid); !ok || token.Denylisted() || !token.HasScope(tokens.BackupDownload) {
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
 			"error": "The requested resource was not found on this server.",
 		})
@@ -56,8 +64,8 @@ func getDownloadBackup(c *gin.Context) {
 		return
 	}
 
-	// The use of `os` here is safe as backups are not stored within server
-	// accessible directories.
+	// The use of `os` here is safe as backups are not stored within server directories.
+	// this path is program-controlled, not user input.
 	f, err := os.Open(b.Path())
 	if err != nil {
 		middleware.CaptureAndAbort(c, err)
@@ -65,11 +73,7 @@ func getDownloadBackup(c *gin.Context) {
 	}
 	defer f.Close()
 
-	c.Header("Content-Length", strconv.Itoa(int(st.Size())))
-	c.Header("Content-Disposition", "attachment; filename="+strconv.Quote(st.Name()))
-	c.Header("Content-Type", "application/octet-stream")
-
-	_, _ = bufio.NewReader(f).WriteTo(c.Writer)
+	serveDownload(c, f, st.Name(), st.ModTime())
 }
 
 // Handles downloading a specific file for a server.
@@ -82,7 +86,7 @@ func getDownloadFile(c *gin.Context) {
 	}
 
 	s, ok := manager.Get(token.ServerUuid)
-	if !ok || token.Denylisted() || !token.IsUniqueRequest() || !token.HasScope(tokens.FileDownload) {
+	if !ok || token.Denylisted() || !token.HasScope(tokens.FileDownload) {
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
 			"error": "The requested resource was not found on this server.",
 		})
@@ -107,9 +111,16 @@ func getDownloadFile(c *gin.Context) {
 		return
 	}
 
-	c.Header("Content-Length", strconv.Itoa(int(st.Size())))
-	c.Header("Content-Disposition", "attachment; filename="+strconv.Quote(st.Name()))
+	serveDownload(c, f, st.Name(), st.ModTime())
+}
+
+// serveDownload writes the content of f as a file attachment. Range, If-Range
+// and HEAD requests are handled by http.ServeContent, which allows clients to
+// resume an interrupted download or fetch it over multiple connections.
+func serveDownload(c *gin.Context, f io.ReadSeeker, name string, modTime time.Time) {
+	c.Header("Content-Disposition", "attachment; filename="+strconv.Quote(name))
+	// Set explicitly so ServeContent does not sniff the content type.
 	c.Header("Content-Type", "application/octet-stream")
 
-	_, _ = bufio.NewReader(f).WriteTo(c.Writer)
+	http.ServeContent(c.Writer, c.Request, name, modTime, f)
 }

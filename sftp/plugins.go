@@ -70,7 +70,7 @@ func (h *Handler) observeFileAction(action api.FileAction, path, target string, 
 // whether it is worth keeping, and a failed stat should not stop the operation,
 // so an unknown size is reported as -1 rather than as an error.
 func (h *Handler) sizeOf(path string) (int64, bool) {
-	st, err := h.fs.UnixFS().Stat(path)
+	st, err := h.fs.Stat2(path)
 	if err != nil {
 		return -1, false
 	}

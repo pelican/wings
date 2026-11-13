@@ -24,6 +24,7 @@ const (
 	PermissionFileCreate      = "file.create"
 	PermissionFileUpdate      = "file.update"
 	PermissionFileDelete      = "file.delete"
+	sftpAttributeExtended     = 1 << 31
 )
 
 type Handler struct {
@@ -153,7 +154,7 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 	if !h.can(permission) {
 		return nil, sftp.ErrSSHFxPermissionDenied
 	}
-	f, err := h.fs.Touch(request.Filepath, os.O_RDWR|os.O_TRUNC)
+	f, err := h.fs.Touch(request.Filepath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		l.WithField("flags", request.Flags).WithField("error", err).Error("failed to open existing file on system")
 		return nil, sftp.ErrSSHFxFailure
@@ -169,6 +170,29 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 	return quotaWriterAt{WriterAt: f, server: h.server}, nil
 }
 
+func setstatMode(request *sftp.Request) (os.FileMode, error) {
+	// pkg/sftp allocates the client-provided extended attribute count before
+	// validating the remaining packet length. Reject it before parsing to avoid
+	// allowing a small packet to request an effectively unbounded allocation.
+	if request.Flags&sftpAttributeExtended != 0 {
+		return 0, sftp.ErrSSHFxBadMessage
+	}
+	attrs := request.Attributes()
+	if attrs == nil {
+		return 0, sftp.ErrSSHFxBadMessage
+	}
+	mode := attrs.FileMode().Perm()
+	// If the client passes an invalid FileMode just use the default 0644.
+	if mode == 0o000 {
+		mode = os.FileMode(0o644)
+	}
+	// Force directories to be 0755.
+	if attrs.FileMode().IsDir() {
+		mode = 0o755
+	}
+	return mode, nil
+}
+
 // Filecmd hander for basic SFTP system calls related to files, but not anything to do with reading
 // or writing to those files.
 func (h *Handler) Filecmd(request *sftp.Request) error {
@@ -180,8 +204,25 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		l = l.WithField("target", request.Target)
 	}
 
-	if err := h.fs.IsIgnored(request.Filepath); err != nil {
+	// Enforce the egg file denylist before performing any operation. Without this,
+	// a user with file.update/file.delete could modify, rename, delete or symlink
+	// denylisted files. Renaming and deleting act on the entry itself, so a symlink
+	// at the end of the path is not followed: a link to a denylisted file can still
+	// be removed.
+	check := h.fs.IsIgnored
+	if request.Method == "Rename" || request.Method == "Rmdir" || request.Method == "Remove" {
+		check = h.fs.IsIgnoredNoFollow
+	}
+	if err := check(request.Filepath); err != nil {
 		return err
+	}
+
+	// Also check the target path (Rename/Symlink). Otherwise a file could be renamed
+	// or linked onto a denylisted path, bypassing the Fileread/Filewrite checks.
+	if request.Target != "" {
+		if err := check(request.Target); err != nil {
+			return err
+		}
 	}
 
 	switch request.Method {
@@ -191,14 +232,9 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		if !h.can(PermissionFileUpdate) {
 			return sftp.ErrSSHFxPermissionDenied
 		}
-		mode := request.Attributes().FileMode().Perm()
-		// If the client passes an invalid FileMode just use the default 0644.
-		if mode == 0o000 {
-			mode = os.FileMode(0o644)
-		}
-		// Force directories to be 0755.
-		if request.Attributes().FileMode().IsDir() {
-			mode = 0o755
+		mode, err := setstatMode(request)
+		if err != nil {
+			return err
 		}
 		if handled, err := h.gateFileAction(api.FileChmod, request.Filepath, "", -1, false); err != nil {
 			return err
@@ -343,14 +379,23 @@ func (h *Handler) Filelist(request *sftp.Request) (sftp.ListerAt, error) {
 
 	switch request.Method {
 	case "List":
-		entries, err := h.fs.ReadDirStat(request.Filepath)
+		d, err := h.fs.ReadDir(request.Filepath)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, sftp.ErrSSHFxNoSuchFile
+			}
 			h.logger.WithField("source", request.Filepath).WithField("error", err).Error("error while listing directory")
 			return nil, sftp.ErrSSHFxFailure
 		}
-		return ListerAt(entries), nil
+		files := make([]os.FileInfo, 0, len(d))
+		for _, entry := range d {
+			if i, err := entry.Info(); err == nil {
+				files = append(files, i)
+			}
+		}
+		return ListerAt(files), nil
 	case "Stat":
-		st, err := h.fs.Stat(request.Filepath)
+		st, err := h.fs.Stat2(request.Filepath)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil, sftp.ErrSSHFxNoSuchFile
@@ -358,7 +403,7 @@ func (h *Handler) Filelist(request *sftp.Request) (sftp.ListerAt, error) {
 			h.logger.WithField("source", request.Filepath).WithField("error", err).Error("error performing stat on file")
 			return nil, sftp.ErrSSHFxFailure
 		}
-		return ListerAt([]os.FileInfo{st.FileInfo}), nil
+		return ListerAt([]os.FileInfo{st}), nil
 	default:
 		return nil, sftp.ErrSSHFxOpUnsupported
 	}

@@ -1,12 +1,18 @@
 package tokens
 
 import (
+	"errors"
 	"time"
 
 	"github.com/gbrlsnchs/jwt/v3"
 
 	"github.com/pelican/wings/config"
 )
+
+// ErrInvalidToken is returned by ParseToken when a token is malformed, has an
+// invalid signature or has expired. It wraps the underlying jwt error, so checks
+// such as errors.Is(err, jwt.ErrExpValidation) keep working.
+var ErrInvalidToken = errors.New("tokens: invalid or expired token")
 
 type TokenData interface {
 	GetPayload() *jwt.Payload
@@ -23,7 +29,18 @@ func ParseToken(token []byte, data TokenData) error {
 		jwt.ExpirationTimeValidator(time.Now()),
 	)
 
-	_, err := jwt.Verify(token, config.GetJwtAlgorithm(), &data, verifyOptions)
-
-	return err
+	if _, err := jwt.Verify(token, config.GetJwtAlgorithm(), &data, verifyOptions); err != nil {
+		return invalidTokenError{err: err}
+	}
+	return nil
 }
+
+// invalidTokenError matches both ErrInvalidToken and the underlying jwt error,
+// and keeps the message of the jwt error, which is sent to websocket clients.
+type invalidTokenError struct {
+	err error
+}
+
+func (e invalidTokenError) Error() string { return e.err.Error() }
+
+func (e invalidTokenError) Unwrap() []error { return []error{ErrInvalidToken, e.err} }

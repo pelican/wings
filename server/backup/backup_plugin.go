@@ -117,19 +117,25 @@ func (p *PluginBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem
 	// the backup really lives, so this copy goes away either way.
 	defer p.Remove()
 
-	a := &filesystem.Archive{
-		Filesystem: fsys,
-		Ignore:     ignore,
+	a, err := fsys.NewArchive(".", filesystem.WithIgnored(ignore))
+	if err != nil {
+		return nil, errors.WrapIf(err, "server/backup: failed to create archive")
 	}
 
 	p.log().WithField("path", p.Path()).Info("creating backup for server")
 
-	if _, err := os.Stat(filepath.Dir(p.Path())); os.IsNotExist(err) {
-		if err := os.MkdirAll(filepath.Dir(p.Path()), 0o700); err != nil {
-			return nil, err
-		}
+	if err := os.MkdirAll(filepath.Dir(p.Path()), 0o700); err != nil {
+		return nil, err
 	}
-	if err := a.Create(ctx, p.Path()); err != nil {
+	f, err := os.OpenFile(p.Path(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, errors.Wrap(err, "server/backup: failed to open file for writing")
+	}
+	if err := a.Create(ctx, f); err != nil {
+		_ = f.Close()
+		return nil, err
+	}
+	if err := f.Close(); err != nil {
 		return nil, err
 	}
 
