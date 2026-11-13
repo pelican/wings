@@ -151,6 +151,21 @@ func TestConfigurationFileUnmarshalLegacySemantics(t *testing.T) {
 				t.Errorf("last duplicate key should win, got file=%q value=%q", f.FileName, f.Replace[0].ReplaceWith.String())
 			}
 
+			// A bad value followed by a valid duplicate uses the last value, as
+			// encoding/json v1 did, instead of failing on the first one.
+			f, err = decodeConfigFile(t, name, `{"file":1,"file":"c.yml","parser":42,"parser":"yaml","replace":[{"match":null,"match":"k","if_value":[],"if_value":"v","replace_with":"x"}]}`)
+			if err != nil {
+				t.Fatalf("a valid last duplicate should win over an invalid earlier one: %v", err)
+			}
+			if f.FileName != "c.yml" || f.Parser != Yaml || len(f.Replace) != 1 || f.Replace[0].Match != "k" || f.Replace[0].IfValue != "v" {
+				t.Errorf("got file=%q parser=%q replace=%#v", f.FileName, f.Parser, f.Replace)
+			}
+
+			// An invalid last value is still an error.
+			if _, err := decodeConfigFile(t, name, `{"file":"a.yml","parser":"yaml","parser":42}`); err == nil {
+				t.Error("an invalid last 'parser' should fail")
+			}
+
 			f, err = decodeConfigFile(t, name, "{\"file\":\"caf\xe9.yml\",\"parser\":\"yaml\"}")
 			if err != nil {
 				t.Fatalf("invalid UTF-8 should not fail: %v", err)

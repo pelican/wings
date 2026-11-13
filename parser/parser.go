@@ -206,43 +206,49 @@ func readObject(dec *jsontext.Decoder, fn func(key string) error) error {
 	return err
 }
 
-// readString reads a JSON string or null from dec. Any other type is an error.
-func readString(dec *jsontext.Decoder, key string) (s string, null bool, err error) {
-	tok, err := dec.ReadToken()
-	if err != nil {
-		return "", false, err
-	}
-	switch tok.Kind() {
+// stringField holds the last value seen for a string member. A wrong type is
+// recorded rather than returned straight away, so a later duplicate of the key
+// can still replace it: the last occurrence wins, as with encoding/json v1.
+type stringField struct {
+	s   string
+	set bool // false when the member was missing or null
+	err error
+}
+
+// read consumes one value from dec into f, replacing anything read before.
+func (f *stringField) read(dec *jsontext.Decoder, key string) error {
+	*f = stringField{}
+	switch k := dec.PeekKind(); k {
 	case '"':
-		return tok.String(), false, nil
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		f.s, f.set = tok.String(), true
 	case 'n':
-		return "", true, nil
+		_, err := dec.ReadToken()
+		return err
 	default:
-		return "", false, errors.Errorf("parser: '%s' must be a string, got %s", key, tok.Kind())
+		f.err = errors.Errorf("parser: '%s' must be a string, got %s", key, k)
+		return dec.SkipValue()
 	}
+	return nil
 }
 
 // UnmarshalJSONFrom decodes a configuration file in a single pass. A key whose
 // value is null is treated as missing.
 func (f *ConfigurationFile) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
-	var haveFile, haveParser, haveCreate bool
+	var file, parser stringField
+	var haveCreate bool
 	var replace []ConfigurationFileReplacement
 	var replaceErr, createErr error
 	f.AllowCreateFile = true
 	err := readObject(dec, func(key string) error {
 		switch key {
 		case "file":
-			s, null, err := readString(dec, key)
-			if err != nil {
-				return err
-			}
-			f.FileName, haveFile = s, !null
+			return file.read(dec, key)
 		case "parser":
-			s, null, err := readString(dec, key)
-			if err != nil {
-				return err
-			}
-			f.Parser, haveParser = ConfigurationParser(s), !null
+			return parser.read(dec, key)
 		case "replace":
 			val, err := dec.ReadValue()
 			if err != nil {
@@ -280,12 +286,19 @@ func (f *ConfigurationFile) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		return err
 	}
 
-	if !haveFile {
+	if file.err != nil {
+		return file.err
+	}
+	if !file.set {
 		return errors.New("parser: configuration file missing required 'file' key")
 	}
-	if !haveParser {
+	if parser.err != nil {
+		return parser.err
+	}
+	if !parser.set {
 		return errors.New("parser: configuration file missing required 'parser' key")
 	}
+	f.FileName, f.Parser = file.s, ConfigurationParser(parser.s)
 
 	f.Replace = []ConfigurationFileReplacement{}
 	if replaceErr != nil {
@@ -322,25 +335,15 @@ func (cfr *ConfigurationFileReplacement) UnmarshalJSON(data []byte) error {
 // "replace_with" are required; "if_value" is optional. Eggs that predate
 // "replace_with" use the old "value" key, which is accepted as a fallback.
 func (cfr *ConfigurationFileReplacement) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
-	var haveMatch, haveReplace, haveLegacy bool
+	var match, ifValue stringField
+	var haveReplace, haveLegacy bool
 	var replaceWith, legacyValue ReplaceValue
 	err := readObject(dec, func(key string) error {
 		switch key {
 		case "match":
-			s, null, err := readString(dec, key)
-			if err != nil {
-				return err
-			}
-			if null {
-				return errors.New("parser: replacement 'match' must be a string")
-			}
-			cfr.Match, haveMatch = s, true
+			return match.read(dec, key)
 		case "if_value":
-			s, _, err := readString(dec, key)
-			if err != nil {
-				return err
-			}
-			cfr.IfValue = s
+			return ifValue.read(dec, key)
 		case "replace_with", "value":
 			val, err := dec.ReadValue()
 			if err != nil {
@@ -360,9 +363,17 @@ func (cfr *ConfigurationFileReplacement) UnmarshalJSONFrom(dec *jsontext.Decoder
 		return err
 	}
 
-	if !haveMatch {
+	if match.err != nil {
+		return match.err
+	}
+	if !match.set {
 		return errors.New("parser: replacement missing required 'match' key")
 	}
+	// if_value is optional, and null means it is not set.
+	if ifValue.err != nil {
+		return ifValue.err
+	}
+	cfr.Match, cfr.IfValue = match.s, ifValue.s
 	switch {
 	case haveReplace:
 		cfr.ReplaceWith = replaceWith
