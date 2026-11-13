@@ -12,12 +12,12 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
-	"github.com/buger/jsonparser"
 	"github.com/docker/docker/api/types/container"
 	dockerImage "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/mount"
 	"github.com/docker/docker/api/types/network"
 	"github.com/docker/docker/client"
+	"github.com/goccy/go-json"
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
@@ -453,11 +453,16 @@ func (e *Environment) ensureImageExists(image string) error {
 	scanner := bufio.NewScanner(out)
 
 	for scanner.Scan() {
-		b := scanner.Bytes()
-		status, _ := jsonparser.GetString(b, "status")
-		progress, _ := jsonparser.GetString(b, "progress")
+		// Each line is a JSON progress message from Docker. A line that fails to
+		// decode still publishes whatever fields were read, matching the old
+		// behaviour of ignoring lookup errors.
+		var msg struct {
+			Status   string `json:"status"`
+			Progress string `json:"progress"`
+		}
+		_ = json.Unmarshal(scanner.Bytes(), &msg)
 
-		e.Events().Publish(environment.DockerImagePullStatus, status+" "+progress)
+		e.Events().Publish(environment.DockerImagePullStatus, msg.Status+" "+msg.Progress)
 	}
 
 	if err := scanner.Err(); err != nil {
