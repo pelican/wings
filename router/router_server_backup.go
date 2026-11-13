@@ -67,8 +67,14 @@ func postServerBackup(c *gin.Context) {
 	case backup.S3BackupAdapter:
 		adapter = backup.NewS3(client, backupUuid, s.ID(), data.Ignore)
 	default:
-		middleware.CaptureAndAbort(c, errors.New("router/backups: provided adapter is not valid: "+string(data.Adapter)))
-		return
+		// An adapter Wings does not know may still be one a plugin provides.
+		// Checked after the built-ins so a plugin cannot take over "wings" or
+		// "s3", which the manager also refuses at registration.
+		if !backup.PluginAdapterExists(string(data.Adapter)) {
+			middleware.CaptureAndAbort(c, errors.New("router/backups: provided adapter is not valid: "+string(data.Adapter)))
+			return
+		}
+		adapter = backup.NewPlugin(client, string(data.Adapter), backupUuid, s.ID(), data.Ignore)
 	}
 
 	// Attach the server ID and the request ID to the adapter log context for easier
@@ -102,7 +108,9 @@ func postServerRestoreBackup(c *gin.Context) {
 	logger := middleware.ExtractLogger(c)
 
 	var data struct {
-		Adapter           backup.AdapterType `binding:"required,oneof=wings s3" json:"adapter"`
+		// Validated below rather than with "oneof", because a plugin may
+		// provide adapters whose names are not known at compile time.
+		Adapter           backup.AdapterType `binding:"required" json:"adapter"`
 		TruncateDirectory bool               `json:"truncate_directory"`
 		// A UUID is always required for this endpoint, however the download URL
 		// is only present when the given adapter type is s3.
@@ -113,6 +121,12 @@ func postServerRestoreBackup(c *gin.Context) {
 	}
 	backupUuid, ok := parseBackupUuid(c, c.Param("backup"))
 	if !ok {
+		return
+	}
+	if data.Adapter != backup.LocalBackupAdapter && data.Adapter != backup.S3BackupAdapter && !backup.PluginAdapterExists(string(data.Adapter)) {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "The requested backup adapter is not available on this node.",
+		})
 		return
 	}
 	if data.Adapter == backup.S3BackupAdapter && data.DownloadUrl == "" {
@@ -162,6 +176,27 @@ func postServerRestoreBackup(c *gin.Context) {
 			logger.Info("completed server restoration from local backup")
 			s.SetRestoring(false)
 		}(s, b, logger)
+		hasError = false
+		c.Status(http.StatusAccepted)
+		return
+	}
+
+	// A plugin adapter knows where its own data is, so it restores without a
+	// download URL and without staging the archive on the node.
+	if data.Adapter != backup.S3BackupAdapter {
+		b := backup.NewPlugin(client, string(data.Adapter), backupUuid, s.ID(), "")
+
+		go func(s *server.Server, b backup.BackupInterface, logger *log.Entry) {
+			logger.WithField("adapter", data.Adapter).Info("starting restoration process for server backup using a plugin adapter")
+			if err := s.RestoreBackup(b, nil); err != nil {
+				logger.WithField("error", err).Error("failed to restore backup to server")
+			}
+			s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from backup.")
+			s.Events().Publish(server.BackupRestoreCompletedEvent, "")
+			logger.Info("completed server restoration from backup")
+			s.SetRestoring(false)
+		}(s, b, logger)
+
 		hasError = false
 		c.Status(http.StatusAccepted)
 		return
@@ -230,6 +265,22 @@ func deleteServerBackup(c *gin.Context) {
 	if !ok {
 		return
 	}
+	// The Panel names the adapter when the backup is not a local one, so a
+	// backup a plugin stored is deleted through that plugin rather than being
+	// looked for on this node's disk, where it was never kept.
+	if adapter := c.Query("adapter"); adapter != "" &&
+		adapter != string(backup.LocalBackupAdapter) &&
+		backup.PluginAdapterExists(adapter) {
+
+		b := backup.NewPlugin(middleware.ExtractApiClient(c), adapter, backupUuid, middleware.ExtractServer(c).ID(), "")
+		if err := b.Remove(); err != nil && !errors.Is(err, os.ErrNotExist) {
+			middleware.CaptureAndAbort(c, err)
+			return
+		}
+		c.Status(http.StatusNoContent)
+		return
+	}
+
 	b, _, err := backup.LocateLocal(middleware.ExtractApiClient(c), backupUuid, middleware.ExtractServer(c).ID())
 	if err != nil {
 		// Just return from the function at this point if the backup was not located.

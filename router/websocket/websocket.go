@@ -22,6 +22,8 @@ import (
 	"github.com/pelican/wings/environment"
 	"github.com/pelican/wings/environment/docker"
 	"github.com/pelican/wings/internal/models"
+	"github.com/pelican/wings/plugins"
+	"github.com/pelican/wings/plugins/api"
 	"github.com/pelican/wings/router/tokens"
 	"github.com/pelican/wings/server"
 )
@@ -459,5 +461,71 @@ func (h *Handler) HandleInbound(ctx context.Context, m Message) error {
 		}
 	}
 
+	// Anything Wings does not recognise is offered to plugins, which is how a
+	// plugin's Panel-side UI talks to its Wings side over the socket the user
+	// already has open, instead of needing an endpoint and a second round of
+	// authentication.
+	//
+	// Only unrecognised events get here, so a plugin cannot shadow a built-in
+	// one: the switch above has already returned for every event Wings owns.
+	h.dispatchPluginMessage(m)
+
 	return nil
+}
+
+// dispatchPluginMessage offers an unrecognised websocket event to plugins and
+// sends back whatever they reply with.
+func (h *Handler) dispatchPluginMessage(m Message) {
+	if !plugins.HasWebsocketHooks() {
+		return
+	}
+
+	jwt := h.GetJwt()
+	if jwt == nil {
+		return
+	}
+
+	replies := plugins.WebsocketMessage(api.WebsocketMessage{
+		Server: h.server.PluginSnapshot(),
+		Event:  string(m.Event),
+		Args:   m.Args,
+		User:   jwt.UserUUID,
+		// The permissions the connection was opened with, so a plugin can
+		// apply its own authorization rather than assuming anyone holding a
+		// socket may do anything.
+		Permissions: jwt.Permissions,
+	})
+
+	for _, reply := range replies {
+		out := Message{Event: Event(reply.Event), Args: reply.Args}
+
+		if reply.Broadcast {
+			h.server.Events().Publish(reply.Event, strings.Join(reply.Args, ""))
+			continue
+		}
+
+		if err := h.SendJson(out); err != nil {
+			h.Logger().WithField("error", err).Warn("failed to send a plugin websocket reply")
+		}
+	}
+}
+
+// PluginConnection describes this connection for plugin hooks.
+//
+// The user and their permissions come from the JWT the client sends after the
+// socket opens, so they are empty on a connection that has not authenticated
+// yet. That is reported as it is rather than waited for: a plugin watching
+// connections should see one that never authenticates too.
+func (h *Handler) PluginConnection() api.WebsocketConnection {
+	conn := api.WebsocketConnection{
+		Server: h.server.PluginSnapshot(),
+		IP:     h.ra.IP(),
+	}
+
+	if jwt := h.GetJwt(); jwt != nil {
+		conn.User = jwt.UserUUID
+		conn.Permissions = jwt.Permissions
+	}
+
+	return conn
 }

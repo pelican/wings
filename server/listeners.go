@@ -11,6 +11,8 @@ import (
 	"github.com/apex/log"
 
 	"github.com/pelican/wings/events"
+	"github.com/pelican/wings/plugins"
+	"github.com/pelican/wings/plugins/api"
 	"github.com/pelican/wings/system"
 
 	"github.com/pelican/wings/environment"
@@ -82,6 +84,19 @@ func (s *Server) processConsoleOutputEvent(v []byte) {
 		return
 	}
 
+	// Offer the line to plugins, which may rewrite it or drop it. This runs
+	// after throttling so a plugin is never handed output that nobody was
+	// going to see anyway, and the check is guarded because building the
+	// server snapshot is far more expensive than the check itself. On a node
+	// with no console plugins this is a single atomic load.
+	if plugins.HasConsoleHooks() {
+		line, keep := plugins.ConsoleLine(s.PluginSnapshot(), string(v))
+		if !keep {
+			return
+		}
+		v = []byte(line)
+	}
+
 	s.Sink(system.LogSink).Push(v)
 }
 
@@ -117,6 +132,22 @@ func (s *Server) StartEventListeners() {
 								return
 							}
 							s.resources.UpdateStats(stats.Data)
+
+							// Offer the sample to plugins. Guarded because
+							// this fires for every running server on a fixed
+							// interval, and building the snapshot costs more
+							// than the check.
+							if plugins.HasStatsHooks() {
+								plugins.Stats(s.PluginSnapshot(), api.Stats{
+									MemoryBytes:      stats.Data.Memory,
+									MemoryLimitBytes: stats.Data.MemoryLimit,
+									CPUPercent:       stats.Data.CpuAbsolute,
+									DiskBytes:        s.Proc().Disk,
+									NetworkRxBytes:   stats.Data.Network.RxBytes,
+									NetworkTxBytes:   stats.Data.Network.TxBytes,
+									UptimeMillis:     stats.Data.Uptime,
+								})
+							}
 							// If there is no disk space available at this point, trigger the server
 							// disk limiter logic which will start to stop the running instance.
 							if !s.Filesystem().HasSpaceAvailable(true) {
@@ -234,7 +265,6 @@ func (s *Server) onConsoleOutput(data []byte) {
 			}
 		}
 	}
-
 
 	// If the command sent to the server is one that should stop the server we will need to
 	// set the server to be in a stopping state, otherwise crash detection will kick in and

@@ -10,6 +10,8 @@ import (
 	"github.com/google/uuid"
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
+	"github.com/pelican/wings/plugins"
+	"github.com/pelican/wings/plugins/api"
 	"github.com/pelican/wings/server/filesystem/quotas"
 )
 
@@ -147,6 +149,18 @@ func (s *Server) HandlePowerAction(action PowerAction, waitSeconds ...int) error
 		} else {
 			log.Warn("failed to acquire exclusive lock, ignoring failure for termination event")
 		}
+	}
+
+	// Ask plugins before doing anything. This sits after the lock so a plugin
+	// sees one request per action rather than one per racing caller, and
+	// before the switch so a refusal costs nothing but the hook call.
+	//
+	// A plugin refusing a kill is allowed but rarely right, since a kill is
+	// what an operator reaches for when a server is already stuck. The
+	// decision is left to the plugin rather than special-cased here.
+	if allow, reason := plugins.GatePowerAction(s.PluginSnapshot(), api.PowerAction(action)); !allow {
+		s.PublishConsoleOutputFromDaemon(reason)
+		return errors.New(reason)
 	}
 
 	switch action {

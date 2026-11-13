@@ -9,6 +9,7 @@ import (
 	"emperror.dev/errors"
 	"github.com/gin-gonic/gin"
 	ws "github.com/gorilla/websocket"
+	"github.com/pelican/wings/plugins"
 	"github.com/pelican/wings/router/middleware"
 	"github.com/pelican/wings/router/websocket"
 	"github.com/pelican/wings/server"
@@ -67,6 +68,19 @@ func getServerWebsocket(c *gin.Context) {
 	s.Websockets().Push(handler.Uuid(), &cancel)
 	handler.Logger().Debug("opening connection to server websocket")
 	defer s.Websockets().Remove(handler.Uuid())
+
+	// Tell plugins somebody is watching this server's console, and that they
+	// have stopped. The pair is what a plugin needs to show who is connected
+	// or to audit console access.
+	//
+	// The connection is reported before authentication finishes, so the user
+	// is only known once the client sends its token; a plugin sees whatever
+	// the handler knows at each point rather than a guess.
+	if plugins.HasWebsocketLifecycleHooks() {
+		conn := handler.PluginConnection()
+		plugins.WebsocketOpened(conn)
+		defer func() { plugins.WebsocketClosed(handler.PluginConnection()) }()
+	}
 
 	go func() {
 		select {

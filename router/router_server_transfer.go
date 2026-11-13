@@ -10,6 +10,8 @@ import (
 	"github.com/gin-gonic/gin"
 
 	"github.com/pelican/wings/environment"
+	"github.com/pelican/wings/plugins"
+	"github.com/pelican/wings/plugins/api"
 	"github.com/pelican/wings/router/middleware"
 	"github.com/pelican/wings/server"
 	"github.com/pelican/wings/server/installer"
@@ -42,6 +44,17 @@ func postServerTransfer(c *gin.Context) {
 		})
 		return
 	}
+
+	// Ask plugins before the transfer starts. Once it is under way the server
+	// is being copied to another node and deleted here, which is not something
+	// a plugin can be allowed to interrupt halfway.
+	snapshot := s.PluginSnapshot()
+	if allow, reason := plugins.GateServerTransfer(snapshot); !allow {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": reason})
+		return
+	}
+
+	plugins.Lifecycle(api.Lifecycle{Server: snapshot, Event: api.ServerTransferStarted})
 
 	manager := middleware.ExtractManager(c)
 

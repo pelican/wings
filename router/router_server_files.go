@@ -21,6 +21,7 @@ import (
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/internal/models"
+	"github.com/pelican/wings/plugins/api"
 	"github.com/pelican/wings/router/downloader"
 	"github.com/pelican/wings/router/middleware"
 	"github.com/pelican/wings/router/tokens"
@@ -155,6 +156,13 @@ func putServerRenameFiles(c *gin.Context) {
 				if err := fs.IsIgnoredNoFollow(pf, pt); err != nil {
 					return err
 				}
+				handled, err := fileGate(c, s, api.FileRename, pf, pt, -1, false)
+				if err != nil {
+					return err
+				}
+				if handled {
+					return nil
+				}
 				if err := fs.Rename(pf, pt); err != nil {
 					// Return nil if the error is an is not exists.
 					// NOTE: os.IsNotExist() does not work if the error is wrapped.
@@ -243,7 +251,24 @@ func postServerDeleteFiles(c *gin.Context) {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
-				return s.Filesystem().SafeDeleteRecursively(pi)
+				// Offer each path to plugins on its own, so a recycle bin can
+				// keep some of a selection and let the rest be destroyed,
+				// which is what a mixed selection spanning the bin needs.
+				size, directory := statForGate(s, pi)
+
+				handled, err := fileGate(c, s, api.FileDelete, pi, "", size, directory)
+				if err != nil {
+					return err
+				}
+				if handled {
+					return nil
+				}
+
+				if err := s.Filesystem().SafeDeleteRecursively(pi); err != nil {
+					return err
+				}
+				fileObserved(c, s, api.FileDelete, pi, "", directory)
+				return nil
 			}
 		})
 	}
