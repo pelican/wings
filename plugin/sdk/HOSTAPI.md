@@ -90,7 +90,7 @@ Method name = `host.<grantKey>`. `M` = mutating, `S` = streaming.
 | `server.command` | ✓ | | `environment.SendCommand` | arbitrary console stdin = in-game command exec. audit; allowlist for untrusted |
 | `server.console.tail` | | | `Server.ReadLogfile` | last N lines. output may contain secrets |
 | `server.console.stream` | | ✓ | `listeners.processConsoleOutputEvent` → LogSink | high-volume; honor console throttle + backpressure |
-| `server.state` / `.subscribe` | | ·/✓ | `IsRunning`/`Environment.State`, `OnStateChange` | already fanned to sinks as `server.state` |
+| `server.state` / `.subscribe` | | ·/✓ | `IsRunning`/`Environment.State`, `OnStateChange` | already fanned to listeners as `server.state` |
 | `server.stats` / `.subscribe` | | ·/✓ | `resources.go:Proc` / `StatsEvent` | resource sample; rate-limit polling |
 | `server.status` | | | `IsInstalling/IsTransferring/IsRestoring/IsSuspended/...` | lifecycle predicate aggregate; safe |
 | `server.install` | ✓ | (✓) | `install.go:Install` | runs egg install script in privileged container over the volume |
@@ -141,7 +141,7 @@ BackupProvider refactor (M4) — this domain lands with M4, not before.
 | `env.stats` | | | `Proc`→`environment.Stats` | safe once scoped |
 | `env.inspect` | | | `ContainerInspect` | **project** `{id,running,startedAt,exitCode,oomKilled,image}` — never raw |
 | `env.readLog` | | | `Readlog` | may leak secrets; cap lines |
-| `events.subscribe` | | ✓ | `EventSink`/`Registry.Emit` | **add per-server filter** (node-wide today) |
+| `events.subscribe` | | ✓ | `EventListener`/`Registry.Emit` | **add per-server filter** (node-wide today) |
 | `events.publish` | ✓ | | `Bus.Publish` | always published on the `plugin` topic with `{topic, data}` as the payload, so a plugin cannot use a Wings topic; websocket clients receive a `plugin` event |
 | `activity.log` | ✓ | | `SaveActivity` | force server scope; namespace key; never touch `remote.Client` |
 | `env.updateLimits` | ✓ | | `InSituUpdate` | read limits from server config, **not** plugin |

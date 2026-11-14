@@ -20,10 +20,10 @@ PLUGIN SYSTEM  — the machinery (this package)
   ├─ transports        native (in-proc) | external subprocess   external/, jsonrpc/
   ├─ config/manifests  which plugins are on, what they may do    config policy + manifest.go
   ├─ HostAPI           what a plugin may ask Wings to do          host.go + cmd/pluginhost*.go
-  └─ hooks             Register{EventSink,Routes,Task}            events.go, route.go, task.go
+  └─ hooks             Register{EventListener,Routes,Task}            events.go, route.go, task.go
 
 CAPABILITIES  — what plugins actually DO (ride on the machinery)
-  ├─ EventSink      subscribe to server lifecycle events (state, stats, install)
+  ├─ EventListener      subscribe to server lifecycle events (state, stats, install)
   └─ ...            new capabilities are a Go interface + a constant; nothing
                     else in the machinery changes
 ```
@@ -37,8 +37,8 @@ every capability.
 | path | what |
 |------|------|
 | `plugin/capability.go` | the `Capability` type |
-| `plugin/registry.go` | the registry: `RegisterEventSink`, `Emit`, enable policy |
-| `plugin/events.go` | `EventSink` contract + `Event` (the event/stream bus) |
+| `plugin/registry.go` | the registry: `RegisterEventListener`, `Emit`, enable policy |
+| `plugin/events.go` | `EventListener` contract + `Event` (the event/stream bus) |
 | `plugin/host.go` | `HostAPI` + `HostHandler` (deny-by-default host callbacks) + grants |
 | `plugin/manifest.go` | external plugin `plugin.yaml` discovery (read, never executed) |
 | `plugin/route.go` | `RegisterRoutes` — add HTTP endpoints |
@@ -66,11 +66,11 @@ Both satisfy the *same* contract; the rest of Wings can't tell them apart.
 
 Every native extension is `init()` → `Register…()` → Wings mounts it at startup.
 
-### 1. Event sinks
+### 1. Event listeners
 
 ```go
 func init() {
-    plugin.RegisterEventSink(auditLog{})
+    plugin.RegisterEventListener(auditLog{})
 }
 // auditLog implements: Name() string; Events() []string; OnEvent(ctx, plugin.Event) error
 ```
@@ -115,14 +115,14 @@ container state change
   ▼  server/listeners.go       (s.OnStateChange as before)
 plugin.Emit({type: "server.state", server, data})     registry.go
   │
-  ▼  registry: every enabled sink subscribed to "server.state"
-EventSink ─► native sink        (in-process, own goroutine)
+  ▼  registry: every enabled listener subscribed to "server.state"
+EventListener ─► native listener        (in-process, own goroutine)
           ─► external plugin    (JSON-RPC "event" notification over stdio)
 ```
 
 Delivery is asynchronous and best-effort: a slow or failing plugin never stalls
-the listener that produced the event. Each sink has a queue of 256 events,
-delivered in order; a sink that falls further behind loses events instead of
+the listener that produced the event. Each listener has a queue of 256 events,
+delivered in order; a listener that falls further behind loses events instead of
 making Wings hold them.
 
 ## Configuration

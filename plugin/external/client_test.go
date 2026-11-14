@@ -7,7 +7,7 @@ import (
 	"github.com/pelican/wings/plugin"
 )
 
-func TestEventSinkScopeComesFromManifest(t *testing.T) {
+func TestEventListenerScopeComesFromManifest(t *testing.T) {
 	c := NewClient(plugin.Manifest{
 		Name:       "audit",
 		Capability: plugin.CapabilityEvents,
@@ -16,7 +16,7 @@ func TestEventSinkScopeComesFromManifest(t *testing.T) {
 		},
 	}, nil)
 
-	s := c.EventSink()
+	s := c.EventListener()
 	if s.Name() != "audit" {
 		t.Fatalf("name = %q, want manifest name", s.Name())
 	}
@@ -26,9 +26,9 @@ func TestEventSinkScopeComesFromManifest(t *testing.T) {
 	}
 }
 
-func TestEventSinkDefaultsToAllEvents(t *testing.T) {
+func TestEventListenerDefaultsToAllEvents(t *testing.T) {
 	c := NewClient(plugin.Manifest{Name: "audit", Capability: plugin.CapabilityEvents}, nil)
-	got := c.EventSink().Events()
+	got := c.EventListener().Events()
 	if len(got) != 1 || got[0] != "*" {
 		t.Fatalf("events = %v, want [*] when the manifest names none", got)
 	}

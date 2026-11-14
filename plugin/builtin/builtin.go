@@ -1,6 +1,6 @@
 // Package builtin is the one place native (compiled-in) plugins are linked into
 // Wings. Each native plugin is an ordinary Go package that registers itself
-// from init() via plugin.RegisterEventSink, plugin.RegisterRoutes or
+// from init() via plugin.RegisterEventListener, plugin.RegisterRoutes or
 // plugin.RegisterTask; importing it here with the blank identifier is all it
 // takes to ship it.
 //

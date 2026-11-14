@@ -125,7 +125,7 @@ func (s *Server) StartEventListeners() {
 							}
 							s.Events().Publish(StatsEvent, s.Proc())
 							// Mirror the sample onto the plugin event bus for any
-							// subscribed event-sink plugins (streaming).
+							// subscribed event-listener plugins (streaming).
 							u := s.Proc()
 							plugin.Emit(plugin.Event{
 								Type:   "server.stats",
@@ -148,7 +148,7 @@ func (s *Server) StartEventListeners() {
 								s.Throttler().Reset()
 							}
 							s.OnStateChange()
-							// Fan the state change out to any subscribed event-sink
+							// Fan the state change out to any subscribed event-listener
 							// plugins. Delivery is asynchronous and best-effort so a
 							// plugin cannot stall this listener.
 							plugin.Emit(plugin.Event{

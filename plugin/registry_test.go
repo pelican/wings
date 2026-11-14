@@ -9,14 +9,14 @@ import (
 	"github.com/pelican/wings/config"
 )
 
-type snapshotSink struct {
+type snapshotListener struct {
 	name   string
 	events []string
 }
 
-func (f snapshotSink) Name() string                         { return f.name }
-func (f snapshotSink) Events() []string                     { return f.events }
-func (f snapshotSink) OnEvent(context.Context, Event) error { return nil }
+func (f snapshotListener) Name() string                         { return f.name }
+func (f snapshotListener) Events() []string                     { return f.events }
+func (f snapshotListener) OnEvent(context.Context, Event) error { return nil }
 
 // setConfig installs a fresh global configuration for a test and returns it for
 // further mutation via config.Set.
@@ -33,14 +33,14 @@ func setConfig(t *testing.T) *config.Configuration {
 	return c
 }
 
-func TestRegistrySnapshotListsSinks(t *testing.T) {
+func TestRegistrySnapshotListsListeners(t *testing.T) {
 	setConfig(t)
 
 	r := NewRegistry()
-	r.RegisterEventSink(snapshotSink{name: "a", events: []string{"*"}})
-	r.RegisterEventSink(snapshotSink{name: "b", events: []string{"server.state"}})
+	r.RegisterEventListener(snapshotListener{name: "a", events: []string{"*"}})
+	r.RegisterEventListener(snapshotListener{name: "b", events: []string{"server.state"}})
 	// A duplicate name overwrites, so a built-in can be shadowed on purpose.
-	r.RegisterEventSink(snapshotSink{name: "a", events: []string{"server.install"}})
+	r.RegisterEventListener(snapshotListener{name: "a", events: []string{"server.install"}})
 
 	got := map[string][]string{}
 	for _, s := range r.snapshot() {
@@ -76,31 +76,31 @@ func TestProviderEnabledAutoloadOff(t *testing.T) {
 	}
 }
 
-// blockingSink never returns from OnEvent until release is closed.
-type blockingSink struct {
+// blockingListener never returns from OnEvent until release is closed.
+type blockingListener struct {
 	name    string
 	release chan struct{}
 	got     chan Event
 }
 
-func (b blockingSink) Name() string     { return b.name }
-func (b blockingSink) Events() []string { return []string{"*"} }
-func (b blockingSink) OnEvent(_ context.Context, e Event) error {
+func (b blockingListener) Name() string     { return b.name }
+func (b blockingListener) Events() []string { return []string{"*"} }
+func (b blockingListener) OnEvent(_ context.Context, e Event) error {
 	b.got <- e
 	<-b.release
 	return nil
 }
 
-func TestEmitStaysBoundedWhenASinkIsStuck(t *testing.T) {
+func TestEmitStaysBoundedWhenAListenerIsStuck(t *testing.T) {
 	setConfig(t)
-	prev := sinkQueueSize
-	sinkQueueSize = 8
-	t.Cleanup(func() { sinkQueueSize = prev })
+	prev := listenerQueueSize
+	listenerQueueSize = 8
+	t.Cleanup(func() { listenerQueueSize = prev })
 
 	r := NewRegistry()
-	stuck := blockingSink{name: "stuck", release: make(chan struct{}), got: make(chan Event, 1)}
+	stuck := blockingListener{name: "stuck", release: make(chan struct{}), got: make(chan Event, 1)}
 	defer close(stuck.release)
-	r.RegisterEventSink(stuck)
+	r.RegisterEventListener(stuck)
 
 	before := runtime.NumGoroutine()
 	start := time.Now()
@@ -108,18 +108,18 @@ func TestEmitStaysBoundedWhenASinkIsStuck(t *testing.T) {
 		r.Emit(Event{Type: "server.stats", Server: "abc"})
 	}
 	if d := time.Since(start); d > 2*time.Second {
-		t.Fatalf("Emit blocked on a stuck sink for %v", d)
+		t.Fatalf("Emit blocked on a stuck listener for %v", d)
 	}
 	if grew := runtime.NumGoroutine() - before; grew > 5 {
-		t.Fatalf("emitting to a stuck sink started %d goroutines", grew)
+		t.Fatalf("emitting to a stuck listener started %d goroutines", grew)
 	}
 }
 
-type orderSink struct{ got chan string }
+type orderListener struct{ got chan string }
 
-func (o orderSink) Name() string     { return "order" }
-func (o orderSink) Events() []string { return []string{"*"} }
-func (o orderSink) OnEvent(_ context.Context, e Event) error {
+func (o orderListener) Name() string     { return "order" }
+func (o orderListener) Events() []string { return []string{"*"} }
+func (o orderListener) OnEvent(_ context.Context, e Event) error {
 	if e.Type == "panic" {
 		panic("boom")
 	}
@@ -127,11 +127,11 @@ func (o orderSink) OnEvent(_ context.Context, e Event) error {
 	return nil
 }
 
-func TestSinkGetsEventsInOrderAndSurvivesAPanic(t *testing.T) {
+func TestListenerGetsEventsInOrderAndSurvivesAPanic(t *testing.T) {
 	setConfig(t)
 	r := NewRegistry()
-	s := orderSink{got: make(chan string, 4)}
-	r.RegisterEventSink(s)
+	s := orderListener{got: make(chan string, 4)}
+	r.RegisterEventListener(s)
 
 	for _, typ := range []string{"a", "panic", "b", "c"} {
 		r.Emit(Event{Type: typ})
@@ -143,7 +143,7 @@ func TestSinkGetsEventsInOrderAndSurvivesAPanic(t *testing.T) {
 				t.Fatalf("got %q, want %q", got, want)
 			}
 		case <-time.After(2 * time.Second):
-			t.Fatalf("event %q never arrived; a panicking event should not stop the sink", want)
+			t.Fatalf("event %q never arrived; a panicking event should not stop the listener", want)
 		}
 	}
 }

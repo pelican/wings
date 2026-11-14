@@ -14,26 +14,26 @@ import (
 	"github.com/pelican/wings/plugin/jsonrpc"
 )
 
-// ServeEventSink runs an events-capability plugin, blocking until the host
+// ServeEventListener runs an events-capability plugin, blocking until the host
 // closes stdin. Each "event" notification from Wings is passed to s.OnEvent;
 // an error returned from OnEvent is written to stderr, which Wings logs.
-func ServeEventSink(s plugin.EventSink) error {
-	return serveEventSink(os.Stdin, os.Stdout, os.Stderr, s)
+func ServeEventListener(s plugin.EventListener) error {
+	return serveEventListener(os.Stdin, os.Stdout, os.Stderr, s)
 }
 
-func serveEventSink(r io.Reader, w io.Writer, errw io.Writer, s plugin.EventSink) error {
-	h := eventSinkHandler{s: s, errw: errw}
+func serveEventListener(r io.Reader, w io.Writer, errw io.Writer, s plugin.EventListener) error {
+	h := eventListenerHandler{s: s, errw: errw}
 	conn := jsonrpc.NewConn(r, w, h.handle, nil)
 	<-conn.Done()
 	return nil
 }
 
-type eventSinkHandler struct {
-	s    plugin.EventSink
+type eventListenerHandler struct {
+	s    plugin.EventListener
 	errw io.Writer
 }
 
-func (h eventSinkHandler) handle(ctx context.Context, method string, params json.RawMessage) (any, error) {
+func (h eventListenerHandler) handle(ctx context.Context, method string, params json.RawMessage) (any, error) {
 	switch method {
 	case "initialize":
 		return map[string]any{

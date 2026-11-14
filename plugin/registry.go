@@ -12,50 +12,50 @@ import (
 
 // Registry holds the set of registered capability providers. It is safe for
 // concurrent use. A process-wide default registry is available via the package
-// level helpers (RegisterEventSink, Emit).
+// level helpers (RegisterEventListener, Emit).
 type Registry struct {
-	mu    sync.RWMutex
-	sinks map[string]*sinkWorker // keyed by provider name
+	mu        sync.RWMutex
+	listeners map[string]*listenerWorker // keyed by provider name
 }
 
-// sinkQueueSize bounds the events waiting for one sink. A sink that falls this
+// listenerQueueSize bounds the events waiting for one listener. A listener that falls this
 // far behind loses events rather than holding memory and goroutines without
 // limit. A variable so tests can lower it.
-var sinkQueueSize = 256
+var listenerQueueSize = 256
 
-// sinkWorker delivers events to one sink, in order, from its own goroutine.
-type sinkWorker struct {
-	sink    EventSink
-	queue   chan Event
-	dropped atomic.Uint64
+// listenerWorker delivers events to one listener, in order, from its own goroutine.
+type listenerWorker struct {
+	listener EventListener
+	queue    chan Event
+	dropped  atomic.Uint64
 }
 
-func newSinkWorker(s EventSink) *sinkWorker {
-	w := &sinkWorker{sink: s, queue: make(chan Event, sinkQueueSize)}
+func newListenerWorker(s EventListener) *listenerWorker {
+	w := &listenerWorker{listener: s, queue: make(chan Event, listenerQueueSize)}
 	go w.run()
 	return w
 }
 
-func (w *sinkWorker) run() {
+func (w *listenerWorker) run() {
 	for e := range w.queue {
 		w.deliver(e)
 	}
 }
 
-func (w *sinkWorker) deliver(e Event) {
-	l := log.WithField("plugin", w.sink.Name()).WithField("event", e.Type)
+func (w *listenerWorker) deliver(e Event) {
+	l := log.WithField("plugin", w.listener.Name()).WithField("event", e.Type)
 	defer func() {
 		if p := recover(); p != nil {
-			l.WithField("panic", p).Error("plugin event sink panicked")
+			l.WithField("panic", p).Error("plugin event listener panicked")
 		}
 	}()
-	if err := w.sink.OnEvent(context.Background(), e); err != nil {
-		l.WithError(err).Warn("plugin event sink returned an error")
+	if err := w.listener.OnEvent(context.Background(), e); err != nil {
+		l.WithError(err).Warn("plugin event listener returned an error")
 	}
 }
 
 // offer queues e without blocking and reports whether it was accepted.
-func (w *sinkWorker) offer(e Event) bool {
+func (w *listenerWorker) offer(e Event) bool {
 	select {
 	case w.queue <- e:
 		return true
@@ -63,8 +63,8 @@ func (w *sinkWorker) offer(e Event) bool {
 		// Log the first drop and then every 1000th, so a stuck plugin on a
 		// busy node does not flood the log.
 		if n := w.dropped.Add(1); n == 1 || n%1000 == 0 {
-			log.WithField("plugin", w.sink.Name()).WithField("dropped", n).
-				Warn("plugin event sink is not keeping up; dropping events")
+			log.WithField("plugin", w.listener.Name()).WithField("dropped", n).
+				Warn("plugin event listener is not keeping up; dropping events")
 		}
 		return false
 	}
@@ -73,7 +73,7 @@ func (w *sinkWorker) offer(e Event) bool {
 // NewRegistry returns an empty registry.
 func NewRegistry() *Registry {
 	return &Registry{
-		sinks: make(map[string]*sinkWorker),
+		listeners: make(map[string]*listenerWorker),
 	}
 }
 
@@ -82,44 +82,44 @@ var defaultRegistry = NewRegistry()
 // Default returns the process-wide registry.
 func Default() *Registry { return defaultRegistry }
 
-// RegisterEventSink adds an event sink to the default registry.
-func RegisterEventSink(s EventSink) { defaultRegistry.RegisterEventSink(s) }
+// RegisterEventListener adds an event listener to the default registry.
+func RegisterEventListener(s EventListener) { defaultRegistry.RegisterEventListener(s) }
 
-// RegisterEventSink adds an event sink to this registry. A sink registered
+// RegisterEventListener adds an event listener to this registry. A listener registered
 // under an existing name replaces it; the old one finishes what it has queued.
-func (r *Registry) RegisterEventSink(s EventSink) {
+func (r *Registry) RegisterEventListener(s EventListener) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if old, ok := r.sinks[s.Name()]; ok {
+	if old, ok := r.listeners[s.Name()]; ok {
 		close(old.queue)
 	}
-	r.sinks[s.Name()] = newSinkWorker(s)
+	r.listeners[s.Name()] = newListenerWorker(s)
 }
 
-func (r *Registry) eventSinks() []EventSink {
+func (r *Registry) eventListeners() []EventListener {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	out := make([]EventSink, 0, len(r.sinks))
-	for _, w := range r.sinks {
-		out = append(out, w.sink)
+	out := make([]EventListener, 0, len(r.listeners))
+	for _, w := range r.listeners {
+		out = append(out, w.listener)
 	}
 	return out
 }
 
-// Emit delivers e to every enabled event sink whose subscription matches, on the
+// Emit delivers e to every enabled event listener whose subscription matches, on the
 // default registry.
 func Emit(e Event) { defaultRegistry.Emit(e) }
 
-// Emit queues e for each matching, enabled sink and returns without waiting.
-// Each sink receives events in order on its own goroutine; a sink error or
-// panic is logged and affects no other sink. A sink whose queue is full drops
+// Emit queues e for each matching, enabled listener and returns without waiting.
+// Each listener receives events in order on its own goroutine; a listener error or
+// panic is logged and affects no other listener. A listener whose queue is full drops
 // the event, so a slow or stuck plugin cannot stall the listener that produced
 // it or make Wings hold an unbounded backlog.
 func (r *Registry) Emit(e Event) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	for _, w := range r.sinks {
-		if !providerEnabled(w.sink.Name()) || !e.matches(w.sink.Events()) {
+	for _, w := range r.listeners {
+		if !providerEnabled(w.listener.Name()) || !e.matches(w.listener.Events()) {
 			continue
 		}
 		w.offer(e)
@@ -161,6 +161,6 @@ func enableState(name string) (bool, string) {
 	return false, "autoload off"
 }
 
-// snapshot returns the registered event sinks as a slice for read-only
+// snapshot returns the registered event listeners as a slice for read-only
 // inspection.
-func (r *Registry) snapshot() []EventSink { return r.eventSinks() }
+func (r *Registry) snapshot() []EventListener { return r.eventListeners() }

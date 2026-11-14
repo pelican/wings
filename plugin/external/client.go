@@ -108,9 +108,9 @@ func (c *Client) ensureSession(ctx context.Context) (*jsonrpc.Conn, error) {
 	return conn, nil
 }
 
-// EventSink returns a plugin.EventSink backed by this client. Events are
+// EventListener returns a plugin.EventListener backed by this client. Events are
 // delivered to the plugin as JSON-RPC notifications.
-func (c *Client) EventSink() plugin.EventSink { return eventSink{c} }
+func (c *Client) EventListener() plugin.EventListener { return eventListener{c} }
 
 func (c *Client) emit(ctx context.Context, e plugin.Event) error {
 	conn, err := c.ensureSession(ctx)
@@ -120,13 +120,13 @@ func (c *Client) emit(ctx context.Context, e plugin.Event) error {
 	return conn.Notify("event", e)
 }
 
-type eventSink struct{ c *Client }
+type eventListener struct{ c *Client }
 
-func (s eventSink) Name() string { return s.c.manifest.Name }
-func (s eventSink) Events() []string {
+func (s eventListener) Name() string { return s.c.manifest.Name }
+func (s eventListener) Events() []string {
 	return plugin.EffectiveEvents(s.c.manifest)
 }
-func (s eventSink) OnEvent(ctx context.Context, e plugin.Event) error { return s.c.emit(ctx, e) }
+func (s eventListener) OnEvent(ctx context.Context, e plugin.Event) error { return s.c.emit(ctx, e) }
 
 type processCloser struct{ cmd *exec.Cmd }
 
@@ -204,7 +204,7 @@ func LoadEnabled(dir string, api plugin.HostAPI) error {
 		client := NewClient(m, handler)
 		switch m.Capability {
 		case plugin.CapabilityEvents:
-			plugin.RegisterEventSink(client.EventSink())
+			plugin.RegisterEventListener(client.EventListener())
 		default:
 			log.WithField("plugin", m.Name).
 				WithField("capability", string(m.Capability)).

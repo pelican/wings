@@ -58,7 +58,7 @@ Config splits by ownership:
 }
 ```
 
-The Go SDK (`sdk.ServeEventSink`) answers `initialize` and dispatches `event`
+The Go SDK (`sdk.ServeEventListener`) answers `initialize` and dispatches `event`
 notifications for you; any other language implements the two messages directly
 (see `examples/plugins/state-log`).
 

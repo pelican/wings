@@ -11,25 +11,25 @@ import (
 	"github.com/pelican/wings/plugin"
 )
 
-type recordingSink struct{ got chan plugin.Event }
+type recordingListener struct{ got chan plugin.Event }
 
-func (recordingSink) Name() string     { return "audit" }
-func (recordingSink) Events() []string { return []string{"server.state"} }
-func (s recordingSink) OnEvent(_ context.Context, e plugin.Event) error {
+func (recordingListener) Name() string     { return "audit" }
+func (recordingListener) Events() []string { return []string{"server.state"} }
+func (s recordingListener) OnEvent(_ context.Context, e plugin.Event) error {
 	s.got <- e
 	return nil
 }
 
-// TestServeEventSinkSpeaksTheWireProtocol drives the SDK the way Wings does:
+// TestServeEventListenerSpeaksTheWireProtocol drives the SDK the way Wings does:
 // an initialize request, then an "event" notification, then stdin closes.
-func TestServeEventSinkSpeaksTheWireProtocol(t *testing.T) {
+func TestServeEventListenerSpeaksTheWireProtocol(t *testing.T) {
 	inR, inW := io.Pipe()
 	outR, outW := io.Pipe()
-	sink := recordingSink{got: make(chan plugin.Event, 1)}
+	listener := recordingListener{got: make(chan plugin.Event, 1)}
 
 	done := make(chan struct{})
 	go func() {
-		_ = serveEventSink(inR, outW, io.Discard, sink)
+		_ = serveEventListener(inR, outW, io.Discard, listener)
 		close(done)
 	}()
 
@@ -65,18 +65,18 @@ func TestServeEventSinkSpeaksTheWireProtocol(t *testing.T) {
 
 	write(`{"jsonrpc":"2.0","method":"event","params":{"type":"server.state","server":"abc","data":{"state":"running"}}}`)
 	select {
-	case e := <-sink.got:
+	case e := <-listener.got:
 		if e.Type != "server.state" || e.Server != "abc" || e.Data["state"] != "running" {
 			t.Fatalf("unexpected event: %+v", e)
 		}
 	case <-time.After(2 * time.Second):
-		t.Fatal("event notification was not delivered to the sink")
+		t.Fatal("event notification was not delivered to the listener")
 	}
 
 	_ = inW.Close()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("ServeEventSink did not return after stdin closed")
+		t.Fatal("ServeEventListener did not return after stdin closed")
 	}
 }

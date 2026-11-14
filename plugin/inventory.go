@@ -57,7 +57,7 @@ func Inventory() ([]ProviderInfo, error) {
 		})
 	}
 
-	// Native plugins that only add routes or tasks are not event sinks, so
+	// Native plugins that only add routes or tasks are not event listeners, so
 	// list them from those registries too, once per plugin name.
 	listed := make(map[string]bool, len(out))
 	for _, p := range out {

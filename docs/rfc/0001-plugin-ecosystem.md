@@ -27,13 +27,13 @@ without core surgery, and a fork's own features live in its own packages.
 
 ### One contract, many transports
 
-A **capability** is a typed Go interface (`EventSink` today, later
+A **capability** is a typed Go interface (`EventListener` today, later
 `BackupProvider`). Providers register against a capability; the host dispatches
 to the enabled providers for it. The caller never knows whether the provider is
 native or external.
 
 ```
-router / server ──► plugin.Registry ──► EventSink
+router / server ──► plugin.Registry ──► EventListener
                                          ├─ native   (in-proc Go)
                                          └─ external  (subprocess, JSON-RPC/stdio)
 ```
@@ -88,7 +88,7 @@ notifications (`event`, later `progress`) share the connection.
 | **M1** | contract, registry, manifest discovery, policy config | **Done** |
 | **M1.5** | `wings plugins list/get/enable/disable/doctor`, `Disabled` blocklist policy | **Done** |
 | **M2** | `plugin/jsonrpc` bidirectional transport, `plugin/external` lazy-spawn supervisor, `plugin/sdk` + SPEC, Bun/TS reference plugin | **Done** |
-| **M3** | `EventSink` capability + `plugin.Emit` (wired to server state, stats and install), `HostAPI` + grant-gated host callbacks, native `RegisterRoutes` / `RegisterTask` | **Done** |
+| **M3** | `EventListener` capability + `plugin.Emit` (wired to server state, stats and install), `HostAPI` + grant-gated host callbacks, native `RegisterRoutes` / `RegisterTask` | **Done** |
 | **M4** | `BackupProvider` contract + **restic** provider (bundled binary, `exec --json`); requires Panel snapshot-chain model | **Deferred** |
 | **M5** | content-bound trust, archive signing, registry install, updater | **Done** |
 | **M6** | per-plugin server scoping of host calls and events, subprocess sandboxing (unprivileged uid, seccomp/namespaces), WASM transport | Next |

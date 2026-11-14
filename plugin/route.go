@@ -41,7 +41,7 @@ func (r Route) Plugin() string { return r.plugin }
 var routes []Route
 
 // RegisterRoutes adds native HTTP routes for a plugin. Call it from a provider's
-// init(), the same way native event sinks register themselves:
+// init(), the same way native event listeners register themselves:
 //
 //	func init() {
 //	    plugin.RegisterRoutes("healthz", plugin.Route{

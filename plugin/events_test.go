@@ -8,30 +8,30 @@ import (
 	"github.com/pelican/wings/config"
 )
 
-type fakeSink struct {
+type fakeListener struct {
 	name string
 	want []string
 	got  chan Event
 }
 
-func (f *fakeSink) Name() string     { return f.name }
-func (f *fakeSink) Events() []string { return f.want }
-func (f *fakeSink) OnEvent(_ context.Context, e Event) error {
+func (f *fakeListener) Name() string     { return f.name }
+func (f *fakeListener) Events() []string { return f.want }
+func (f *fakeListener) OnEvent(_ context.Context, e Event) error {
 	f.got <- e
 	return nil
 }
 
-func TestEmitDeliversToMatchingEnabledSink(t *testing.T) {
-	setConfig(t) // Autoload true -> sink enabled
+func TestEmitDeliversToMatchingEnabledListener(t *testing.T) {
+	setConfig(t) // Autoload true -> listener enabled
 
 	r := NewRegistry()
-	sink := &fakeSink{name: "s", want: []string{"server.state"}, got: make(chan Event, 1)}
-	r.RegisterEventSink(sink)
+	listener := &fakeListener{name: "s", want: []string{"server.state"}, got: make(chan Event, 1)}
+	r.RegisterEventListener(listener)
 
 	r.Emit(Event{Type: "server.state", Server: "x"})
 
 	select {
-	case e := <-sink.got:
+	case e := <-listener.got:
 		if e.Server != "x" {
 			t.Fatalf("unexpected event: %+v", e)
 		}
@@ -44,32 +44,32 @@ func TestEmitSkipsNonMatchingType(t *testing.T) {
 	setConfig(t)
 
 	r := NewRegistry()
-	sink := &fakeSink{name: "s", want: []string{"other"}, got: make(chan Event, 1)}
-	r.RegisterEventSink(sink)
+	listener := &fakeListener{name: "s", want: []string{"other"}, got: make(chan Event, 1)}
+	r.RegisterEventListener(listener)
 
 	r.Emit(Event{Type: "server.state"})
 
 	select {
-	case <-sink.got:
+	case <-listener.got:
 		t.Fatal("event should not have been delivered")
 	case <-time.After(200 * time.Millisecond):
 	}
 }
 
-func TestEmitSkipsDisabledSink(t *testing.T) {
+func TestEmitSkipsDisabledListener(t *testing.T) {
 	c := setConfig(t)
 	c.Plugins.Disabled = []string{"s"}
 	config.Set(c)
 
 	r := NewRegistry()
-	sink := &fakeSink{name: "s", want: []string{"*"}, got: make(chan Event, 1)}
-	r.RegisterEventSink(sink)
+	listener := &fakeListener{name: "s", want: []string{"*"}, got: make(chan Event, 1)}
+	r.RegisterEventListener(listener)
 
 	r.Emit(Event{Type: "server.state"})
 
 	select {
-	case <-sink.got:
-		t.Fatal("disabled sink should not receive events")
+	case <-listener.got:
+		t.Fatal("disabled listener should not receive events")
 	case <-time.After(200 * time.Millisecond):
 	}
 }
