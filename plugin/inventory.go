@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"path/filepath"
+	"sort"
 
 	"github.com/pelican/wings/config"
 )
@@ -53,6 +54,28 @@ func Inventory() ([]ProviderInfo, error) {
 			Enabled:    enabled,
 			Trusted:    true, // native providers are compiled into Wings
 			Reason:     reason,
+		})
+	}
+
+	// Native plugins that only add routes or tasks are not event sinks, so
+	// list them from those registries too, once per plugin name.
+	listed := make(map[string]bool, len(out))
+	for _, p := range out {
+		listed[p.Name] = true
+	}
+	for _, name := range routeAndTaskPlugins() {
+		if listed[name] {
+			continue
+		}
+		listed[name] = true
+		enabled, reason := enableState(name)
+		out = append(out, ProviderInfo{
+			Name:      name,
+			Kind:      KindNative,
+			Transport: "in-proc",
+			Enabled:   enabled,
+			Trusted:   true,
+			Reason:    reason,
 		})
 	}
 
@@ -123,4 +146,25 @@ func Find(name string) (ProviderInfo, bool, error) {
 		}
 	}
 	return ProviderInfo{}, false, err
+}
+
+// routeAndTaskPlugins returns the names of plugins with registered routes or
+// tasks, sorted and without duplicates.
+func routeAndTaskPlugins() []string {
+	seen := map[string]bool{}
+	var names []string
+	add := func(n string) {
+		if !seen[n] {
+			seen[n] = true
+			names = append(names, n)
+		}
+	}
+	for _, r := range Routes() {
+		add(r.Plugin())
+	}
+	for _, t := range Tasks() {
+		add(t.Plugin())
+	}
+	sort.Strings(names)
+	return names
 }

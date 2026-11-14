@@ -17,6 +17,11 @@ import (
 func schedulePluginTasks(ctx context.Context, s gocron.Scheduler) {
 	l := log.WithField("subsystem", "cron")
 	for _, t := range plugin.Tasks() {
+		if !plugin.Enabled(t.Plugin()) {
+			l.WithField("plugin", t.Plugin()).WithField("task", t.Name).
+				Info("plugin is disabled; not scheduling its task")
+			continue
+		}
 		if t.Interval <= 0 || t.Run == nil {
 			l.WithField("plugin", t.Plugin()).WithField("task", t.Name).
 				Warn("skipping plugin task with no interval or handler")

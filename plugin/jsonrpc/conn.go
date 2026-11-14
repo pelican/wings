@@ -15,10 +15,22 @@ import (
 	"strconv"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ErrClosed is returned for calls made on or after the connection closes.
 var ErrClosed = errors.New("jsonrpc: connection closed")
+
+// ErrWriteTimeout is returned when a message could not be written within
+// WriteTimeout. The connection is closed when that happens.
+var ErrWriteTimeout = errors.New("jsonrpc: write timed out; connection closed")
+
+// WriteTimeout bounds how long writing one message may take, including waiting
+// for earlier writes. A peer that stops reading would otherwise block every
+// writer forever once the pipe fills. When it is exceeded the connection is
+// closed, which for a plugin kills the process and unblocks the stuck write.
+// Each connection reads it once, when it is created.
+var WriteTimeout = 10 * time.Second
 
 // Handler processes an inbound request or notification from the peer. For a
 // notification (no response expected) the returned values are ignored. A nil
@@ -55,9 +67,10 @@ type Conn struct {
 	nextID  atomic.Uint64
 	pending sync.Map // string(id) -> chan message
 
-	closeOnce sync.Once
-	closed    chan struct{}
-	closer    io.Closer
+	closeOnce    sync.Once
+	closed       chan struct{}
+	closer       io.Closer
+	writeTimeout time.Duration
 }
 
 // NewConn starts a connection reading from r and writing to w. handler may be
@@ -71,6 +84,8 @@ func NewConn(r io.Reader, w io.Writer, handler Handler, closer io.Closer) *Conn 
 		handler: handler,
 		closed:  make(chan struct{}),
 		closer:  closer,
+
+		writeTimeout: WriteTimeout,
 	}
 	go c.readLoop(r)
 	return c
@@ -154,17 +169,38 @@ func (c *Conn) safeHandle(method string, params json.RawMessage) (result any, er
 
 func (c *Conn) write(m message) error {
 	m.JSONRPC = "2.0"
-	c.wmu.Lock()
-	defer c.wmu.Unlock()
 	select {
 	case <-c.closed:
 		return ErrClosed
 	default:
 	}
-	if err := c.enc.Encode(m); err != nil {
+	done := make(chan error, 1)
+	go func() {
+		c.wmu.Lock()
+		defer c.wmu.Unlock()
+		select {
+		case <-c.closed:
+			done <- ErrClosed
+			return
+		default:
+		}
+		if err := c.enc.Encode(m); err != nil {
+			done <- err
+			return
+		}
+		done <- c.w.Flush()
+	}()
+	timer := time.NewTimer(c.writeTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
 		return err
+	case <-c.closed:
+		return ErrClosed
+	case <-timer.C:
+		c.close()
+		return ErrWriteTimeout
 	}
-	return c.w.Flush()
 }
 
 // Call issues a request and waits for the response or ctx cancellation. result

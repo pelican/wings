@@ -17,6 +17,13 @@ import (
 // plugin exposed and under which auth scope.
 func mountPluginRoutes(scopes map[plugin.Scope]gin.IRoutes) {
 	for _, r := range plugin.Routes() {
+		// A disabled plugin's routes are not mounted at all, so disabling a
+		// plugin also takes down its public endpoints.
+		if !plugin.Enabled(r.Plugin()) {
+			log.WithField("plugin", r.Plugin()).WithField("path", r.Path).
+				Info("plugin is disabled; not mounting its route")
+			continue
+		}
 		group, ok := scopes[r.Scope]
 		if !ok {
 			log.WithField("plugin", r.Plugin()).

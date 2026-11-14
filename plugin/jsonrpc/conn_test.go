@@ -3,6 +3,7 @@ package jsonrpc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"testing"
 	"time"
@@ -178,5 +179,35 @@ func TestStringAndNumberIDsAreEchoed(t *testing.T) {
 	case <-host.Done():
 		t.Fatal("connection closed after a string id")
 	default:
+	}
+}
+
+// TestWriteTimesOutWhenThePeerStopsReading covers a plugin that stops reading
+// its stdin: once the pipe is full every write used to block forever.
+func TestWriteTimesOutWhenThePeerStopsReading(t *testing.T) {
+	prev := WriteTimeout
+	WriteTimeout = 200 * time.Millisecond
+	t.Cleanup(func() { WriteTimeout = prev })
+
+	hostR, _ := io.Pipe() // nothing ever writes to the host
+	_, hostW := io.Pipe() // nothing ever reads what the host writes
+	host := NewConn(hostR, hostW, nil, nil)
+	WriteTimeout = prev // the connection has its own copy now
+
+	start := time.Now()
+	err := host.Notify("event", map[string]string{"type": "server.state"})
+	if !errors.Is(err, ErrWriteTimeout) {
+		t.Fatalf("Notify = %v, want ErrWriteTimeout", err)
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("Notify took %v", d)
+	}
+	select {
+	case <-host.Done():
+	default:
+		t.Fatal("the connection should be closed after a write timeout")
+	}
+	if err := host.Notify("event", nil); !errors.Is(err, ErrClosed) {
+		t.Fatalf("a later write = %v, want ErrClosed", err)
 	}
 }

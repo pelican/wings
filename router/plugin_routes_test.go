@@ -32,7 +32,14 @@ func TestPluginRouteScopesInheritCoreAuth(t *testing.T) {
 	}
 	config.Set(cfg)
 
+	cfg.Plugins.Disabled = []string{"switchedoff"}
+	config.Set(cfg)
+
 	ok := func(c *gin.Context) { c.String(http.StatusOK, "plugin") }
+	// A disabled plugin's routes, even public ones, are not mounted.
+	plugin.RegisterRoutes("switchedoff",
+		plugin.Route{Scope: plugin.ScopePublic, Method: http.MethodGet, Path: "/ping", Handler: ok},
+	)
 	plugin.RegisterRoutes("authcheck",
 		plugin.Route{Scope: plugin.ScopePublic, Method: http.MethodGet, Path: "/ping", Handler: ok},
 		plugin.Route{Scope: plugin.ScopeNode, Method: http.MethodGet, Path: "/ping", Handler: ok},
@@ -54,6 +61,9 @@ func TestPluginRouteScopesInheritCoreAuth(t *testing.T) {
 		{"node with token", "/api/ext/authcheck/ping", "secret", http.StatusOK},
 		{"server without token", "/api/servers/missing/ext/authcheck/ping", "", http.StatusUnauthorized},
 		{"server with token, unknown server", "/api/servers/missing/ext/authcheck/ping", "secret", http.StatusNotFound},
+		// Not mounted, so it is an unknown path, which Wings answers with 401
+		// because the auth middleware sits on the engine. Mounted, it was 200.
+		{"disabled plugin's public route", "/ext/switchedoff/ping", "", http.StatusUnauthorized},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

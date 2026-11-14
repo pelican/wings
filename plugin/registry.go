@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 
 	"github.com/apex/log"
 
@@ -14,13 +15,65 @@ import (
 // level helpers (RegisterEventSink, Emit).
 type Registry struct {
 	mu    sync.RWMutex
-	sinks map[string]EventSink // keyed by provider name
+	sinks map[string]*sinkWorker // keyed by provider name
+}
+
+// sinkQueueSize bounds the events waiting for one sink. A sink that falls this
+// far behind loses events rather than holding memory and goroutines without
+// limit. A variable so tests can lower it.
+var sinkQueueSize = 256
+
+// sinkWorker delivers events to one sink, in order, from its own goroutine.
+type sinkWorker struct {
+	sink    EventSink
+	queue   chan Event
+	dropped atomic.Uint64
+}
+
+func newSinkWorker(s EventSink) *sinkWorker {
+	w := &sinkWorker{sink: s, queue: make(chan Event, sinkQueueSize)}
+	go w.run()
+	return w
+}
+
+func (w *sinkWorker) run() {
+	for e := range w.queue {
+		w.deliver(e)
+	}
+}
+
+func (w *sinkWorker) deliver(e Event) {
+	l := log.WithField("plugin", w.sink.Name()).WithField("event", e.Type)
+	defer func() {
+		if p := recover(); p != nil {
+			l.WithField("panic", p).Error("plugin event sink panicked")
+		}
+	}()
+	if err := w.sink.OnEvent(context.Background(), e); err != nil {
+		l.WithError(err).Warn("plugin event sink returned an error")
+	}
+}
+
+// offer queues e without blocking and reports whether it was accepted.
+func (w *sinkWorker) offer(e Event) bool {
+	select {
+	case w.queue <- e:
+		return true
+	default:
+		// Log the first drop and then every 1000th, so a stuck plugin on a
+		// busy node does not flood the log.
+		if n := w.dropped.Add(1); n == 1 || n%1000 == 0 {
+			log.WithField("plugin", w.sink.Name()).WithField("dropped", n).
+				Warn("plugin event sink is not keeping up; dropping events")
+		}
+		return false
+	}
 }
 
 // NewRegistry returns an empty registry.
 func NewRegistry() *Registry {
 	return &Registry{
-		sinks: make(map[string]EventSink),
+		sinks: make(map[string]*sinkWorker),
 	}
 }
 
@@ -32,19 +85,23 @@ func Default() *Registry { return defaultRegistry }
 // RegisterEventSink adds an event sink to the default registry.
 func RegisterEventSink(s EventSink) { defaultRegistry.RegisterEventSink(s) }
 
-// RegisterEventSink adds an event sink to this registry.
+// RegisterEventSink adds an event sink to this registry. A sink registered
+// under an existing name replaces it; the old one finishes what it has queued.
 func (r *Registry) RegisterEventSink(s EventSink) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.sinks[s.Name()] = s
+	if old, ok := r.sinks[s.Name()]; ok {
+		close(old.queue)
+	}
+	r.sinks[s.Name()] = newSinkWorker(s)
 }
 
 func (r *Registry) eventSinks() []EventSink {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]EventSink, 0, len(r.sinks))
-	for _, s := range r.sinks {
-		out = append(out, s)
+	for _, w := range r.sinks {
+		out = append(out, w.sink)
 	}
 	return out
 }
@@ -53,23 +110,19 @@ func (r *Registry) eventSinks() []EventSink {
 // default registry.
 func Emit(e Event) { defaultRegistry.Emit(e) }
 
-// Emit delivers e to matching, enabled sinks. Delivery is asynchronous and
-// best-effort: a sink error is logged and does not affect other sinks or the
-// caller. This keeps a slow or broken plugin from stalling the server event
-// loop that produced the event.
+// Emit queues e for each matching, enabled sink and returns without waiting.
+// Each sink receives events in order on its own goroutine; a sink error or
+// panic is logged and affects no other sink. A sink whose queue is full drops
+// the event, so a slow or stuck plugin cannot stall the listener that produced
+// it or make Wings hold an unbounded backlog.
 func (r *Registry) Emit(e Event) {
-	for _, s := range r.eventSinks() {
-		if !providerEnabled(s.Name()) || !e.matches(s.Events()) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, w := range r.sinks {
+		if !providerEnabled(w.sink.Name()) || !e.matches(w.sink.Events()) {
 			continue
 		}
-		go func(sink EventSink) {
-			if err := sink.OnEvent(context.Background(), e); err != nil {
-				log.WithField("plugin", sink.Name()).
-					WithField("event", e.Type).
-					WithError(err).
-					Warn("plugin event sink returned an error")
-			}
-		}(s)
+		w.offer(e)
 	}
 }
 

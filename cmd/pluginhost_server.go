@@ -6,6 +6,7 @@ import (
 	"net"
 	"strconv"
 
+	"github.com/pelican/wings/events"
 	"github.com/pelican/wings/server"
 )
 
@@ -102,8 +103,6 @@ func init() {
 		return okResult, nil
 	})
 
-	// events.publish force-prefixes the topic with "plugin:" so a plugin can
-	// never spoof a reserved Wings topic (status, stats, console output, ...).
 	register("events.publish", true, func(_ pluginHost, _ context.Context, s *server.Server, params json.RawMessage) (any, error) {
 		args, err := decode[publishArgs](params)
 		if err != nil {
@@ -112,9 +111,22 @@ func init() {
 		if args.Topic == "" {
 			return nil, rpcErr(-32602, "topic is required")
 		}
-		s.Events().Publish("plugin:"+args.Topic, args.Data)
+		publishPluginEvent(s.Events(), args.Topic, args.Data)
 		return okResult, nil
 	})
+}
+
+// pluginEventTopic is the only bus topic plugins publish on, so a plugin can
+// never spoof a Wings topic (status, stats, console output, ...). Websocket
+// clients receive it as the "plugin" event.
+const pluginEventTopic = "plugin"
+
+// publishPluginEvent puts the plugin's own topic inside the payload. Putting it
+// in the bus topic ("plugin:<topic>") does not work: Bus.Publish keeps only
+// the part before the first colon, so every plugin event arrived as "plugin"
+// with its topic gone.
+func publishPluginEvent(bus *events.Bus, topic string, data any) {
+	bus.Publish(pluginEventTopic, map[string]any{"topic": topic, "data": data})
 }
 
 type logsArgs struct {

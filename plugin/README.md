@@ -121,7 +121,9 @@ EventSink ─► native sink        (in-process, own goroutine)
 ```
 
 Delivery is asynchronous and best-effort: a slow or failing plugin never stalls
-the listener that produced the event.
+the listener that produced the event. Each sink has a queue of 256 events,
+delivered in order; a sink that falls further behind loses events instead of
+making Wings hold them.
 
 ## Configuration
 

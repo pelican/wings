@@ -92,7 +92,7 @@ Emitted event types:
 | `server.stats` | each resource tick | `{state, memory_bytes, memory_limit_bytes, cpu_absolute, disk_bytes, uptime}` |
 | `server.install` | install start/finish | `{status: "started" \| "completed"}` |
 
-Delivery is best-effort and asynchronous. Events are node-wide today — a plugin
+Delivery is best-effort and asynchronous. Each plugin has its own queue of 256 events, delivered in order; if a plugin falls that far behind, newer events for it are dropped (and logged) rather than held. A message Wings cannot write within 10 seconds, because the plugin stopped reading stdin, closes the connection and stops the process. Events are node-wide today — a plugin
 subscribed to `"*"` sees them for every server; per-plugin server scoping is a
 follow-up. High-volume console streaming is intentionally not on this bus yet
 (needs backpressure).

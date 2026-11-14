@@ -35,7 +35,11 @@ These grant keys are registered in `cmd/pluginhost*.go` (asserted by
 | server (read) | `server.list`, `server.get`, `server.status`, `server.state`, `server.stats`, `server.allocations`, `server.logs`, `resolveAddress` |
 | server (mutating) | `server.power`, `server.command` |
 | fs (read) | `fs.list`, `fs.read` (≤ 1 MiB, base64), `fs.diskUsage` |
-| fs (mutating) | `fs.write` (≤ 1 MiB, base64), `fs.mkdir`, `fs.delete` (refuses the root), `fs.rename`, `fs.copy`, `fs.chmod` |
+| fs (mutating) | `fs.write` (≤ 1 MiB, base64), `fs.mkdir`, `fs.delete` (refuses the root), `fs.rename`, `fs.copy`, `fs.chmod` (Unix mode, e.g. `0o2750`) |
+
+The fs methods apply the server's file denylist the same way the HTTP file API
+does: reads, writes, copies and chmods of a denylisted path are refused, renames
+check both ends, and a recursive delete leaves denylisted entries in place.
 | events | `events.publish` |
 
 Known gaps against the rules below: **rule 4 is not enforced yet**. Scoped
@@ -138,7 +142,7 @@ BackupProvider refactor (M4) — this domain lands with M4, not before.
 | `env.inspect` | | | `ContainerInspect` | **project** `{id,running,startedAt,exitCode,oomKilled,image}` — never raw |
 | `env.readLog` | | | `Readlog` | may leak secrets; cap lines |
 | `events.subscribe` | | ✓ | `EventSink`/`Registry.Emit` | **add per-server filter** (node-wide today) |
-| `events.publish` | ✓ | | `Bus.Publish` | plugin-prefixed topics only; **reject reserved** |
+| `events.publish` | ✓ | | `Bus.Publish` | always published on the `plugin` topic with `{topic, data}` as the payload, so a plugin cannot use a Wings topic; websocket clients receive a `plugin` event |
 | `activity.log` | ✓ | | `SaveActivity` | force server scope; namespace key; never touch `remote.Client` |
 | `env.updateLimits` | ✓ | | `InSituUpdate` | read limits from server config, **not** plugin |
 | `env.imagePull` | ✓ | ✓ | `ensureImageExists` | **avoid** or restrict to egg image (registry-cred abuse) |

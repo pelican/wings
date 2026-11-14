@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strings"
 	"sync"
 	"time"
 
@@ -137,9 +138,37 @@ func (p processCloser) Close() error {
 }
 
 func pipeStderr(name string, r io.Reader) {
-	s := bufio.NewScanner(r)
-	for s.Scan() {
-		log.WithField("plugin", name).Warn(s.Text())
+	l := log.WithField("plugin", name)
+	pipeLines(r, maxStderrLine, func(line string) { l.Warn(line) })
+}
+
+// maxStderrLine is the longest stderr line logged in full.
+const maxStderrLine = 8 << 10
+
+// pipeLines reads r until EOF and calls emit once per line. A line longer than
+// max is cut to max bytes, marked, and the rest of it skipped. A bufio.Scanner
+// would stop at its first too-long line instead, and then nothing would drain
+// the pipe: the plugin's next stderr writes would block once the pipe filled.
+func pipeLines(r io.Reader, max int, emit func(string)) {
+	br := bufio.NewReaderSize(r, max)
+	for {
+		line, err := br.ReadSlice('\n')
+		if err == bufio.ErrBufferFull {
+			emit(string(line) + " … (line truncated)")
+			for err == bufio.ErrBufferFull {
+				_, err = br.ReadSlice('\n')
+			}
+			if err != nil {
+				return
+			}
+			continue
+		}
+		if len(line) > 0 {
+			emit(strings.TrimRight(string(line), "\r\n"))
+		}
+		if err != nil {
+			return
+		}
 	}
 }
 
