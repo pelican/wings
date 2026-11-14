@@ -312,7 +312,47 @@ func extractArchive(ctx context.Context, archivePath, dest string) error {
 	type link struct{ name, target string }
 	var links []link
 
-	var entries int
+	// Every file, directory and symlink extraction creates counts against
+	// maxUpdateExtractEntries, including parent directories an entry's path
+	// implies but the archive never lists: one entry "a/b/c/.../f" would
+	// otherwise create as many directories as its path has parts.
+	var entries, created int
+	create := func() error {
+		created++
+		if created > maxUpdateExtractEntries {
+			return fmt.Errorf("plugin: archive creates more than %d files and directories", maxUpdateExtractEntries)
+		}
+		return nil
+	}
+	known := map[string]bool{".": true}
+	var mkdirs func(dir string) error
+	mkdirs = func(dir string) error {
+		if known[dir] {
+			return nil
+		}
+		if err := mkdirs(path.Dir(dir)); err != nil {
+			return err
+		}
+		info, err := root.Lstat(dir)
+		switch {
+		case err == nil:
+			if !info.IsDir() {
+				return fmt.Errorf("plugin: archive path %q is not a directory", dir)
+			}
+		case errors.Is(err, fs.ErrNotExist):
+			if err := create(); err != nil {
+				return err
+			}
+			if err := root.Mkdir(dir, 0o755); err != nil {
+				return err
+			}
+		default:
+			return err
+		}
+		known[dir] = true
+		return nil
+	}
+
 	remaining := maxUpdateExtractBytes
 	err = ex.Extract(ctx, input, func(ctx context.Context, af archives.FileInfo) error {
 		entries++
@@ -324,7 +364,12 @@ func extractArchive(ctx context.Context, archivePath, dest string) error {
 			return err
 		}
 		if name == "." {
-			return nil // the archive's own top-level directory entry
+			// The archive's own top-level directory. Anything else under that
+			// name would be skipped unread, outside the size limits.
+			if !af.IsDir() {
+				return fmt.Errorf("plugin: archive entry %q names the root but is not a directory", af.NameInArchive)
+			}
+			return nil
 		}
 		if af.Mode()&os.ModeSymlink != 0 {
 			if af.LinkTarget == "" || filepath.IsAbs(af.LinkTarget) {
@@ -337,12 +382,15 @@ func extractArchive(ctx context.Context, archivePath, dest string) error {
 			return fmt.Errorf("plugin: archive entry %q is a hard link, which is not supported", af.NameInArchive)
 		}
 		if af.IsDir() {
-			return root.MkdirAll(name, 0o755)
+			return mkdirs(name)
 		}
 		if !af.Mode().IsRegular() {
 			return fmt.Errorf("plugin: archive entry %q is not a regular file, directory or symlink", af.NameInArchive)
 		}
-		if err := root.MkdirAll(path.Dir(name), 0o755); err != nil {
+		if err := mkdirs(path.Dir(name)); err != nil {
+			return err
+		}
+		if err := create(); err != nil {
 			return err
 		}
 		r, err := af.Open()
@@ -374,7 +422,10 @@ func extractArchive(ctx context.Context, archivePath, dest string) error {
 	}
 
 	for _, l := range links {
-		if err := root.MkdirAll(path.Dir(l.name), 0o755); err != nil {
+		if err := mkdirs(path.Dir(l.name)); err != nil {
+			return err
+		}
+		if err := create(); err != nil {
 			return err
 		}
 		if err := root.Symlink(l.target, l.name); err != nil {

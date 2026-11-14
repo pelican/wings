@@ -346,3 +346,29 @@ func TestExtractArchiveRefusesEntriesOutsideTheDestination(t *testing.T) {
 		})
 	}
 }
+
+func TestExtractArchiveCountsImpliedDirectories(t *testing.T) {
+	prev := maxUpdateExtractEntries
+	maxUpdateExtractEntries = 5
+	t.Cleanup(func() { maxUpdateExtractEntries = prev })
+
+	// One entry, but its path implies seven directories.
+	archive := writeTar(t, []tarEntry{{name: "a/b/c/d/e/f/g/file", typ: tar.TypeReg, body: "x"}})
+	err := extractArchive(context.Background(), archive, t.TempDir())
+	if err == nil || !strings.Contains(err.Error(), "more than 5 files and directories") {
+		t.Fatalf("directories implied by an entry's path must count against the limit, got %v", err)
+	}
+	if err := extractArchive(context.Background(), writeTar(t, []tarEntry{{name: "a/b/file", typ: tar.TypeReg, body: "x"}}), t.TempDir()); err != nil {
+		t.Fatalf("three objects should fit under a limit of five: %v", err)
+	}
+}
+
+func TestExtractArchiveRefusesARegularFileNamedDot(t *testing.T) {
+	archive := writeTar(t, []tarEntry{{name: ".", typ: tar.TypeReg, body: strings.Repeat("x", 4096)}})
+	if err := extractArchive(context.Background(), archive, t.TempDir()); err == nil {
+		t.Fatal("a regular file named \".\" must be refused, not skipped unread")
+	}
+	if err := extractArchive(context.Background(), writeTar(t, []tarEntry{{name: "./", typ: tar.TypeDir}, {name: "./plugin.yaml", typ: tar.TypeReg, body: "x"}}), t.TempDir()); err != nil {
+		t.Fatalf("a \"./\" root directory entry is normal and must still work: %v", err)
+	}
+}
