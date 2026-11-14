@@ -26,7 +26,9 @@ func ServeEventListener(s plugin.EventListener) error {
 func serveEventListener(r io.Reader, w io.Writer, errw io.Writer, s plugin.EventListener) error {
 	h := eventListenerHandler{s: s, errw: errw}
 	conn := jsonrpc.NewConn(r, w, h.handle, nil)
-	<-conn.Done()
+	// Return only after the events Wings sent before closing stdin have all
+	// reached OnEvent; the plugin usually exits right after this returns.
+	<-conn.Drained()
 	return nil
 }
 

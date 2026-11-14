@@ -334,3 +334,36 @@ func TestNotificationHandlerCanCallBack(t *testing.T) {
 		t.Fatal("a host call made while handling a notification never returned")
 	}
 }
+
+// TestCallReturnsAResponseSentJustBeforeClose covers a peer that answers and
+// then hangs up at once. The read loop hands the response over before it
+// closes the connection, so Call must return it rather than ErrClosed. The
+// two arrive almost together, so the case is repeated to catch the race.
+func TestCallReturnsAResponseSentJustBeforeClose(t *testing.T) {
+	for i := 0; i < 500; i++ {
+		hostR, peerW := io.Pipe()
+		peerR, hostW := io.Pipe()
+		host := NewConn(hostR, hostW, nil, nil)
+
+		go func() {
+			var req struct {
+				ID json.RawMessage `json:"id"`
+			}
+			if err := json.NewDecoder(peerR).Decode(&req); err != nil {
+				return
+			}
+			_, _ = io.WriteString(peerW, `{"jsonrpc":"2.0","id":`+string(req.ID)+`,"result":{"ok":true}}`+"\n")
+			_ = peerW.Close()
+		}()
+
+		var out struct{ OK bool }
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := host.Call(ctx, "ping", nil, &out)
+		cancel()
+		_ = host.Close()
+		_ = peerR.Close()
+		if err != nil || !out.OK {
+			t.Fatalf("iteration %d: Call = %v, ok=%v; the answered call was reported as failed", i, err, out.OK)
+		}
+	}
+}

@@ -79,7 +79,8 @@ type Conn struct {
 	closer       io.Closer
 	writeTimeout time.Duration
 
-	notes   chan message // inbound notifications, in arrival order
+	notes   chan message  // inbound notifications, in arrival order
+	drained chan struct{} // closed once every queued notification is handled
 	dropped atomic.Uint64
 }
 
@@ -97,6 +98,7 @@ func NewConn(r io.Reader, w io.Writer, handler Handler, closer io.Closer) *Conn 
 
 		writeTimeout: WriteTimeout,
 		notes:        make(chan message, NotificationQueueSize),
+		drained:      make(chan struct{}),
 	}
 	go c.readLoop(r)
 	go c.notificationLoop()
@@ -112,10 +114,17 @@ func (c *Conn) Dropped() uint64 { return c.dropped.Load() }
 // (a plugin asking Wings for something while handling an event) needs the read
 // loop free to receive the response.
 func (c *Conn) notificationLoop() {
+	defer close(c.drained)
 	for m := range c.notes {
 		c.serveNotification(m)
 	}
 }
+
+// Drained returns a channel that is closed once the peer has stopped sending
+// (its side of the stream ended) and every notification it sent before that
+// has been handled. Done alone closes as soon as the stream ends, while queued
+// notifications may still be waiting.
+func (c *Conn) Drained() <-chan struct{} { return c.drained }
 
 func (c *Conn) readLoop(r io.Reader) {
 	dec := json.NewDecoder(bufio.NewReader(r))
@@ -227,7 +236,14 @@ func (c *Conn) write(m message) error {
 	case err := <-done:
 		return err
 	case <-c.closed:
-		return ErrClosed
+		// The message may have been written just before the peer hung up
+		// (and, for a Call, answered); report what actually happened.
+		select {
+		case err := <-done:
+			return err
+		default:
+			return ErrClosed
+		}
 	case <-timer.C:
 		c.close()
 		return ErrWriteTimeout
@@ -247,22 +263,44 @@ func (c *Conn) Call(ctx context.Context, method string, params any, result any) 
 	defer c.pending.Delete(id)
 
 	if err := c.write(message{ID: json.RawMessage(id), Method: method, Params: raw}); err != nil {
+		// A peer can read the request, answer and hang up before the write
+		// is reported done. The read loop hands any response over before it
+		// closes the connection, so an answer that arrived is waiting here.
+		if errors.Is(err, ErrClosed) {
+			select {
+			case resp := <-ch:
+				return decodeResponse(resp, result)
+			default:
+			}
+		}
 		return err
 	}
 	select {
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-c.closed:
-		return ErrClosed
+		// The read loop hands a response over before it closes the
+		// connection, so a peer that answered and then hung up has its
+		// answer waiting here; don't report that call as failed.
+		select {
+		case resp := <-ch:
+			return decodeResponse(resp, result)
+		default:
+			return ErrClosed
+		}
 	case resp := <-ch:
-		if resp.Error != nil {
-			return resp.Error
-		}
-		if result != nil && len(resp.Result) > 0 {
-			return json.Unmarshal(resp.Result, result)
-		}
-		return nil
+		return decodeResponse(resp, result)
 	}
+}
+
+func decodeResponse(resp message, result any) error {
+	if resp.Error != nil {
+		return resp.Error
+	}
+	if result != nil && len(resp.Result) > 0 {
+		return json.Unmarshal(resp.Result, result)
+	}
+	return nil
 }
 
 // Notify sends a notification for which no response is expected.

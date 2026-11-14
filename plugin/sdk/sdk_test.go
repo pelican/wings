@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -78,5 +79,42 @@ func TestServeEventListenerSpeaksTheWireProtocol(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("ServeEventListener did not return after stdin closed")
+	}
+}
+
+type slowListener struct{ handled *atomic.Int32 }
+
+func (slowListener) Name() string     { return "slow" }
+func (slowListener) Events() []string { return []string{"*"} }
+func (s slowListener) OnEvent(context.Context, plugin.Event) error {
+	time.Sleep(5 * time.Millisecond)
+	s.handled.Add(1)
+	return nil
+}
+
+// TestServeEventListenerHandlesQueuedEventsBeforeReturning covers Wings
+// closing stdin right after sending events: the plugin usually exits as soon
+// as ServeEventListener returns, so it must not return with events queued.
+func TestServeEventListenerHandlesQueuedEventsBeforeReturning(t *testing.T) {
+	var handled atomic.Int32
+	inR, inW := io.Pipe()
+	done := make(chan struct{})
+	go func() {
+		_ = serveEventListener(inR, io.Discard, io.Discard, slowListener{handled: &handled})
+		close(done)
+	}()
+	for i := 0; i < 20; i++ {
+		if _, err := io.WriteString(inW, `{"jsonrpc":"2.0","method":"event","params":{"type":"server.state"}}`+"\n"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = inW.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ServeEventListener did not return")
+	}
+	if n := handled.Load(); n != 20 {
+		t.Fatalf("returned after handling %d of 20 events", n)
 	}
 }
