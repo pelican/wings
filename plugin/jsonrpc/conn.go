@@ -39,6 +39,16 @@ var WriteTimeout = 10 * time.Second
 // created.
 var NotificationQueueSize = 256
 
+// MaxConcurrentRequests bounds the inbound requests one connection handles at
+// once. A request beyond it is answered right away with ErrCodeBusy instead of
+// starting another goroutine, so a peer that floods requests cannot make this
+// side grow without limit. Each connection reads it once, when it is created.
+var MaxConcurrentRequests = 64
+
+// ErrCodeBusy is the JSON-RPC error code for a request refused because
+// MaxConcurrentRequests were already being handled.
+const ErrCodeBusy = -32003
+
 // Handler processes an inbound request or notification from the peer. For a
 // notification (no response expected) the returned values are ignored. A nil
 // Handler rejects inbound requests with a method-not-found error.
@@ -82,6 +92,8 @@ type Conn struct {
 	notes   chan message  // inbound notifications, in arrival order
 	drained chan struct{} // closed once every queued notification is handled
 	dropped atomic.Uint64
+
+	inflight chan struct{} // one slot per inbound request being handled
 }
 
 // NewConn starts a connection reading from r and writing to w. handler may be
@@ -99,6 +111,7 @@ func NewConn(r io.Reader, w io.Writer, handler Handler, closer io.Closer) *Conn 
 		writeTimeout: WriteTimeout,
 		notes:        make(chan message, NotificationQueueSize),
 		drained:      make(chan struct{}),
+		inflight:     make(chan struct{}, MaxConcurrentRequests),
 	}
 	go c.readLoop(r)
 	go c.notificationLoop()
@@ -138,7 +151,18 @@ func (c *Conn) readLoop(r io.Reader) {
 		hasID := len(m.ID) > 0 && string(m.ID) != "null"
 		switch {
 		case m.Method != "" && hasID:
-			go c.serveRequest(m)
+			select {
+			case c.inflight <- struct{}{}:
+				go func(m message) {
+					defer func() { <-c.inflight }()
+					c.serveRequest(m)
+				}(m)
+			default:
+				// Answered from the read loop, which stays free to deliver
+				// responses to this side's own calls. If the peer also stops
+				// reading, the write timeout closes the connection.
+				_ = c.write(message{ID: m.ID, Error: &Error{Code: ErrCodeBusy, Message: "too many concurrent requests"}})
+			}
 		case m.Method != "":
 			select {
 			case c.notes <- m:

@@ -101,3 +101,7 @@ follow-up. High-volume console streaming is intentionally not on this bus yet
 
 Standard JSON-RPC error object: `{ "code": <int>, "message": <string> }`. Use
 `-32601` for an unknown method and `-32602` for invalid params.
+
+Wings handles at most 64 of a plugin's requests at once. A request beyond
+that is answered right away with `-32003` ("too many concurrent requests");
+retry it later rather than sending more.

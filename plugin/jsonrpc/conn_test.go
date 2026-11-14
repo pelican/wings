@@ -367,3 +367,73 @@ func TestCallReturnsAResponseSentJustBeforeClose(t *testing.T) {
 		}
 	}
 }
+
+// TestRequestFloodStaysBounded covers a peer that sends requests faster than
+// they are handled: each one used to get its own goroutine.
+func TestRequestFloodStaysBounded(t *testing.T) {
+	prev := MaxConcurrentRequests
+	MaxConcurrentRequests = 4
+	release := make(chan struct{})
+	hostR, peerW := io.Pipe()
+	peerR, hostW := io.Pipe()
+	host := NewConn(hostR, hostW, func(context.Context, string, json.RawMessage) (any, error) {
+		<-release
+		return "done", nil
+	}, nil)
+	MaxConcurrentRequests = prev
+	t.Cleanup(func() { _ = host.Close() })
+
+	type reply struct {
+		ID    int
+		Error *Error
+	}
+	replies := make(chan reply, 200)
+	go func() {
+		dec := json.NewDecoder(peerR)
+		for {
+			var r reply
+			if err := dec.Decode(&r); err != nil {
+				return
+			}
+			replies <- r
+		}
+	}()
+
+	before := runtime.NumGoroutine()
+	for i := 1; i <= 100; i++ {
+		msg := `{"jsonrpc":"2.0","id":` + strconv.Itoa(i) + `,"method":"host.server.list"}` + "\n"
+		if _, err := io.WriteString(peerW, msg); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 96 refusals arrive while the 4 accepted requests are still blocked.
+	busy := 0
+	deadline := time.After(5 * time.Second)
+	for busy < 96 {
+		select {
+		case r := <-replies:
+			if r.Error == nil || r.Error.Code != ErrCodeBusy {
+				t.Fatalf("reply %d: want a busy error while 4 requests are in flight, got %+v", r.ID, r.Error)
+			}
+			busy++
+		case <-deadline:
+			t.Fatalf("got %d busy replies, want 96", busy)
+		}
+	}
+	if grew := runtime.NumGoroutine() - before; grew > 4+5 {
+		t.Fatalf("100 requests started %d goroutines with a limit of 4", grew)
+	}
+
+	close(release)
+	for done := 0; done < 4; {
+		select {
+		case r := <-replies:
+			if r.Error != nil {
+				t.Fatalf("accepted request %d failed: %+v", r.ID, r.Error)
+			}
+			done++
+		case <-time.After(5 * time.Second):
+			t.Fatalf("only %d of the 4 accepted requests finished", done)
+		}
+	}
+}
