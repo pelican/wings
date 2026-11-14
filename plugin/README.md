@@ -234,6 +234,10 @@ wings plugins add https://host/registry.json#state-log   # by explicit URL
 wings plugins add state-log                              # search all registries
 ```
 
+A bare name must be listed in exactly one configured registry, and every
+registry must be readable; otherwise the command asks for `@namespace/name`.
+That way a public registry can't take over a name your private registry uses.
+
 `registry.json`:
 
 ```json

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/pelican/wings/config"
@@ -70,7 +71,8 @@ type ResolvedPlugin struct {
 //
 //	@namespace/name   resolve the namespace to a registry (with its auth) from config
 //	url#name          fetch that registry URL and pick the named entry (no auth)
-//	name              search every configured registry, first match wins
+//	name              search every configured registry; it must be found in
+//	                  exactly one, and every registry must be readable
 func Resolve(ctx context.Context, ref string) (ResolvedPlugin, error) {
 	switch {
 	case strings.Contains(ref, "#"):
@@ -104,17 +106,40 @@ func Resolve(ctx context.Context, ref string) (ResolvedPlugin, error) {
 		return ResolvedPlugin{}, fmt.Errorf("plugin %q not found in registry %q", name, ns)
 
 	default:
-		for _, reg := range registries() {
-			a := authFor(reg)
-			cat, err := FetchCatalog(ctx, reg.URL, a)
+		// A bare name must be unambiguous. If two registries list it (say a
+		// company's private one and a public one) the operator has to say which
+		// with @namespace/name; picking one would let whichever registry
+		// published the name first decide what code gets installed. For the
+		// same reason a registry that cannot be read fails the lookup instead
+		// of being skipped, since it might hold the plugin the operator meant.
+		regs := registries()
+		namespaces := make([]string, 0, len(regs))
+		for ns := range regs {
+			namespaces = append(namespaces, ns)
+		}
+		sort.Strings(namespaces)
+
+		var found []ResolvedPlugin
+		var where []string
+		for _, ns := range namespaces {
+			a := authFor(regs[ns])
+			cat, err := FetchCatalog(ctx, regs[ns].URL, a)
 			if err != nil {
-				continue // skip an unreachable registry, try the rest
+				return ResolvedPlugin{}, fmt.Errorf("plugin: could not read registry %q (%v); install with @namespace/name to use a specific registry", ns, err)
 			}
 			if e, ok := cat.find(ref); ok {
-				return ResolvedPlugin{Entry: e, auth: a}, nil
+				found = append(found, ResolvedPlugin{Entry: e, auth: a})
+				where = append(where, "@"+ns+"/"+ref)
 			}
 		}
-		return ResolvedPlugin{}, fmt.Errorf("plugin %q not found in any configured registry", ref)
+		switch len(found) {
+		case 0:
+			return ResolvedPlugin{}, fmt.Errorf("plugin %q not found in any configured registry", ref)
+		case 1:
+			return found[0], nil
+		default:
+			return ResolvedPlugin{}, fmt.Errorf("plugin %q is listed in more than one registry; choose one of: %s", ref, strings.Join(where, ", "))
+		}
 	}
 }
 
