@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestCopyLimitedRejectsOversizedInput(t *testing.T) {
@@ -116,7 +117,8 @@ func hiddenEntries(t *testing.T, dir string) []string {
 	}
 	var out []string
 	for _, e := range entries {
-		if strings.HasPrefix(e.Name(), ".") {
+		// The install lock file stays by design; staging and backup copies must not.
+		if strings.HasPrefix(e.Name(), ".") && e.Name() != installLockName {
 			out = append(out, e.Name())
 		}
 	}
@@ -185,5 +187,143 @@ func TestRollbackOfAFreshInstallRemovesIt(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(dir, "audit")); !os.IsNotExist(err) {
 		t.Fatalf("a rolled-back fresh install should be gone, stat err = %v", err)
+	}
+}
+
+type tarEntry struct {
+	name, body, link string
+	typ              byte
+}
+
+// writeTar builds a .tar.gz from explicit entries, including links.
+func writeTar(t *testing.T, entries []tarEntry) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "plugin.tar.gz")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gz := gzip.NewWriter(f)
+	tw := tar.NewWriter(gz)
+	for _, e := range entries {
+		hdr := &tar.Header{Name: e.name, Mode: 0o644, Typeflag: e.typ, Linkname: e.link, Size: int64(len(e.body))}
+		if e.typ == tar.TypeDir {
+			hdr.Mode = 0o755
+		}
+		if err := tw.WriteHeader(hdr); err != nil {
+			t.Fatal(err)
+		}
+		if e.body != "" {
+			if _, err := tw.Write([]byte(e.body)); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	for _, c := range []interface{ Close() error }{tw, gz, f} {
+		if err := c.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return path
+}
+
+func TestExtractArchiveKeepsInternalSymlinks(t *testing.T) {
+	dest := t.TempDir()
+	archive := writeTar(t, []tarEntry{
+		{name: "main.py", typ: tar.TypeSymlink, link: "src/main.py"},
+		{name: "src/main.py", typ: tar.TypeReg, body: "print('hi')\n"},
+	})
+	if err := extractArchive(context.Background(), archive, dest); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Lstat(filepath.Join(dest, "main.py"))
+	if err != nil || info.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("main.py should be a symlink, got %v %v", info, err)
+	}
+	b, err := os.ReadFile(filepath.Join(dest, "main.py"))
+	if err != nil || string(b) != "print('hi')\n" {
+		t.Fatalf("reading through the link: %q %v", b, err)
+	}
+}
+
+func TestExtractArchiveRefusesLinksLeavingThePlugin(t *testing.T) {
+	cases := map[string][]tarEntry{
+		"absolute target": {{name: "run", typ: tar.TypeSymlink, link: "/bin/sh"}},
+		"relative escape": {{name: "run", typ: tar.TypeSymlink, link: "../../outside"}},
+		// Each link looks fine on its own; together they lead to dest's parent.
+		"chain escape": {
+			{name: "root", typ: tar.TypeSymlink, link: "."},
+			{name: "x/up", typ: tar.TypeSymlink, link: "../root/.."},
+			{name: "x/keep", typ: tar.TypeReg, body: "k"},
+		},
+		"hard link": {
+			{name: "a", typ: tar.TypeReg, body: "a"},
+			{name: "b", typ: tar.TypeLink, link: "a"},
+		},
+	}
+	for name, entries := range cases {
+		t.Run(name, func(t *testing.T) {
+			if err := extractArchive(context.Background(), writeTar(t, entries), t.TempDir()); err == nil {
+				t.Fatal("expected the archive to be refused")
+			}
+		})
+	}
+}
+
+func TestExtractArchiveNeverWritesThroughALink(t *testing.T) {
+	parent := t.TempDir()
+	dest := filepath.Join(parent, "plugin")
+	if err := os.Mkdir(dest, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	archive := writeTar(t, []tarEntry{
+		{name: "out", typ: tar.TypeSymlink, link: ".."},
+		{name: "out/escaped.txt", typ: tar.TypeReg, body: "x"},
+	})
+	_ = extractArchive(context.Background(), archive, dest)
+	if _, err := os.Stat(filepath.Join(parent, "escaped.txt")); !os.IsNotExist(err) {
+		t.Fatalf("a file was written outside the plugin directory (stat err = %v)", err)
+	}
+}
+
+func TestInstallsOnTheSameDirectoryWaitForEachOther(t *testing.T) {
+	dir := t.TempDir()
+	pluginDir(t, filepath.Join(dir, "audit"), "audit v1")
+	pluginDir(t, filepath.Join(dir, ".wings-install-a"), "audit from A")
+	pluginDir(t, filepath.Join(dir, ".wings-install-b"), "audit from B")
+	dest := filepath.Join(dir, "audit")
+	a := &StagedInstall{DestDir: dest, StagingDir: filepath.Join(dir, ".wings-install-a")}
+	b := &StagedInstall{DestDir: dest, StagingDir: filepath.Join(dir, ".wings-install-b")}
+
+	if err := a.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	bDone := make(chan error, 1)
+	go func() {
+		err := b.Commit()
+		if err == nil {
+			err = b.Finish()
+		}
+		bDone <- err
+	}()
+	select {
+	case err := <-bDone:
+		t.Fatalf("B committed while A still held the install (err %v)", err)
+	case <-time.After(300 * time.Millisecond):
+	}
+	// A's approval failed, so A rolls back; then B goes ahead.
+	if err := a.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case err := <-bDone:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("B never got the install lock")
+	}
+	if got := readID(t, dest); got != "audit from B" {
+		t.Fatalf("audit = %q, want B's version", got)
 	}
 }

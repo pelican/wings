@@ -12,11 +12,13 @@ import (
 	"strings"
 
 	"github.com/mholt/archives"
+	"golang.org/x/sys/unix"
 )
 
 // ApplyUpdate downloads the archive named in a prior CheckUpdate, verifies its
 // sha256, extracts it to a staging directory next to the plugin, then atomically
-// swaps it into place (keeping a ".bak" of the old version, restored on failure).
+// swaps it into place (keeping the old version in a hidden backup until the
+// caller finishes or rolls back).
 // The archive is expected to contain the plugin's files at its root (plugin.yaml
 // at the top). A running plugin process must be restarted to pick up the change.
 func ApplyUpdate(ctx context.Context, st UpdateStatus) error {
@@ -78,6 +80,37 @@ type StagedInstall struct {
 	// backupHolder is the hidden directory holding the previous version
 	// between Commit and Finish or Rollback. Empty for a fresh install.
 	backupHolder string
+	// lock is the plugins directory's install lock, held from Commit until
+	// Finish or Rollback.
+	lock *os.File
+}
+
+// installLockName is the lock file installs take in the plugins directory.
+// A hidden file, so discovery never looks at it.
+const installLockName = ".install.lock"
+
+// lockInstalls takes the plugins directory's install lock, waiting for any
+// other install (in this or another process) to finish or roll back first.
+// Without it, a second install could swap in between another's Commit and its
+// Rollback, and that Rollback would delete the second install's files.
+func lockInstalls(pluginsDir string) (*os.File, error) {
+	f, err := os.OpenFile(filepath.Join(pluginsDir, installLockName), os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, fmt.Errorf("plugin: opening install lock: %w", err)
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX); err != nil {
+		f.Close()
+		return nil, fmt.Errorf("plugin: taking install lock: %w", err)
+	}
+	return f, nil
+}
+
+func (s *StagedInstall) unlock() {
+	if s.lock != nil {
+		_ = unix.Flock(int(s.lock.Fd()), unix.LOCK_UN)
+		_ = s.lock.Close()
+		s.lock = nil
+	}
 }
 
 // Manifest loads the staged plugin manifest without executing plugin code.
@@ -93,10 +126,17 @@ func (s *StagedInstall) Commit() error {
 	if s.committed {
 		return nil
 	}
-	holder, err := swapIn(s.DestDir, s.StagingDir)
+	lock, err := lockInstalls(filepath.Dir(s.DestDir))
 	if err != nil {
 		return err
 	}
+	holder, err := swapIn(s.DestDir, s.StagingDir)
+	if err != nil {
+		_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+		_ = lock.Close()
+		return err
+	}
+	s.lock = lock
 	s.backupHolder = holder
 	s.committed = true
 	return nil
@@ -104,7 +144,11 @@ func (s *StagedInstall) Commit() error {
 
 // Finish discards the previous version kept by Commit.
 func (s *StagedInstall) Finish() error {
-	if s == nil || s.backupHolder == "" {
+	if s == nil {
+		return nil
+	}
+	defer s.unlock()
+	if s.backupHolder == "" {
 		return nil
 	}
 	err := os.RemoveAll(s.backupHolder)
@@ -118,6 +162,7 @@ func (s *StagedInstall) Rollback() error {
 	if s == nil || !s.committed {
 		return nil
 	}
+	defer s.unlock()
 	if err := os.RemoveAll(s.DestDir); err != nil {
 		return fmt.Errorf("plugin: removing new version: %w", err)
 	}
@@ -185,9 +230,17 @@ func extractArchive(ctx context.Context, archivePath, dest string) error {
 	if !ok {
 		return errors.New("plugin: archive format is not extractable")
 	}
+
+	// Symlinks are created only after every file and directory is written, so
+	// no entry is ever written through a link, and each link must then resolve
+	// inside dest. Checking each link's text on its own is not enough: a chain
+	// of links that each look harmless can still lead outside.
+	type link struct{ path, target string }
+	var links []link
+
 	var entries int
 	remaining := maxUpdateExtractBytes
-	return ex.Extract(ctx, input, func(ctx context.Context, af archives.FileInfo) error {
+	err = ex.Extract(ctx, input, func(ctx context.Context, af archives.FileInfo) error {
 		entries++
 		if entries > maxUpdateExtractEntries {
 			return fmt.Errorf("plugin: archive has more than %d entries", maxUpdateExtractEntries)
@@ -196,8 +249,21 @@ func extractArchive(ctx context.Context, archivePath, dest string) error {
 		if err != nil {
 			return err
 		}
+		if af.Mode()&os.ModeSymlink != 0 {
+			if af.LinkTarget == "" || filepath.IsAbs(af.LinkTarget) {
+				return fmt.Errorf("plugin: archive symlink %q must have a relative target", af.NameInArchive)
+			}
+			links = append(links, link{path: target, target: af.LinkTarget})
+			return nil
+		}
+		if af.LinkTarget != "" {
+			return fmt.Errorf("plugin: archive entry %q is a hard link, which is not supported", af.NameInArchive)
+		}
 		if af.IsDir() {
 			return os.MkdirAll(target, 0o755)
+		}
+		if !af.Mode().IsRegular() {
+			return fmt.Errorf("plugin: archive entry %q is not a regular file, directory or symlink", af.NameInArchive)
 		}
 		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
 			return err
@@ -226,6 +292,37 @@ func extractArchive(ctx context.Context, archivePath, dest string) error {
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+
+	for _, l := range links {
+		if err := os.MkdirAll(filepath.Dir(l.path), 0o755); err != nil {
+			return err
+		}
+		if err := os.Symlink(l.target, l.path); err != nil {
+			return fmt.Errorf("plugin: creating archive symlink: %w", err)
+		}
+	}
+	if len(links) == 0 {
+		return nil
+	}
+	realDest, err := filepath.EvalSymlinks(dest)
+	if err != nil {
+		return err
+	}
+	for _, l := range links {
+		rel, _ := filepath.Rel(dest, l.path)
+		resolved, err := filepath.EvalSymlinks(l.path)
+		if err != nil {
+			return fmt.Errorf("plugin: archive symlink %s does not resolve inside the plugin: %w", rel, err)
+		}
+		inside, err := filepath.Rel(realDest, resolved)
+		if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
+			return fmt.Errorf("plugin: archive symlink %s points outside the plugin directory", rel)
+		}
+	}
+	return nil
 }
 
 // copyLimited copies at most max bytes and reports an error if src holds more.

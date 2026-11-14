@@ -84,3 +84,13 @@ func TestWritePrivateKeyCreatesPrivateFile(t *testing.T) {
 		t.Fatalf("key file mode = %o, want 600", perm)
 	}
 }
+
+func TestKeygenAndSignDoNotNeedANodeConfig(t *testing.T) {
+	root := newPluginsCommand()
+	for _, sub := range root.Commands() {
+		want := sub.Name() != "keygen" && sub.Name() != "sign"
+		if got := needsNodeConfig(sub); got != want {
+			t.Errorf("needsNodeConfig(%s) = %v, want %v", sub.Name(), got, want)
+		}
+	}
+}

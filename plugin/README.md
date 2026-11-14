@@ -206,7 +206,8 @@ update manifest:
 
 `wings plugins update <name>` fetches it (HTTPS only, including every redirect; credentials are dropped if a redirect leaves the registry host), compares versions,
 downloads the archive, **verifies the sha256 and signature policy**, extracts it
-(path-traversal guarded) into a staging dir next to the plugin, asks the
+(path-traversal guarded; symlinks must resolve inside the plugin, hard links
+are refused) into a staging dir next to the plugin, asks the
 operator to approve the staged manifest, then atomically swaps it in (keeping a
 `.bak`, restored on failure). Restart Wings to load the new version.
 

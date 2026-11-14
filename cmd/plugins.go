@@ -22,7 +22,9 @@ func newPluginsCommand() *cobra.Command {
 		Use:   "plugins",
 		Short: "Inspect and manage Wings capability plugins.",
 		PersistentPreRun: func(cmd *cobra.Command, args []string) {
-			initConfig()
+			if needsNodeConfig(cmd) {
+				initConfig()
+			}
 		},
 	}
 	cmd.AddCommand(
@@ -39,6 +41,17 @@ func newPluginsCommand() *cobra.Command {
 		newPluginsSignCommand(),
 	)
 	return cmd
+}
+
+// needsNodeConfig reports whether a plugins subcommand reads this node's Wings
+// configuration. keygen and sign are run by plugin authors, usually on a
+// machine that is not a Wings node at all.
+func needsNodeConfig(cmd *cobra.Command) bool {
+	switch cmd.Name() {
+	case "keygen", "sign":
+		return false
+	}
+	return true
 }
 
 func newPluginsKeygenCommand() *cobra.Command {
