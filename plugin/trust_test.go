@@ -3,6 +3,7 @@ package plugin
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/pelican/wings/config"
@@ -166,5 +167,87 @@ func trustTestManifest() Manifest {
 		Requires: Requires{
 			HostAPI: []string{"server.stats"},
 		},
+	}
+}
+
+func TestTrustStoreDigestRejectsSymlinkOutsideDir(t *testing.T) {
+	root := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "real-binary")
+	if err := os.WriteFile(outside, []byte("v1"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(outside, filepath.Join(root, "run")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := contentDigest(root); err == nil || !strings.Contains(err.Error(), "points outside") {
+		t.Fatalf("a symlink leaving the plugin directory must be refused, got %v", err)
+	}
+}
+
+func TestTrustStoreDigestFollowsSymlinkInsideDir(t *testing.T) {
+	root := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(root, "lib"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(root, "lib", "tool.js")
+	if err := os.WriteFile(target, []byte("v1"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join("lib", "tool.js"), filepath.Join(root, "tool")); err != nil {
+		t.Fatal(err)
+	}
+	before, err := contentDigest(root)
+	if err != nil {
+		t.Fatalf("a symlink inside the plugin directory should be allowed: %v", err)
+	}
+	if err := os.WriteFile(target, []byte("v2"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	after, err := contentDigest(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == after {
+		t.Fatal("changing the symlink's target must change the digest")
+	}
+}
+
+func TestTrustStoreConcurrentChangesDoNotUndoEachOther(t *testing.T) {
+	c := setConfig(t)
+	c.Plugins.Directory = t.TempDir()
+	config.Set(c)
+
+	x := trustTestManifest()
+	x.Name = "x"
+	y := trustTestManifest()
+	y.Name = "y"
+
+	first, err := LoadTrustStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := first.Approve(x); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two CLI runs load the store at the same time.
+	a, _ := LoadTrustStore()
+	b, _ := LoadTrustStore()
+	if err := b.Revoke("x"); err != nil {
+		t.Fatal(err)
+	}
+	if err := a.Approve(y); err != nil { // a still holds the stale approval of x
+		t.Fatal(err)
+	}
+
+	final, err := LoadTrustStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.IsTrusted(x) {
+		t.Fatal("a stale store restored an approval that was revoked")
+	}
+	if !final.IsTrusted(y) {
+		t.Fatal("the new approval was lost")
 	}
 }

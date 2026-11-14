@@ -104,8 +104,12 @@ func (m Manifest) validate() error {
 	return nil
 }
 
+// invalidPluginName reports whether name cannot be used as a plugin's own
+// directory under the plugins directory. "." is refused as well as separators
+// and "..": filepath.Join(dir, ".") is dir itself, so installing a plugin
+// named "." would replace every plugin and the trust store.
 func invalidPluginName(name string) bool {
-	return name == "" || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..")
+	return name == "" || name == "." || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..")
 }
 
 // DiscoveryIssue is a per-plugin discovery failure. It lets operator tooling

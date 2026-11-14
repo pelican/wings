@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -65,6 +66,29 @@ func (c Catalog) find(name string) (CatalogEntry, bool) {
 type ResolvedPlugin struct {
 	Entry CatalogEntry
 	auth  auth
+	// registryHost is the host the registry index was fetched from. The
+	// registry's credentials are only sent to that host.
+	registryHost string
+}
+
+// downloadAuth returns the credentials to send with the archive download:
+// the registry's, but only when the archive is served from the registry's
+// own host. An archive on a CDN or object store never sees the token or
+// custom headers.
+func (r ResolvedPlugin) downloadAuth() auth {
+	u, err := url.Parse(r.Entry.Download)
+	if err != nil || r.registryHost == "" || u.Host != r.registryHost {
+		return auth{}
+	}
+	return r.auth
+}
+
+func hostOf(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	return u.Host
 }
 
 // Resolve turns a reference into a ResolvedPlugin. Accepted forms:
@@ -101,7 +125,7 @@ func Resolve(ctx context.Context, ref string) (ResolvedPlugin, error) {
 			return ResolvedPlugin{}, err
 		}
 		if e, ok := cat.find(name); ok {
-			return ResolvedPlugin{Entry: e, auth: a}, nil
+			return ResolvedPlugin{Entry: e, auth: a, registryHost: hostOf(reg.URL)}, nil
 		}
 		return ResolvedPlugin{}, fmt.Errorf("plugin %q not found in registry %q", name, ns)
 
@@ -128,7 +152,7 @@ func Resolve(ctx context.Context, ref string) (ResolvedPlugin, error) {
 				return ResolvedPlugin{}, fmt.Errorf("plugin: could not read registry %q (%v); install with @namespace/name to use a specific registry", ns, err)
 			}
 			if e, ok := cat.find(ref); ok {
-				found = append(found, ResolvedPlugin{Entry: e, auth: a})
+				found = append(found, ResolvedPlugin{Entry: e, auth: a, registryHost: hostOf(regs[ns].URL)})
 				where = append(where, "@"+ns+"/"+ref)
 			}
 		}
@@ -172,7 +196,7 @@ func StageAdd(ctx context.Context, r ResolvedPlugin, pluginsDir string) (*Staged
 		return nil, fmt.Errorf("plugin: creating plugins directory: %w", err)
 	}
 	dest := filepath.Join(pluginsDir, e.Name)
-	stage, err := stageArchive(ctx, e.Download, e.SHA256, e.Signature, dest, r.auth)
+	stage, err := stageArchive(ctx, e.Download, e.SHA256, e.Signature, dest, r.downloadAuth())
 	if err != nil {
 		return nil, err
 	}

@@ -10,6 +10,9 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
+
+	"golang.org/x/sys/unix"
 
 	"github.com/pelican/wings/config"
 )
@@ -52,15 +55,65 @@ func LoadTrustStore() (*TrustStore, error) {
 	return ts, nil
 }
 
-func (ts *TrustStore) save() error {
-	b, err := json.MarshalIndent(ts, "", "  ")
-	if err != nil {
-		return err
-	}
+// update applies fn to the approvals as they are on disk now, under an
+// exclusive lock, and writes the result back atomically. Two CLI runs (say
+// `trust a` and `untrust b`) each loaded the store earlier; without the reload
+// under the lock, the later save would restore whatever the other one removed.
+func (ts *TrustStore) update(fn func(approved map[string]string)) error {
 	if err := os.MkdirAll(filepath.Dir(ts.path), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(ts.path, b, 0o600)
+	lock, err := os.OpenFile(ts.path+".lock", os.O_CREATE|os.O_RDWR, 0o600)
+	if err != nil {
+		return err
+	}
+	defer lock.Close()
+	if err := unix.Flock(int(lock.Fd()), unix.LOCK_EX); err != nil {
+		return fmt.Errorf("plugin: locking trust store: %w", err)
+	}
+	defer unix.Flock(int(lock.Fd()), unix.LOCK_UN)
+
+	current := &TrustStore{Approved: map[string]string{}}
+	if b, err := os.ReadFile(ts.path); err == nil {
+		if err := json.Unmarshal(b, current); err != nil {
+			return err
+		}
+		if current.Approved == nil {
+			current.Approved = map[string]string{}
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	fn(current.Approved)
+
+	b, err := json.MarshalIndent(current, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(ts.path), ".trust-*.json")
+	if err != nil {
+		return err
+	}
+	if _, err := tmp.Write(b); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		tmp.Close()
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	if err := os.Rename(tmp.Name(), ts.path); err != nil {
+		os.Remove(tmp.Name())
+		return err
+	}
+	ts.Approved = current.Approved
+	return nil
 }
 
 // IsTrusted reports whether the manifest has been approved with a fingerprint
@@ -79,14 +132,12 @@ func (ts *TrustStore) Approve(m Manifest) error {
 	if err != nil {
 		return err
 	}
-	ts.Approved[m.Name] = fp
-	return ts.save()
+	return ts.update(func(approved map[string]string) { approved[m.Name] = fp })
 }
 
 // Revoke removes approval for a plugin name and persists the change.
 func (ts *TrustStore) Revoke(name string) error {
-	delete(ts.Approved, name)
-	return ts.save()
+	return ts.update(func(approved map[string]string) { delete(approved, name) })
 }
 
 // fingerprint hashes the fields that determine what a plugin runs, what it asks
@@ -129,10 +180,14 @@ func contentDigest(root string) (string, error) {
 	if root == "" {
 		return "", nil
 	}
+	realRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", err
+	}
 	h := sha256.New()
 	write := func(s string) { io.WriteString(h, s); h.Write([]byte{0}) }
 
-	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
@@ -171,12 +226,20 @@ func contentDigest(root string) (string, error) {
 			}
 			write(hex.EncodeToString(fh.Sum(nil)))
 		case mode&os.ModeSymlink != 0:
-			write("symlink")
-			target, err := os.Readlink(path)
+			// Hashing only the link text would let the file it points to
+			// change without a new approval. A link is allowed only when it
+			// resolves inside the plugin directory, where the walk hashes the
+			// target itself (node_modules/.bin links, for example).
+			resolved, err := filepath.EvalSymlinks(path)
 			if err != nil {
-				return err
+				return fmt.Errorf("plugin: resolving symlink %s: %w", rel, err)
 			}
-			write(target)
+			inside, err := filepath.Rel(realRoot, resolved)
+			if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
+				return fmt.Errorf("plugin: symlink %s points outside the plugin directory", rel)
+			}
+			write("symlink")
+			write(filepath.ToSlash(inside))
 		default:
 			return fmt.Errorf("plugin: unsupported file type in plugin directory: %s", rel)
 		}

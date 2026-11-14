@@ -144,7 +144,13 @@ func extractArchive(ctx context.Context, archivePath, dest string) error {
 	if !ok {
 		return errors.New("plugin: archive format is not extractable")
 	}
+	var entries int
+	remaining := maxUpdateExtractBytes
 	return ex.Extract(ctx, input, func(ctx context.Context, af archives.FileInfo) error {
+		entries++
+		if entries > maxUpdateExtractEntries {
+			return fmt.Errorf("plugin: archive has more than %d entries", maxUpdateExtractEntries)
+		}
 		target, err := safeJoin(dest, af.NameInArchive)
 		if err != nil {
 			return err
@@ -165,19 +171,33 @@ func extractArchive(ctx context.Context, archivePath, dest string) error {
 			return err
 		}
 		defer out.Close()
-		return copyFileLimited(out, r, maxUpdateFileBytes)
+		limit := int64(maxUpdateFileBytes)
+		if remaining < limit {
+			limit = remaining
+		}
+		n, err := copyLimited(out, r, limit)
+		remaining -= n
+		if err != nil {
+			if limit < maxUpdateFileBytes {
+				return fmt.Errorf("plugin: archive expands to more than %d bytes", maxUpdateExtractBytes)
+			}
+			return err
+		}
+		return nil
 	})
 }
 
-func copyFileLimited(dst io.Writer, src io.Reader, max int64) error {
+// copyLimited copies at most max bytes and reports an error if src holds more.
+// It returns how many bytes were written.
+func copyLimited(dst io.Writer, src io.Reader, max int64) (int64, error) {
 	n, err := io.Copy(dst, io.LimitReader(src, max+1))
 	if err != nil {
-		return err
+		return n, err
 	}
 	if n > max {
-		return fmt.Errorf("plugin: archive entry exceeds maximum file size of %d bytes", max)
+		return n, fmt.Errorf("plugin: archive entry exceeds maximum file size of %d bytes", max)
 	}
-	return nil
+	return n, nil
 }
 
 // safeJoin joins name onto base and guarantees the result stays within base,

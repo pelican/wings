@@ -25,13 +25,13 @@ func TestCatalogFind(t *testing.T) {
 }
 
 func TestAddRejectsUnsafeName(t *testing.T) {
-	unsafe := []string{"", "../evil", "a/b", `a\b`, "x..y"}
+	unsafe := []string{"", ".", "../evil", "a/b", `a\b`, "x..y"}
 	for _, name := range unsafe {
 		err := Add(context.Background(),
 			ResolvedPlugin{Entry: CatalogEntry{Name: name, Download: "https://example.com/a.tgz", SHA256: "abc"}},
 			t.TempDir())
-		if err == nil {
-			t.Fatalf("expected rejection for unsafe name %q", name)
+		if err == nil || !strings.Contains(err.Error(), "invalid plugin name") {
+			t.Fatalf("expected %q to be refused as an invalid plugin name, got %v", name, err)
 		}
 	}
 }
@@ -96,5 +96,21 @@ func TestResolveBareNameFailsWhenARegistryIsUnreadable(t *testing.T) {
 	_, err := Resolve(context.Background(), "billing-hook")
 	if err == nil || !strings.Contains(err.Error(), `could not read registry "acme"`) {
 		t.Fatalf("an unreadable registry must fail a bare-name lookup, got %v", err)
+	}
+}
+
+func TestRegistryCredentialsOnlyGoToTheRegistryHost(t *testing.T) {
+	a := auth{token: "secret", headers: map[string]string{"X-Api-Key": "key"}}
+	same := ResolvedPlugin{Entry: CatalogEntry{Download: "https://registry.acme.test/x.tar.gz"}, auth: a, registryHost: "registry.acme.test"}
+	if got := same.downloadAuth(); got.token != "secret" || got.headers["X-Api-Key"] != "key" {
+		t.Fatalf("an archive on the registry host should get its credentials, got %+v", got)
+	}
+	cdn := ResolvedPlugin{Entry: CatalogEntry{Download: "https://cdn.example.test/x.tar.gz"}, auth: a, registryHost: "registry.acme.test"}
+	if got := cdn.downloadAuth(); got.token != "" || len(got.headers) != 0 {
+		t.Fatalf("an archive on another host must not get registry credentials, got %+v", got)
+	}
+	port := ResolvedPlugin{Entry: CatalogEntry{Download: "https://registry.acme.test:8443/x.tar.gz"}, auth: a, registryHost: "registry.acme.test"}
+	if got := port.downloadAuth(); got.token != "" {
+		t.Fatalf("another port is another host, got %+v", got)
 	}
 }

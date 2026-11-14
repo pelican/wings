@@ -22,6 +22,15 @@ const (
 	updateHTTPTimeout      = 60 * time.Second
 )
 
+// Archive-wide extraction limits. The download cap only bounds the compressed
+// archive and the per-file cap only bounds one entry, so without these a small
+// archive of many large or many tiny entries could fill the disk or its inodes.
+// Variables so tests can lower them.
+var (
+	maxUpdateExtractBytes   int64 = 512 << 20 // 512 MiB in total
+	maxUpdateExtractEntries       = 20000
+)
+
 var updateHTTPClient = &http.Client{Timeout: updateHTTPTimeout, CheckRedirect: checkPluginRedirect}
 
 // maxPluginRedirects matches net/http's default redirect limit.
