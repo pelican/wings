@@ -136,3 +136,47 @@ func asError(err error, target **Error) bool {
 	}
 	return false
 }
+
+// TestStringAndNumberIDsAreEchoed covers a peer that is not this package — for
+// example a JavaScript plugin — issuing requests with string ids, which JSON-RPC
+// 2.0 allows. The id must be echoed back as sent and the connection must stay
+// up; a numeric-only id once made the decoder fail and drop the plugin.
+func TestStringAndNumberIDsAreEchoed(t *testing.T) {
+	hostR, peerW := io.Pipe()
+	peerR, hostW := io.Pipe()
+	host := NewConn(hostR, hostW, func(_ context.Context, method string, _ json.RawMessage) (any, error) {
+		return map[string]string{"method": method}, nil
+	}, nil)
+	t.Cleanup(func() { _ = host.Close() })
+
+	dec := json.NewDecoder(peerR)
+	for _, id := range []string{`"p1"`, `7`, `"p2"`} {
+		req := `{"jsonrpc":"2.0","id":` + id + `,"method":"host.ping"}` + "\n"
+		if _, err := io.WriteString(peerW, req); err != nil {
+			t.Fatalf("write %s: %v", id, err)
+		}
+		var resp struct {
+			ID     json.RawMessage `json:"id"`
+			Result struct{ Method string }
+			Error  *Error
+		}
+		decoded := make(chan error, 1)
+		go func() { decoded <- dec.Decode(&resp) }()
+		select {
+		case err := <-decoded:
+			if err != nil {
+				t.Fatalf("decode response to id %s: %v", id, err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("no response to id %s; the connection was dropped", id)
+		}
+		if string(resp.ID) != id || resp.Error != nil || resp.Result.Method != "host.ping" {
+			t.Fatalf("id %s: got id=%s result=%+v error=%v", id, resp.ID, resp.Result, resp.Error)
+		}
+	}
+	select {
+	case <-host.Done():
+		t.Fatal("connection closed after a string id")
+	default:
+	}
+}

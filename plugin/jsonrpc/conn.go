@@ -12,6 +12,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strconv"
 	"sync"
 	"sync/atomic"
 )
@@ -32,9 +33,12 @@ type Error struct {
 
 func (e *Error) Error() string { return fmt.Sprintf("jsonrpc: %d %s", e.Code, e.Message) }
 
+// message is any JSON-RPC frame. ID is kept raw because JSON-RPC 2.0 allows a
+// string or a number, and a peer written in another language (JavaScript
+// especially) commonly uses strings; it is echoed back byte-for-byte.
 type message struct {
 	JSONRPC string          `json:"jsonrpc"`
-	ID      *uint64         `json:"id,omitempty"`
+	ID      json.RawMessage `json:"id,omitempty"`
 	Method  string          `json:"method,omitempty"`
 	Params  json.RawMessage `json:"params,omitempty"`
 	Result  json.RawMessage `json:"result,omitempty"`
@@ -49,7 +53,7 @@ type Conn struct {
 	handler Handler
 
 	nextID  atomic.Uint64
-	pending sync.Map // uint64 -> chan message
+	pending sync.Map // string(id) -> chan message
 
 	closeOnce sync.Once
 	closed    chan struct{}
@@ -80,13 +84,14 @@ func (c *Conn) readLoop(r io.Reader) {
 			c.close()
 			return
 		}
+		hasID := len(m.ID) > 0 && string(m.ID) != "null"
 		switch {
-		case m.Method != "" && m.ID != nil:
+		case m.Method != "" && hasID:
 			go c.serveRequest(m)
 		case m.Method != "":
 			go c.serveNotification(m)
-		case m.ID != nil:
-			if ch, ok := c.pending.LoadAndDelete(*m.ID); ok {
+		case hasID:
+			if ch, ok := c.pending.LoadAndDelete(string(m.ID)); ok {
 				ch.(chan message) <- m
 			}
 		}
@@ -169,12 +174,12 @@ func (c *Conn) Call(ctx context.Context, method string, params any, result any) 
 	if err != nil {
 		return err
 	}
-	id := c.nextID.Add(1)
+	id := strconv.FormatUint(c.nextID.Add(1), 10)
 	ch := make(chan message, 1)
 	c.pending.Store(id, ch)
 	defer c.pending.Delete(id)
 
-	if err := c.write(message{ID: &id, Method: method, Params: raw}); err != nil {
+	if err := c.write(message{ID: json.RawMessage(id), Method: method, Params: raw}); err != nil {
 		return err
 	}
 	select {
