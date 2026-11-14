@@ -3,6 +3,7 @@ package plugin
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -21,7 +22,28 @@ const (
 	updateHTTPTimeout      = 60 * time.Second
 )
 
-var updateHTTPClient = &http.Client{Timeout: updateHTTPTimeout}
+var updateHTTPClient = &http.Client{Timeout: updateHTTPTimeout, CheckRedirect: checkPluginRedirect}
+
+// maxPluginRedirects matches net/http's default redirect limit.
+const maxPluginRedirects = 10
+
+// checkPluginRedirect keeps every hop of a plugin fetch on https, so the scheme
+// check in httpsGet cannot be bypassed by a redirect. When a redirect leaves the
+// host the request was first sent to, every request header is dropped: net/http
+// forwards custom headers to any host and Authorization to a same-domain host,
+// and both carry private registry credentials.
+func checkPluginRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxPluginRedirects {
+		return fmt.Errorf("plugin: stopped after %d redirects", maxPluginRedirects)
+	}
+	if req.URL.Scheme != "https" {
+		return errors.New("plugin: refusing redirect to a non-https url")
+	}
+	if req.URL.Host != via[0].URL.Host {
+		req.Header = make(http.Header)
+	}
+	return nil
+}
 
 // UpdateManifest is the JSON a plugin publisher hosts at Manifest.Update.
 type UpdateManifest struct {

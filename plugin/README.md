@@ -135,6 +135,10 @@ plugins:
   grants: {}                            # per-plugin host-capability overrides
 ```
 
+The `plugins:` block is read only from the file: a configuration push from the
+Panel (`POST /api/update`) keeps the node's existing plugin policy, because the
+plugins directory also holds the operator's trust approvals.
+
 Per-plugin settings live **inside the plugin's own directory** (Wings never
 parses them). See `sdk/SPEC.md`.
 
@@ -198,7 +202,7 @@ update manifest:
   "sha256": "<hex>", "signature": "<base64>" }
 ```
 
-`wings plugins update <name>` fetches it (HTTPS only), compares versions,
+`wings plugins update <name>` fetches it (HTTPS only, including every redirect; credentials are dropped if a redirect leaves the registry host), compares versions,
 downloads the archive, **verifies the sha256 and signature policy**, extracts it
 (path-traversal guarded) into a staging dir next to the plugin, asks the
 operator to approve the staged manifest, then atomically swaps it in (keeping a

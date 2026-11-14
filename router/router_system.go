@@ -243,6 +243,12 @@ func postUpdateConfiguration(c *gin.Context) {
 		return
 	}
 
+	// Plugin policy belongs to the node operator and is only read from the
+	// config file. A push must not change it: the plugins directory also holds
+	// the operator's trust approvals, so pointing it somewhere a server user can
+	// write would let them get a plugin run by Wings.
+	cfg.Plugins = config.Get().Plugins
+
 	// Keep the SSL certificates the same since the Panel will send through Lets Encrypt
 	// default locations. However, if we picked a different location manually we don't
 	// want to override that.
