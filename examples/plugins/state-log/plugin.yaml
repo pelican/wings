@@ -1,0 +1,19 @@
+apiVersion: v1
+name: state-log
+capability: events
+version: 1.0.0
+author: example
+description: Log server state changes, and the last console lines when a server stops.
+license: MIT
+# update: https://plugins.example.com/state-log/update.json   # for `wings plugins update`
+# Entrypoint is resolved relative to this plugin's directory. Wings launches it
+# with WINGS_PLUGIN=1 and speaks JSON-RPC 2.0 over its stdio. Bun runs the
+# TypeScript source directly; no build step is required.
+entrypoint: ["bun", "index.ts"]
+provides:
+  # Only state changes are delivered; omit the list (or use "*") for every event.
+  events: ["server.state"]
+requires:
+  # Host callbacks this plugin asks for. The operator approves them with
+  # `wings plugins trust state-log` and can narrow them under plugins.grants.
+  hostAPI: ["server.logs"]

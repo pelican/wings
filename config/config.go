@@ -405,6 +405,51 @@ type Configuration struct {
 
 	// IgnorePanelConfigUpdates causes confiuration updates that are sent by the panel to be ignored.
 	IgnorePanelConfigUpdates bool `json:"ignore_panel_config_updates" yaml:"ignore_panel_config_updates"`
+
+	// Plugins configures the capability-provider plugin system.
+	Plugins PluginConfiguration `json:"plugins" yaml:"plugins"`
+}
+
+// PluginConfiguration holds the policy for the plugin system. It intentionally
+// carries only policy — which providers are permitted, and what they may access
+// — not per-plugin plumbing. External plugins describe themselves via a manifest
+// (plugin.yaml) in Directory; native providers register themselves in code.
+type PluginConfiguration struct {
+	// Directory is scanned for external plugin manifests during discovery.
+	Directory string `default:"/var/lib/pelican/plugins" json:"directory" yaml:"directory"`
+	// Autoload activates every registered/discovered provider when Enabled is
+	// empty. Set it to false alongside an explicit Enabled allowlist to lock the
+	// system down.
+	Autoload bool `default:"true" json:"autoload" yaml:"autoload"`
+	// Enabled is an optional allowlist of provider names. When non-empty only the
+	// listed providers are active, regardless of Autoload.
+	Enabled []string `json:"enabled" yaml:"enabled"`
+	// Disabled is a blocklist of provider names. A name here is never active,
+	// taking precedence over Autoload and Enabled. This is what `wings plugins
+	// disable` writes.
+	Disabled []string `json:"disabled" yaml:"disabled"`
+	// Grants optionally overrides, per provider name, the host capabilities a
+	// plugin may use. Reserved for external transports in a later milestone.
+	Grants map[string][]string `json:"grants" yaml:"grants"`
+	// Registries maps a namespace to a plugin registry, used by
+	// `wings plugins add @namespace/name`. Private (company) registries carry an
+	// auth token or headers.
+	Registries map[string]PluginRegistry `json:"registries" yaml:"registries"`
+	// RequireSignatures rejects installing or updating a plugin whose archive is
+	// not signed by a trusted key.
+	RequireSignatures bool `json:"require_signatures" yaml:"require_signatures"`
+	// TrustedKeys are the base64 Ed25519 public keys (optionally "id:key")
+	// permitted to sign plugin archives.
+	TrustedKeys []string `json:"trusted_keys" yaml:"trusted_keys"`
+}
+
+// PluginRegistry describes a plugin registry index and optional auth for private
+// (company) registries. Token and Headers values are environment-expanded
+// (${VAR}) so secrets stay out of the config file.
+type PluginRegistry struct {
+	URL     string            `json:"url" yaml:"url"`
+	Token   string            `json:"token" yaml:"token"`
+	Headers map[string]string `json:"headers" yaml:"headers"`
 }
 
 // SearchRecursion holds the configuration for directory search recursion settings.

@@ -1,0 +1,16 @@
+{
+  "name": "wings-plugin-state-log",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Reference Wings external events plugin (Bun + TypeScript).",
+  "module": "index.ts",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "compile": "bun build --compile --minify --outfile wings-plugin-state-log index.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.6.0"
+  }
+}

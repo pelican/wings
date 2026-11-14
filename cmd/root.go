@@ -33,6 +33,7 @@ import (
 	"github.com/pelican/wings/internal/cron"
 	"github.com/pelican/wings/internal/database"
 	"github.com/pelican/wings/loggers/cli"
+	"github.com/pelican/wings/plugin/external"
 	"github.com/pelican/wings/remote"
 	"github.com/pelican/wings/router"
 	"github.com/pelican/wings/server"
@@ -92,6 +93,7 @@ func init() {
 	rootCommand.AddCommand(configureCmd)
 	rootCommand.AddCommand(newDiagnosticsCommand())
 	rootCommand.AddCommand(newSelfupdateCommand())
+	rootCommand.AddCommand(newPluginsCommand())
 }
 
 func isDockerSnap() bool {
@@ -192,6 +194,19 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	if err := environment.ConfigureDocker(cmd.Context()); err != nil {
 		log.WithField("error", err).Fatal("failed to configure docker environment")
 		return
+	}
+
+	// Ensure the plugins directory exists so discovery, the trust store, and
+	// installs have a place to read from and write to.
+	if err := os.MkdirAll(config.Get().Plugins.Directory, 0o755); err != nil {
+		log.WithField("error", err).Warn("failed to create plugins directory")
+	}
+
+	// Discover and register enabled external capability plugins. Manifests are
+	// read without executing anything; the plugin processes are spawned lazily
+	// on first use. Native providers register themselves via package init.
+	if err := external.LoadEnabled(config.Get().Plugins.Directory, pluginHost{manager}); err != nil {
+		log.WithField("error", err).Warn("plugin discovery was incomplete")
 	}
 
 	if err := config.WriteToDisk(config.Get()); err != nil {
