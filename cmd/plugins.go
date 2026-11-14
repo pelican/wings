@@ -156,16 +156,21 @@ func newPluginsAddCommand() *cobra.Command {
 				stage.Cleanup()
 				os.Exit(1)
 			}
+			// Until the approval is saved the install can still be undone; a
+			// plugin left installed without an approval would never load.
 			m, err = plugin.LoadManifest(filepath.Join(dir, m.Name, plugin.ManifestFile))
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "installed, but could not read manifest for trust approval: %v\n", err)
-				stage.Cleanup()
+				fmt.Fprintf(os.Stderr, "install failed: could not read the installed manifest for trust approval: %v\n", err)
+				rollbackOrWarn(stage)
 				os.Exit(1)
 			}
 			if err := recordPluginTrust(m); err != nil {
-				fmt.Fprintf(os.Stderr, "recording trust: %v\n", err)
-				stage.Cleanup()
+				fmt.Fprintf(os.Stderr, "install failed: recording trust: %v\n", err)
+				rollbackOrWarn(stage)
 				os.Exit(1)
+			}
+			if err := stage.Finish(); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not remove the previous version's backup: %v\n", err)
 			}
 			fmt.Printf("installed and trusted %s %s. Restart Wings to load it.\n", m.Name, m.Version)
 		},
@@ -226,6 +231,16 @@ func newPluginsUntrustCommand() *cobra.Command {
 			fmt.Printf("untrusted %s. Restart Wings to unload it.\n", args[0])
 		},
 	}
+}
+
+// rollbackOrWarn undoes a committed install after a later step failed, and
+// says so if even that fails, since the plugins directory then needs a look.
+func rollbackOrWarn(stage *plugin.StagedInstall) {
+	if err := stage.Rollback(); err != nil {
+		fmt.Fprintf(os.Stderr, "could not restore the previous state: %v\n", err)
+		return
+	}
+	fmt.Fprintln(os.Stderr, "the previous state was restored.")
 }
 
 // reviewPlugin prints the plugin's details + requested host access and asks the
@@ -371,16 +386,22 @@ func newPluginsUpdateCommand() *cobra.Command {
 				stage.Cleanup()
 				os.Exit(1)
 			}
+			// Until the approval is saved the update can still be undone; the
+			// new version without an approval would never load, and the old
+			// one would be gone.
 			m, err = plugin.LoadManifest(info.Manifest)
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "updated, but could not read manifest for trust approval: %v\n", err)
-				stage.Cleanup()
+				fmt.Fprintf(os.Stderr, "update failed: could not read the installed manifest for trust approval: %v\n", err)
+				rollbackOrWarn(stage)
 				os.Exit(1)
 			}
 			if err := recordPluginTrust(m); err != nil {
-				fmt.Fprintf(os.Stderr, "recording trust: %v\n", err)
-				stage.Cleanup()
+				fmt.Fprintf(os.Stderr, "update failed: recording trust: %v\n", err)
+				rollbackOrWarn(stage)
 				os.Exit(1)
+			}
+			if err := stage.Finish(); err != nil {
+				fmt.Fprintf(os.Stderr, "warning: could not remove the previous version's backup: %v\n", err)
 			}
 			fmt.Printf("updated and trusted %s to %s. Restart Wings to load the new version.\n", st.Name, st.Latest)
 		},

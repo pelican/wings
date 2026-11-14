@@ -178,7 +178,10 @@ func Add(ctx context.Context, r ResolvedPlugin, pluginsDir string) error {
 		return err
 	}
 	defer stage.Cleanup()
-	return stage.Commit()
+	if err := stage.Commit(); err != nil {
+		return err
+	}
+	return stage.Finish()
 }
 
 // StageAdd downloads and extracts a registry plugin without committing it. The

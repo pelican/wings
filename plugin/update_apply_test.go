@@ -87,3 +87,103 @@ func TestExtractArchiveEnforcesEntryCount(t *testing.T) {
 		t.Fatalf("expected the entry limit to stop extraction, got %v", err)
 	}
 }
+
+// pluginDir writes a directory holding one file whose contents identify it.
+func pluginDir(t *testing.T, path, contents string) {
+	t.Helper()
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(path, "id"), []byte(contents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readID(t *testing.T, path string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(path, "id"))
+	if err != nil {
+		t.Fatalf("reading %s: %v", path, err)
+	}
+	return string(b)
+}
+
+func hiddenEntries(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".") {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+func TestUpdateLeavesAPluginNamedBakAlone(t *testing.T) {
+	dir := t.TempDir()
+	pluginDir(t, filepath.Join(dir, "audit"), "audit v1")
+	pluginDir(t, filepath.Join(dir, "audit.bak"), "a different plugin")
+	pluginDir(t, filepath.Join(dir, ".wings-install-1"), "audit v2")
+
+	stage := &StagedInstall{DestDir: filepath.Join(dir, "audit"), StagingDir: filepath.Join(dir, ".wings-install-1")}
+	if err := stage.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stage.Finish(); err != nil {
+		t.Fatal(err)
+	}
+
+	if got := readID(t, filepath.Join(dir, "audit.bak")); got != "a different plugin" {
+		t.Fatalf("audit.bak was touched: %q", got)
+	}
+	if got := readID(t, filepath.Join(dir, "audit")); got != "audit v2" {
+		t.Fatalf("audit = %q, want v2", got)
+	}
+	if h := hiddenEntries(t, dir); len(h) != 0 {
+		t.Fatalf("left behind: %v", h)
+	}
+}
+
+func TestRollbackRestoresThePreviousVersion(t *testing.T) {
+	dir := t.TempDir()
+	pluginDir(t, filepath.Join(dir, "audit"), "audit v1")
+	pluginDir(t, filepath.Join(dir, ".wings-install-1"), "audit v2")
+
+	stage := &StagedInstall{DestDir: filepath.Join(dir, "audit"), StagingDir: filepath.Join(dir, ".wings-install-1")}
+	if err := stage.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readID(t, filepath.Join(dir, "audit")); got != "audit v2" {
+		t.Fatalf("after commit audit = %q", got)
+	}
+	// Recording the approval failed: the update has to be undone.
+	if err := stage.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readID(t, filepath.Join(dir, "audit")); got != "audit v1" {
+		t.Fatalf("after rollback audit = %q, want v1", got)
+	}
+	if h := hiddenEntries(t, dir); len(h) != 0 {
+		t.Fatalf("left behind: %v", h)
+	}
+}
+
+func TestRollbackOfAFreshInstallRemovesIt(t *testing.T) {
+	dir := t.TempDir()
+	pluginDir(t, filepath.Join(dir, ".wings-install-1"), "audit v1")
+
+	stage := &StagedInstall{DestDir: filepath.Join(dir, "audit"), StagingDir: filepath.Join(dir, ".wings-install-1")}
+	if err := stage.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stage.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "audit")); !os.IsNotExist(err) {
+		t.Fatalf("a rolled-back fresh install should be gone, stat err = %v", err)
+	}
+}

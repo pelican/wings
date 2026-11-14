@@ -126,3 +126,23 @@ func TestLoadManifestRejectsIncomplete(t *testing.T) {
 		t.Fatal("expected validation error for incomplete manifest")
 	}
 }
+
+func TestDiscoverSkipsHiddenDirectories(t *testing.T) {
+	dir := t.TempDir()
+	manifest := "" +
+		"apiVersion: v1\n" +
+		"name: audit\n" +
+		"capability: events\n" +
+		"entrypoint: [\"node\", \"index.js\"]\n"
+	writeManifest(t, dir, "audit", manifest)
+	// What an interrupted install leaves behind: a second copy of the plugin.
+	writeManifest(t, dir, ".wings-install-123", manifest)
+
+	got, issues, err := DiscoverDetailed(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].Name != "audit" || len(issues) != 0 {
+		t.Fatalf("a hidden leftover must not hide the real plugin: got %d manifests, issues %v", len(got), issues)
+	}
+}

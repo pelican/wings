@@ -25,7 +25,10 @@ func ApplyUpdate(ctx context.Context, st UpdateStatus) error {
 		return err
 	}
 	defer stage.Cleanup()
-	return stage.Commit()
+	if err := stage.Commit(); err != nil {
+		return err
+	}
+	return stage.Finish()
 }
 
 // StageUpdate downloads, verifies, and extracts an update without replacing the
@@ -72,6 +75,9 @@ type StagedInstall struct {
 	DestDir    string
 	StagingDir string
 	committed  bool
+	// backupHolder is the hidden directory holding the previous version
+	// between Commit and Finish or Rollback. Empty for a fresh install.
+	backupHolder string
 }
 
 // Manifest loads the staged plugin manifest without executing plugin code.
@@ -79,15 +85,50 @@ func (s *StagedInstall) Manifest() (Manifest, error) {
 	return LoadManifest(filepath.Join(s.StagingDir, ManifestFile))
 }
 
-// Commit atomically replaces DestDir with StagingDir.
+// Commit moves StagingDir into place as DestDir. The previous version is kept
+// until Finish discards it or Rollback restores it, so a caller that still has
+// work to do after the swap (recording the operator's approval) can undo it.
+// If the swap itself fails, the previous version is already back in place.
 func (s *StagedInstall) Commit() error {
 	if s.committed {
 		return nil
 	}
-	if err := swapDir(s.DestDir, s.StagingDir); err != nil {
+	holder, err := swapIn(s.DestDir, s.StagingDir)
+	if err != nil {
 		return err
 	}
+	s.backupHolder = holder
 	s.committed = true
+	return nil
+}
+
+// Finish discards the previous version kept by Commit.
+func (s *StagedInstall) Finish() error {
+	if s == nil || s.backupHolder == "" {
+		return nil
+	}
+	err := os.RemoveAll(s.backupHolder)
+	s.backupHolder = ""
+	return err
+}
+
+// Rollback undoes a Commit: the new version is removed and the previous one,
+// if there was one, is put back.
+func (s *StagedInstall) Rollback() error {
+	if s == nil || !s.committed {
+		return nil
+	}
+	if err := os.RemoveAll(s.DestDir); err != nil {
+		return fmt.Errorf("plugin: removing new version: %w", err)
+	}
+	if s.backupHolder != "" {
+		if err := os.Rename(filepath.Join(s.backupHolder, backupName), s.DestDir); err != nil {
+			return fmt.Errorf("plugin: restoring previous version from %s: %w", s.backupHolder, err)
+		}
+		_ = os.RemoveAll(s.backupHolder)
+		s.backupHolder = ""
+	}
+	s.committed = false
 	return nil
 }
 
@@ -210,21 +251,37 @@ func safeJoin(base, name string) (string, error) {
 	return target, nil
 }
 
-// swapDir replaces dst with the freshly-extracted staging directory, keeping a
-// ".bak" of the old one that is restored if the swap fails.
-func swapDir(dst, staging string) error {
-	backup := dst + ".bak"
-	_ = os.RemoveAll(backup)
+// backupName is the previous version's name inside its backup holder.
+const backupName = "previous"
 
-	if _, err := os.Stat(dst); err == nil {
-		if err := os.Rename(dst, backup); err != nil {
-			return fmt.Errorf("plugin: backing up current plugin: %w", err)
+// swapIn moves staging to dst. An existing dst is first moved into a new hidden
+// directory next to it (".wings-backup-*"), whose path is returned so the
+// caller can discard or restore it. The backup never takes a name another
+// plugin could have: a fixed "<name>.bak" is a valid plugin directory, and
+// clearing it out before the swap would delete that plugin.
+func swapIn(dst, staging string) (string, error) {
+	if _, err := os.Lstat(dst); os.IsNotExist(err) {
+		if err := os.Rename(staging, dst); err != nil {
+			return "", fmt.Errorf("plugin: installing new plugin: %w", err)
 		}
+		return "", nil
+	} else if err != nil {
+		return "", err
+	}
+
+	holder, err := os.MkdirTemp(filepath.Dir(dst), ".wings-backup-*")
+	if err != nil {
+		return "", fmt.Errorf("plugin: creating backup directory: %w", err)
+	}
+	backup := filepath.Join(holder, backupName)
+	if err := os.Rename(dst, backup); err != nil {
+		_ = os.Remove(holder)
+		return "", fmt.Errorf("plugin: backing up current plugin: %w", err)
 	}
 	if err := os.Rename(staging, dst); err != nil {
 		_ = os.Rename(backup, dst) // roll back
-		return fmt.Errorf("plugin: installing new plugin: %w", err)
+		_ = os.Remove(holder)
+		return "", fmt.Errorf("plugin: installing new plugin: %w", err)
 	}
-	_ = os.RemoveAll(backup)
-	return nil
+	return holder, nil
 }

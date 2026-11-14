@@ -105,11 +105,13 @@ func (m Manifest) validate() error {
 }
 
 // invalidPluginName reports whether name cannot be used as a plugin's own
-// directory under the plugins directory. "." is refused as well as separators
-// and "..": filepath.Join(dir, ".") is dir itself, so installing a plugin
-// named "." would replace every plugin and the trust store.
+// directory under the plugins directory. Separators and ".." are refused, and
+// so is a leading ".": filepath.Join(dir, ".") is dir itself, so installing a
+// plugin named "." would replace every plugin and the trust store, and hidden
+// directories are where installs keep their staging and backup copies, which
+// discovery skips.
 func invalidPluginName(name string) bool {
-	return name == "" || name == "." || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..")
+	return name == "" || strings.HasPrefix(name, ".") || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..")
 }
 
 // DiscoveryIssue is a per-plugin discovery failure. It lets operator tooling
@@ -178,7 +180,11 @@ func DiscoverDetailed(dir string) ([]Manifest, []DiscoveryIssue, error) {
 	var loaded []Manifest
 	var issues []DiscoveryIssue
 	for _, e := range entries {
-		if !e.IsDir() {
+		// Hidden directories hold in-progress installs and the previous
+		// version during an update (.wings-install-*, .wings-backup-*). One
+		// left behind by an interrupted run would otherwise show up as a
+		// second copy of the plugin and get both copies rejected.
+		if !e.IsDir() || strings.HasPrefix(e.Name(), ".") {
 			continue
 		}
 		path := filepath.Join(dir, e.Name(), ManifestFile)
