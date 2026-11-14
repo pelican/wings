@@ -15,8 +15,10 @@ import (
 )
 
 // ServeEventListener runs an events-capability plugin, blocking until the host
-// closes stdin. Each "event" notification from Wings is passed to s.OnEvent;
-// an error returned from OnEvent is written to stderr, which Wings logs.
+// closes stdin. Each "event" notification from Wings is passed to s.OnEvent,
+// one at a time and in the order Wings sent them; if OnEvent falls
+// jsonrpc.NotificationQueueSize events behind, newer ones are dropped. An error
+// returned from OnEvent is written to stderr, which Wings logs.
 func ServeEventListener(s plugin.EventListener) error {
 	return serveEventListener(os.Stdin, os.Stdout, os.Stderr, s)
 }

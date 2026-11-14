@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"runtime"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -209,5 +211,126 @@ func TestWriteTimesOutWhenThePeerStopsReading(t *testing.T) {
 	}
 	if err := host.Notify("event", nil); !errors.Is(err, ErrClosed) {
 		t.Fatalf("a later write = %v, want ErrClosed", err)
+	}
+}
+
+// writeNotifications sends n "event" notifications numbered 0..n-1.
+func writeNotifications(t *testing.T, w io.Writer, n int) {
+	t.Helper()
+	for i := 0; i < n; i++ {
+		msg := `{"jsonrpc":"2.0","method":"event","params":{"n":` + strconv.Itoa(i) + `}}` + "\n"
+		if _, err := io.WriteString(w, msg); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+	}
+}
+
+func TestNotificationsAreHandledInOrder(t *testing.T) {
+	got := make(chan int, 100)
+	r, w := io.Pipe()
+	c := NewConn(r, io.Discard, func(_ context.Context, _ string, params json.RawMessage) (any, error) {
+		var p struct{ N int }
+		_ = json.Unmarshal(params, &p)
+		time.Sleep(time.Duration(p.N%3) * time.Millisecond) // uneven work per event
+		got <- p.N
+		return nil, nil
+	}, nil)
+	t.Cleanup(func() { _ = c.Close() })
+
+	writeNotifications(t, w, 50)
+	for want := 0; want < 50; want++ {
+		select {
+		case n := <-got:
+			if n != want {
+				t.Fatalf("notification %d handled at position %d", n, want)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("notification %d never handled", want)
+		}
+	}
+}
+
+func TestSlowNotificationHandlerStaysBounded(t *testing.T) {
+	prev := NotificationQueueSize
+	NotificationQueueSize = 8
+	release := make(chan struct{})
+	handled := make(chan int, 1000)
+	r, w := io.Pipe()
+	c := NewConn(r, io.Discard, func(_ context.Context, _ string, params json.RawMessage) (any, error) {
+		var p struct{ N int }
+		_ = json.Unmarshal(params, &p)
+		<-release
+		handled <- p.N
+		return nil, nil
+	}, nil)
+	NotificationQueueSize = prev
+	t.Cleanup(func() { _ = c.Close() })
+
+	before := runtime.NumGoroutine()
+	writeNotifications(t, w, 1000)
+	if grew := runtime.NumGoroutine() - before; grew > 5 {
+		t.Fatalf("a stuck handler made the connection start %d goroutines", grew)
+	}
+	close(release)
+
+	// Roughly one in the handler plus a full queue get through, in order; the
+	// rest are dropped. A few of the last notifications may still be in the
+	// decoder's buffer when the handler is released, so the exact split varies.
+	var got []int
+	deadline := time.After(5 * time.Second)
+	for len(got)+int(c.Dropped()) < 1000 {
+		select {
+		case n := <-handled:
+			got = append(got, n)
+		case <-time.After(10 * time.Millisecond):
+		case <-deadline:
+			t.Fatalf("handled %d and dropped %d of 1000", len(got), c.Dropped())
+		}
+	}
+	for i := 1; i < len(got); i++ {
+		if got[i] <= got[i-1] {
+			t.Fatalf("handled out of order: %v", got)
+		}
+	}
+	if len(got) > 20 {
+		t.Fatalf("%d notifications got through a queue of 8 while the handler was stuck", len(got))
+	}
+}
+
+// TestNotificationHandlerCanCallBack covers a plugin that asks Wings for
+// something while handling an event; that needs the read loop to keep running.
+func TestNotificationHandlerCanCallBack(t *testing.T) {
+	hostR, peerW := io.Pipe()
+	peerR, hostW := io.Pipe()
+
+	answered := make(chan string, 1)
+	var peer *Conn
+	ready := make(chan struct{})
+	peer = NewConn(peerR, peerW, func(ctx context.Context, method string, _ json.RawMessage) (any, error) {
+		<-ready
+		var out struct{ Lines []string }
+		if err := peer.Call(ctx, "host.server.logs", nil, &out); err != nil {
+			answered <- "error: " + err.Error()
+			return nil, nil
+		}
+		answered <- out.Lines[0]
+		return nil, nil
+	}, nil)
+	close(ready)
+	host := NewConn(hostR, hostW, func(_ context.Context, method string, _ json.RawMessage) (any, error) {
+		return map[string][]string{"lines": {"server stopped"}}, nil
+	}, nil)
+	t.Cleanup(func() { _ = host.Close(); _ = peer.Close() })
+
+	if err := host.Notify("event", map[string]string{"type": "server.state"}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case got := <-answered:
+		if got != "server stopped" {
+			t.Fatalf("host call from a notification handler: %s", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a host call made while handling a notification never returned")
 	}
 }

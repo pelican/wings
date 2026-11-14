@@ -32,6 +32,13 @@ var ErrWriteTimeout = errors.New("jsonrpc: write timed out; connection closed")
 // Each connection reads it once, when it is created.
 var WriteTimeout = 10 * time.Second
 
+// NotificationQueueSize bounds the inbound notifications waiting for the
+// handler. They are handled one at a time, in the order they arrived; when the
+// handler falls this far behind, newer ones are dropped (see Dropped) instead
+// of piling up as goroutines. Each connection reads it once, when it is
+// created.
+var NotificationQueueSize = 256
+
 // Handler processes an inbound request or notification from the peer. For a
 // notification (no response expected) the returned values are ignored. A nil
 // Handler rejects inbound requests with a method-not-found error.
@@ -71,6 +78,9 @@ type Conn struct {
 	closed       chan struct{}
 	closer       io.Closer
 	writeTimeout time.Duration
+
+	notes   chan message // inbound notifications, in arrival order
+	dropped atomic.Uint64
 }
 
 // NewConn starts a connection reading from r and writing to w. handler may be
@@ -86,9 +96,25 @@ func NewConn(r io.Reader, w io.Writer, handler Handler, closer io.Closer) *Conn 
 		closer:  closer,
 
 		writeTimeout: WriteTimeout,
+		notes:        make(chan message, NotificationQueueSize),
 	}
 	go c.readLoop(r)
+	go c.notificationLoop()
 	return c
+}
+
+// Dropped reports how many inbound notifications were dropped because the
+// handler had NotificationQueueSize of them still waiting.
+func (c *Conn) Dropped() uint64 { return c.dropped.Load() }
+
+// notificationLoop hands queued notifications to the handler one at a time.
+// They are not handled on the read loop itself: a handler that makes a Call
+// (a plugin asking Wings for something while handling an event) needs the read
+// loop free to receive the response.
+func (c *Conn) notificationLoop() {
+	for m := range c.notes {
+		c.serveNotification(m)
+	}
 }
 
 func (c *Conn) readLoop(r io.Reader) {
@@ -96,6 +122,7 @@ func (c *Conn) readLoop(r io.Reader) {
 	for {
 		var m message
 		if err := dec.Decode(&m); err != nil {
+			close(c.notes) // the read loop is the only sender
 			c.close()
 			return
 		}
@@ -104,7 +131,11 @@ func (c *Conn) readLoop(r io.Reader) {
 		case m.Method != "" && hasID:
 			go c.serveRequest(m)
 		case m.Method != "":
-			go c.serveNotification(m)
+			select {
+			case c.notes <- m:
+			default:
+				c.dropped.Add(1)
+			}
 		case hasID:
 			if ch, ok := c.pending.LoadAndDelete(string(m.ID)); ok {
 				ch.(chan message) <- m
