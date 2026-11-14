@@ -52,7 +52,7 @@ func newPluginsKeygenCommand() *cobra.Command {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
 				os.Exit(1)
 			}
-			if err := os.WriteFile(out, []byte(priv+"\n"), 0o600); err != nil {
+			if err := writePrivateKey(out, priv); err != nil {
 				fmt.Fprintf(os.Stderr, "writing private key: %v\n", err)
 				os.Exit(1)
 			}
@@ -62,6 +62,22 @@ func newPluginsKeygenCommand() *cobra.Command {
 	}
 	cmd.Flags().StringVar(&out, "out", "wings-plugin.key", "path to write the private key")
 	return cmd
+}
+
+// writePrivateKey creates path with mode 0600 and refuses to touch an existing
+// file. os.WriteFile would truncate an existing file and keep its permissions,
+// so a key written over a world-readable file would stay world-readable.
+func writePrivateKey(path, priv string) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	if _, err := f.WriteString(priv + "\n"); err != nil {
+		f.Close()
+		os.Remove(path)
+		return err
+	}
+	return f.Close()
 }
 
 func newPluginsSignCommand() *cobra.Command {
@@ -113,6 +129,8 @@ func newPluginsAddCommand() *cobra.Command {
 				fmt.Fprintf(os.Stderr, "install failed: %v\n", err)
 				os.Exit(1)
 			}
+			// os.Exit skips deferred calls, so every exit below removes the
+			// staging directory itself.
 			defer stage.Cleanup()
 
 			// Read the staged manifest and ask the operator to approve it
@@ -120,11 +138,13 @@ func newPluginsAddCommand() *cobra.Command {
 			m, err := stage.Manifest()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "install failed: could not read staged manifest for trust approval: %v\n", err)
+				stage.Cleanup()
 				os.Exit(1)
 			}
 			ok, err := reviewPlugin(m, assumeYes)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
+				stage.Cleanup()
 				os.Exit(1)
 			}
 			if !ok {
@@ -133,15 +153,18 @@ func newPluginsAddCommand() *cobra.Command {
 			}
 			if err := stage.Commit(); err != nil {
 				fmt.Fprintf(os.Stderr, "install failed: %v\n", err)
+				stage.Cleanup()
 				os.Exit(1)
 			}
 			m, err = plugin.LoadManifest(filepath.Join(dir, m.Name, plugin.ManifestFile))
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "installed, but could not read manifest for trust approval: %v\n", err)
+				stage.Cleanup()
 				os.Exit(1)
 			}
 			if err := recordPluginTrust(m); err != nil {
 				fmt.Fprintf(os.Stderr, "recording trust: %v\n", err)
+				stage.Cleanup()
 				os.Exit(1)
 			}
 			fmt.Printf("installed and trusted %s %s. Restart Wings to load it.\n", m.Name, m.Version)
@@ -314,23 +337,29 @@ func newPluginsUpdateCommand() *cobra.Command {
 				fmt.Fprintf(os.Stderr, "update failed: %v\n", err)
 				os.Exit(1)
 			}
+			// os.Exit skips deferred calls, so every exit below removes the
+			// staging directory itself.
 			defer stage.Cleanup()
 			m, err = stage.Manifest()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "update failed: could not read staged manifest: %v\n", err)
+				stage.Cleanup()
 				os.Exit(1)
 			}
 			if m.Name != st.Name {
 				fmt.Fprintf(os.Stderr, "update failed: staged manifest name %q does not match plugin %q\n", m.Name, st.Name)
+				stage.Cleanup()
 				os.Exit(1)
 			}
 			if m.Version != st.Latest {
 				fmt.Fprintf(os.Stderr, "update failed: staged manifest version %q does not match update version %q\n", m.Version, st.Latest)
+				stage.Cleanup()
 				os.Exit(1)
 			}
 			ok, err = reviewPlugin(m, assumeYes)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
+				stage.Cleanup()
 				os.Exit(1)
 			}
 			if !ok {
@@ -339,15 +368,18 @@ func newPluginsUpdateCommand() *cobra.Command {
 			}
 			if err := stage.Commit(); err != nil {
 				fmt.Fprintf(os.Stderr, "update failed: %v\n", err)
+				stage.Cleanup()
 				os.Exit(1)
 			}
 			m, err = plugin.LoadManifest(info.Manifest)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "updated, but could not read manifest for trust approval: %v\n", err)
+				stage.Cleanup()
 				os.Exit(1)
 			}
 			if err := recordPluginTrust(m); err != nil {
 				fmt.Fprintf(os.Stderr, "recording trust: %v\n", err)
+				stage.Cleanup()
 				os.Exit(1)
 			}
 			fmt.Printf("updated and trusted %s to %s. Restart Wings to load the new version.\n", st.Name, st.Latest)
@@ -429,9 +461,27 @@ func newPluginsGetCommand() *cobra.Command {
 	}
 }
 
-// newPluginsToggleCommand builds the shared enable/disable command. enable=true
-// removes the provider from the blocklist (and adds it to a non-empty
-// allowlist); enable=false adds it to the blocklist.
+// togglePlugin updates plugin policy so name ends up enabled or disabled.
+//
+// Enabling removes it from the blocklist and, when the allowlist is in force
+// (non-empty, or autoload is off so only listed plugins run), adds it there.
+// Disabling only adds it to the blocklist, which always wins; it leaves the
+// allowlist alone, because removing the last entry would empty the allowlist
+// and, with autoload on, turn every other plugin on.
+func togglePlugin(p *config.PluginConfiguration, name string, enable bool) {
+	if enable {
+		p.Disabled = removeString(p.Disabled, name)
+		if (!p.Autoload || len(p.Enabled) > 0) && !containsString(p.Enabled, name) {
+			p.Enabled = append(p.Enabled, name)
+		}
+		return
+	}
+	if !containsString(p.Disabled, name) {
+		p.Disabled = append(p.Disabled, name)
+	}
+}
+
+// newPluginsToggleCommand builds the shared enable/disable command.
 func newPluginsToggleCommand(verb string, enable bool) *cobra.Command {
 	return &cobra.Command{
 		Use:   verb + " <name>",
@@ -440,18 +490,7 @@ func newPluginsToggleCommand(verb string, enable bool) *cobra.Command {
 		Run: func(cmd *cobra.Command, args []string) {
 			name := args[0]
 			c := config.Get()
-			p := &c.Plugins
-			if enable {
-				p.Disabled = removeString(p.Disabled, name)
-				if len(p.Enabled) > 0 && !containsString(p.Enabled, name) {
-					p.Enabled = append(p.Enabled, name)
-				}
-			} else {
-				p.Enabled = removeString(p.Enabled, name)
-				if !containsString(p.Disabled, name) {
-					p.Disabled = append(p.Disabled, name)
-				}
-			}
+			togglePlugin(&c.Plugins, name, enable)
 			if err := config.WriteToDisk(c); err != nil {
 				fmt.Fprintf(os.Stderr, "failed to write config: %v\n", err)
 				os.Exit(1)
