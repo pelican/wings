@@ -327,3 +327,22 @@ func TestInstallsOnTheSameDirectoryWaitForEachOther(t *testing.T) {
 		t.Fatalf("audit = %q, want B's version", got)
 	}
 }
+
+func TestExtractArchiveRefusesEntriesOutsideTheDestination(t *testing.T) {
+	for _, name := range []string{"../escaped.txt", "a/../../escaped.txt", "/escaped.txt"} {
+		t.Run(name, func(t *testing.T) {
+			parent := t.TempDir()
+			dest := filepath.Join(parent, "plugin")
+			if err := os.Mkdir(dest, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			archive := writeTar(t, []tarEntry{{name: name, typ: tar.TypeReg, body: "x"}})
+			if err := extractArchive(context.Background(), archive, dest); err == nil {
+				t.Fatal("expected the entry to be refused")
+			}
+			if _, err := os.Stat(filepath.Join(parent, "escaped.txt")); !os.IsNotExist(err) {
+				t.Fatalf("a file was written outside the destination (stat err = %v)", err)
+			}
+		})
+	}
+}

@@ -2,12 +2,15 @@ package plugin
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 
@@ -59,26 +62,56 @@ func stageArchive(ctx context.Context, download, wantSHA256, signature, destDir 
 	if err := os.MkdirAll(parent, 0o755); err != nil {
 		return nil, err
 	}
-	staging, err := os.MkdirTemp(parent, ".wings-install-*")
+	root, err := os.OpenRoot(parent)
+	if err != nil {
+		return nil, err
+	}
+	defer root.Close()
+	staging, err := mkdirHidden(root, ".wings-install-")
 	if err != nil {
 		return nil, err
 	}
 
-	if err := extractArchive(ctx, archivePath, staging); err != nil {
-		_ = os.RemoveAll(staging)
+	if err := extractArchive(ctx, archivePath, filepath.Join(parent, staging)); err != nil {
+		_ = root.RemoveAll(staging)
 		return nil, err
 	}
-	return &StagedInstall{DestDir: destDir, StagingDir: staging}, nil
+	return &StagedInstall{DestDir: destDir, StagingDir: filepath.Join(parent, staging)}, nil
+}
+
+// mkdirHidden creates a new, uniquely named directory "<prefix><random>" in
+// root and returns its name.
+func mkdirHidden(root *os.Root, prefix string) (string, error) {
+	for i := 0; i < 10; i++ {
+		b := make([]byte, 8)
+		if _, err := rand.Read(b); err != nil {
+			return "", err
+		}
+		name := prefix + hex.EncodeToString(b)
+		err := root.Mkdir(name, 0o755)
+		if err == nil {
+			return name, nil
+		}
+		if !errors.Is(err, fs.ErrExist) {
+			return "", err
+		}
+	}
+	return "", errors.New("plugin: could not create a unique working directory")
 }
 
 // StagedInstall is an extracted, verified plugin archive waiting to be swapped
 // into its final directory.
+//
+// Every change to the plugins directory below goes through an os.Root opened on
+// it, so a plugin name or a path inside an archive can never reach outside it,
+// whatever checks were missed earlier.
 type StagedInstall struct {
 	DestDir    string
 	StagingDir string
 	committed  bool
-	// backupHolder is the hidden directory holding the previous version
-	// between Commit and Finish or Rollback. Empty for a fresh install.
+	// backupHolder is the hidden directory (relative to the plugins
+	// directory) holding the previous version between Commit and Finish or
+	// Rollback. Empty for a fresh install.
 	backupHolder string
 	// lock is the plugins directory's install lock, held from Commit until
 	// Finish or Rollback.
@@ -89,12 +122,25 @@ type StagedInstall struct {
 // A hidden file, so discovery never looks at it.
 const installLockName = ".install.lock"
 
+// backupName is the previous version's name inside its backup holder.
+const backupName = "previous"
+
+// pluginsRoot opens the directory that holds DestDir and returns it with the
+// names of the plugin and its staging directory inside it.
+func (s *StagedInstall) pluginsRoot() (root *os.Root, name, staging string, err error) {
+	root, err = os.OpenRoot(filepath.Dir(s.DestDir))
+	if err != nil {
+		return nil, "", "", err
+	}
+	return root, filepath.Base(s.DestDir), filepath.Base(s.StagingDir), nil
+}
+
 // lockInstalls takes the plugins directory's install lock, waiting for any
 // other install (in this or another process) to finish or roll back first.
 // Without it, a second install could swap in between another's Commit and its
 // Rollback, and that Rollback would delete the second install's files.
-func lockInstalls(pluginsDir string) (*os.File, error) {
-	f, err := os.OpenFile(filepath.Join(pluginsDir, installLockName), os.O_CREATE|os.O_RDWR, 0o600)
+func lockInstalls(root *os.Root) (*os.File, error) {
+	f, err := root.OpenFile(installLockName, os.O_CREATE|os.O_RDWR, 0o600)
 	if err != nil {
 		return nil, fmt.Errorf("plugin: opening install lock: %w", err)
 	}
@@ -126,11 +172,16 @@ func (s *StagedInstall) Commit() error {
 	if s.committed {
 		return nil
 	}
-	lock, err := lockInstalls(filepath.Dir(s.DestDir))
+	root, name, staging, err := s.pluginsRoot()
 	if err != nil {
 		return err
 	}
-	holder, err := swapIn(s.DestDir, s.StagingDir)
+	defer root.Close()
+	lock, err := lockInstalls(root)
+	if err != nil {
+		return err
+	}
+	holder, err := swapIn(root, name, staging)
 	if err != nil {
 		_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
 		_ = lock.Close()
@@ -151,7 +202,12 @@ func (s *StagedInstall) Finish() error {
 	if s.backupHolder == "" {
 		return nil
 	}
-	err := os.RemoveAll(s.backupHolder)
+	root, _, _, err := s.pluginsRoot()
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	err = root.RemoveAll(s.backupHolder)
 	s.backupHolder = ""
 	return err
 }
@@ -163,14 +219,19 @@ func (s *StagedInstall) Rollback() error {
 		return nil
 	}
 	defer s.unlock()
-	if err := os.RemoveAll(s.DestDir); err != nil {
+	root, name, _, err := s.pluginsRoot()
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	if err := root.RemoveAll(name); err != nil {
 		return fmt.Errorf("plugin: removing new version: %w", err)
 	}
 	if s.backupHolder != "" {
-		if err := os.Rename(filepath.Join(s.backupHolder, backupName), s.DestDir); err != nil {
+		if err := root.Rename(path.Join(s.backupHolder, backupName), name); err != nil {
 			return fmt.Errorf("plugin: restoring previous version from %s: %w", s.backupHolder, err)
 		}
-		_ = os.RemoveAll(s.backupHolder)
+		_ = root.RemoveAll(s.backupHolder)
 		s.backupHolder = ""
 	}
 	s.committed = false
@@ -182,7 +243,12 @@ func (s *StagedInstall) Cleanup() error {
 	if s == nil || s.committed {
 		return nil
 	}
-	return os.RemoveAll(s.StagingDir)
+	root, _, staging, err := s.pluginsRoot()
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	return root.RemoveAll(staging)
 }
 
 // downloadAndVerify streams the archive to a temp file while hashing it, checks
@@ -215,6 +281,9 @@ func downloadAndVerify(ctx context.Context, rawURL, wantSHA256 string, a auth) (
 	return tmp.Name(), digest, nil
 }
 
+// extractArchive unpacks archivePath into dest. Every write goes through an
+// os.Root opened on dest, so no entry name, ".." or symlink can place a file
+// outside it.
 func extractArchive(ctx context.Context, archivePath, dest string) error {
 	f, err := os.Open(archivePath)
 	if err != nil {
@@ -230,12 +299,17 @@ func extractArchive(ctx context.Context, archivePath, dest string) error {
 	if !ok {
 		return errors.New("plugin: archive format is not extractable")
 	}
+	root, err := os.OpenRoot(dest)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
 
 	// Symlinks are created only after every file and directory is written, so
-	// no entry is ever written through a link, and each link must then resolve
-	// inside dest. Checking each link's text on its own is not enough: a chain
-	// of links that each look harmless can still lead outside.
-	type link struct{ path, target string }
+	// no entry is ever written through one, and each must then resolve inside
+	// dest. Checking each link's text on its own is not enough: a chain of
+	// links that each look harmless can still lead outside.
+	type link struct{ name, target string }
 	var links []link
 
 	var entries int
@@ -245,27 +319,30 @@ func extractArchive(ctx context.Context, archivePath, dest string) error {
 		if entries > maxUpdateExtractEntries {
 			return fmt.Errorf("plugin: archive has more than %d entries", maxUpdateExtractEntries)
 		}
-		target, err := safeJoin(dest, af.NameInArchive)
+		name, err := entryName(af.NameInArchive)
 		if err != nil {
 			return err
+		}
+		if name == "." {
+			return nil // the archive's own top-level directory entry
 		}
 		if af.Mode()&os.ModeSymlink != 0 {
 			if af.LinkTarget == "" || filepath.IsAbs(af.LinkTarget) {
 				return fmt.Errorf("plugin: archive symlink %q must have a relative target", af.NameInArchive)
 			}
-			links = append(links, link{path: target, target: af.LinkTarget})
+			links = append(links, link{name: name, target: af.LinkTarget})
 			return nil
 		}
 		if af.LinkTarget != "" {
 			return fmt.Errorf("plugin: archive entry %q is a hard link, which is not supported", af.NameInArchive)
 		}
 		if af.IsDir() {
-			return os.MkdirAll(target, 0o755)
+			return root.MkdirAll(name, 0o755)
 		}
 		if !af.Mode().IsRegular() {
 			return fmt.Errorf("plugin: archive entry %q is not a regular file, directory or symlink", af.NameInArchive)
 		}
-		if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+		if err := root.MkdirAll(path.Dir(name), 0o755); err != nil {
 			return err
 		}
 		r, err := af.Open()
@@ -273,7 +350,7 @@ func extractArchive(ctx context.Context, archivePath, dest string) error {
 			return err
 		}
 		defer r.Close()
-		out, err := os.OpenFile(target, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+		out, err := root.OpenFile(name, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
 		if err != nil {
 			return err
 		}
@@ -297,32 +374,37 @@ func extractArchive(ctx context.Context, archivePath, dest string) error {
 	}
 
 	for _, l := range links {
-		if err := os.MkdirAll(filepath.Dir(l.path), 0o755); err != nil {
+		if err := root.MkdirAll(path.Dir(l.name), 0o755); err != nil {
 			return err
 		}
-		if err := os.Symlink(l.target, l.path); err != nil {
+		if err := root.Symlink(l.target, l.name); err != nil {
 			return fmt.Errorf("plugin: creating archive symlink: %w", err)
 		}
 	}
-	if len(links) == 0 {
-		return nil
-	}
-	realDest, err := filepath.EvalSymlinks(dest)
-	if err != nil {
-		return err
-	}
+	// os.Root follows a link only while it stays inside the root, so Stat
+	// fails for a link that leads outside, directly or through a chain, and
+	// for a dangling one.
 	for _, l := range links {
-		rel, _ := filepath.Rel(dest, l.path)
-		resolved, err := filepath.EvalSymlinks(l.path)
-		if err != nil {
-			return fmt.Errorf("plugin: archive symlink %s does not resolve inside the plugin: %w", rel, err)
-		}
-		inside, err := filepath.Rel(realDest, resolved)
-		if err != nil || inside == ".." || strings.HasPrefix(inside, ".."+string(filepath.Separator)) {
-			return fmt.Errorf("plugin: archive symlink %s points outside the plugin directory", rel)
+		if _, err := root.Stat(l.name); err != nil {
+			return fmt.Errorf("plugin: archive symlink %s points outside the plugin directory or nowhere: %w", l.name, err)
 		}
 	}
 	return nil
+}
+
+// entryName turns an archive path into a clean, slash-separated name relative
+// to the extraction root, refusing absolute paths and ".." (zip-slip). The
+// os.Root writes would refuse those anyway; this gives a clearer error.
+func entryName(nameInArchive string) (string, error) {
+	n := filepath.ToSlash(nameInArchive)
+	if path.IsAbs(n) {
+		return "", fmt.Errorf("plugin: archive entry escapes destination: %q", nameInArchive)
+	}
+	n = path.Clean(n)
+	if n == ".." || strings.HasPrefix(n, "../") {
+		return "", fmt.Errorf("plugin: archive entry escapes destination: %q", nameInArchive)
+	}
+	return n, nil
 }
 
 // copyLimited copies at most max bytes and reports an error if src holds more.
@@ -338,27 +420,15 @@ func copyLimited(dst io.Writer, src io.Reader, max int64) (int64, error) {
 	return n, nil
 }
 
-// safeJoin joins name onto base and guarantees the result stays within base,
-// guarding against archive path traversal (zip-slip).
-func safeJoin(base, name string) (string, error) {
-	target := filepath.Join(base, name)
-	if target != base && !strings.HasPrefix(target, base+string(os.PathSeparator)) {
-		return "", fmt.Errorf("plugin: archive entry escapes destination: %q", name)
-	}
-	return target, nil
-}
-
-// backupName is the previous version's name inside its backup holder.
-const backupName = "previous"
-
-// swapIn moves staging to dst. An existing dst is first moved into a new hidden
-// directory next to it (".wings-backup-*"), whose path is returned so the
-// caller can discard or restore it. The backup never takes a name another
-// plugin could have: a fixed "<name>.bak" is a valid plugin directory, and
-// clearing it out before the swap would delete that plugin.
-func swapIn(dst, staging string) (string, error) {
-	if _, err := os.Lstat(dst); os.IsNotExist(err) {
-		if err := os.Rename(staging, dst); err != nil {
+// swapIn moves staging to name, both directories inside root. An existing
+// name is first moved into a new hidden directory (".wings-backup-*"), whose
+// name is returned so the caller can discard or restore it. The backup never
+// takes a name another plugin could have: a fixed "<name>.bak" is a valid
+// plugin directory, and clearing it out before the swap would delete that
+// plugin.
+func swapIn(root *os.Root, name, staging string) (string, error) {
+	if _, err := root.Lstat(name); errors.Is(err, fs.ErrNotExist) {
+		if err := root.Rename(staging, name); err != nil {
 			return "", fmt.Errorf("plugin: installing new plugin: %w", err)
 		}
 		return "", nil
@@ -366,18 +436,18 @@ func swapIn(dst, staging string) (string, error) {
 		return "", err
 	}
 
-	holder, err := os.MkdirTemp(filepath.Dir(dst), ".wings-backup-*")
+	holder, err := mkdirHidden(root, ".wings-backup-")
 	if err != nil {
 		return "", fmt.Errorf("plugin: creating backup directory: %w", err)
 	}
-	backup := filepath.Join(holder, backupName)
-	if err := os.Rename(dst, backup); err != nil {
-		_ = os.Remove(holder)
+	backup := path.Join(holder, backupName)
+	if err := root.Rename(name, backup); err != nil {
+		_ = root.Remove(holder)
 		return "", fmt.Errorf("plugin: backing up current plugin: %w", err)
 	}
-	if err := os.Rename(staging, dst); err != nil {
-		_ = os.Rename(backup, dst) // roll back
-		_ = os.Remove(holder)
+	if err := root.Rename(staging, name); err != nil {
+		_ = root.Rename(backup, name) // roll back
+		_ = root.Remove(holder)
 		return "", fmt.Errorf("plugin: installing new plugin: %w", err)
 	}
 	return holder, nil
