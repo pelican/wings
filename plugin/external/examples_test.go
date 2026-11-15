@@ -125,11 +125,20 @@ func TestExamplePluginsRunUnderTheClient(t *testing.T) {
 	t.Run("go external statecount", func(t *testing.T) {
 		need(t, "go")
 		m := install(t, "go-external-statecount")
-		build := exec.Command("go", "build", "-o", filepath.Join(m.Dir(), "wings-plugin-statecount"),
-			"../../examples/plugins/go-external-statecount")
+		bin := filepath.Join(m.Dir(), "wings-plugin-statecount")
+		build := exec.Command("go", "build", "-o", bin, "../../examples/plugins/go-external-statecount")
 		if out, err := build.CombinedOutput(); err != nil {
 			t.Fatalf("build: %v\n%s", err, out)
 		}
+		// The first launch of a freshly built binary can take seconds on a busy
+		// machine (macOS checks new executables), more than the client's 5 s
+		// handshake timeout. Launch it once with no input first; it exits at
+		// the end of its input.
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		warm := exec.CommandContext(ctx, bin)
+		warm.Env = append(os.Environ(), "WINGS_PLUGIN_DATA="+t.TempDir())
+		_ = warm.Run()
+		cancel()
 		run(t, m, nil, plugin.Event{Type: "server.state", Server: "abc", Data: map[string]any{"state": "running"}})
 
 		counts := filepath.Join(m.DataDir(), "counts.json")
