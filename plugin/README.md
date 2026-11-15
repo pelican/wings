@@ -252,10 +252,10 @@ Limits to keep in mind:
 
 - All external plugins run as the same user, so each can read the others' data
   directories.
-- A plugin's process inherits Wings' environment variables (with `HOME`, `USER`
-  and `LOGNAME` replaced). Keep secrets such as `WINGS_TOKEN`, or a registry
-  token referenced as `${NAME}`, out of Wings' environment on a node that runs
-  plugins you don't fully trust.
+- A plugin's process gets only `PATH`, locale, `TZ`, TLS certificate and proxy
+  variables from Wings' environment (`plugin/sdk/SPEC.md`, Lifecycle), so
+  `WINGS_TOKEN` and registry tokens referenced as `${NAME}` stay with Wings. A
+  proxy URL with a password in it does reach the plugin.
 - Signing proves who published an archive, not that it is safe.
 
 **Responsibilities.** Wings: the guarantees and the disclosure above, safe

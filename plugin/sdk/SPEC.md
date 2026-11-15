@@ -14,13 +14,18 @@ over its **stdio**: it reads requests from `stdin` and writes responses to
 - Request ids may be numbers or strings, as JSON-RPC 2.0 allows. Wings echoes a
   plugin's id back exactly as sent, and its own ids are numbers.
 - `stderr` is not part of the protocol; Wings captures it and logs each line at
-  warn level. Use it for diagnostics only.
+  info level. Use it for diagnostics only.
 
 ## Lifecycle
 
 1. Wings spawns the plugin with the working directory set to the plugin's own
    directory and the environment variables `WINGS_PLUGIN=1` and
-   `WINGS_PLUGIN_DATA` (the plugin's data directory, see Configuration).
+   `WINGS_PLUGIN_DATA` (the plugin's data directory, see Configuration). From
+   Wings' own environment the plugin gets only `PATH`, the locale (`LANG`,
+   `LANGUAGE`, `LC_*`), `TZ`, `SSL_CERT_FILE`, `SSL_CERT_DIR` and the proxy
+   variables (`HTTP_PROXY`, `HTTPS_PROXY`, `NO_PROXY`, in either case); when
+   Wings starts it as `system.user`, `HOME`, `USER` and `LOGNAME` are set for
+   that user. Nothing else reaches the plugin, `WINGS_TOKEN` included.
 2. Wings sends an `initialize` request. The plugin must respond before it will
    receive any capability calls.
 3. Wings delivers capability traffic (e.g. `event` notifications) as needed.

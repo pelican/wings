@@ -125,7 +125,7 @@ func (c *Client) command() (*exec.Cmd, error) {
 	argv := c.manifest.Entrypoint
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = c.manifest.Dir()
-	cmd.Env = append(os.Environ(), "WINGS_PLUGIN=1")
+	cmd.Env = append(pluginEnv(os.Environ()), "WINGS_PLUGIN=1")
 	dir := c.manifest.DataDir()
 	if dir != "" {
 		if err := plugin.PrepareDataDir(dir, u); err != nil {
@@ -137,6 +137,9 @@ func (c *Client) command() (*exec.Cmd, error) {
 		return cmd, nil
 	}
 	if err := plugin.CheckReadOnlyTo(c.manifest.Dir(), u); err != nil {
+		return nil, fmt.Errorf("plugin %q: %w", c.manifest.Name, err)
+	}
+	if err := plugin.CheckReachableBy(c.manifest.Dir(), u); err != nil {
 		return nil, fmt.Errorf("plugin %q: %w", c.manifest.Name, err)
 	}
 	uid, gid, err := u.IDs()
@@ -157,6 +160,27 @@ func (c *Client) command() (*exec.Cmd, error) {
 	cmd.Env = setEnv(cmd.Env, "USER", u.Name)
 	cmd.Env = setEnv(cmd.Env, "LOGNAME", u.Name)
 	return cmd, nil
+}
+
+// pluginEnv keeps the part of Wings' environment a plugin needs to run:
+// PATH, locale, time zone, TLS certificate locations and proxy settings.
+// Everything else stays with Wings, above all WINGS_TOKEN (the node's
+// credential for its own HTTP API) and registry tokens referenced as ${NAME}.
+func pluginEnv(environ []string) []string {
+	keep := map[string]bool{
+		"PATH": true, "LANG": true, "LANGUAGE": true, "TZ": true,
+		"SSL_CERT_FILE": true, "SSL_CERT_DIR": true,
+		"HTTP_PROXY": true, "HTTPS_PROXY": true, "NO_PROXY": true,
+		"http_proxy": true, "https_proxy": true, "no_proxy": true,
+	}
+	out := make([]string, 0, len(keep))
+	for _, kv := range environ {
+		k, _, _ := strings.Cut(kv, "=")
+		if keep[k] || strings.HasPrefix(k, "LC_") {
+			out = append(out, kv)
+		}
+	}
+	return out
 }
 
 // setEnv sets key=value in env, replacing any earlier value.
