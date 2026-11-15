@@ -139,9 +139,13 @@ func (c *Client) command() (*exec.Cmd, error) {
 	if err := plugin.CheckReadOnlyTo(c.manifest.Dir(), u); err != nil {
 		return nil, fmt.Errorf("plugin %q: %w", c.manifest.Name, err)
 	}
+	uid, gid, err := u.IDs()
+	if err != nil {
+		return nil, fmt.Errorf("plugin %q: %w", c.manifest.Name, err)
+	}
 	// No supplementary groups: root's would otherwise carry over.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{
-		Uid: uint32(u.Uid), Gid: uint32(u.Gid), Groups: []uint32{},
+		Uid: uid, Gid: gid, Groups: []uint32{},
 	}}
 	// Root's HOME isn't the plugin's; its data directory is the one place it
 	// can write.
