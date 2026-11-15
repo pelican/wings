@@ -168,6 +168,11 @@ func (e *Environment) Create() error {
 	a := e.Configuration.Allocations()
 	evs := e.Configuration.EnvironmentVariables()
 
+	portBindings, err := a.DockerBindings()
+	if err != nil {
+		return errors.WithStackIf(err)
+	}
+
 	// If port is 0 then we have a server with no allocation and this should stay 127.0.0.1 and not the docker network interface ip.
 	if a.DefaultMapping.Port != 0 {
 		for i, v := range evs {
@@ -246,7 +251,7 @@ func (e *Environment) Create() error {
 	}
 
 	hostConf := &container.HostConfig{
-		PortBindings: a.DockerBindings(),
+		PortBindings: portBindings,
 
 		// Configure the mounts for this container. First mount the server data directory
 		// into the container as an r/w bind.

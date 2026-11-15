@@ -1,6 +1,7 @@
 package environment
 
 import (
+	"fmt"
 	"net/netip"
 	"strconv"
 	"strings"
@@ -82,10 +83,19 @@ func (a *Allocations) Bindings() network.PortMap {
 // Returns the bindings for the server in a way that is supported correctly by Docker. This replaces
 // any reference to 127.0.0.1 with the IP of the pelican0 network interface which will allow the
 // server to operate on a local address while still being accessible by other containers.
-func (a *Allocations) DockerBindings() network.PortMap {
-	// An empty or invalid interface leaves the zero address, which binds on
-	// all interfaces, matching how Docker treated an empty HostIP string.
-	iface, _ := netip.ParseAddr(strings.TrimSpace(config.Get().Docker.Network.Interface))
+func (a *Allocations) DockerBindings() (network.PortMap, error) {
+	// An empty interface leaves the zero address, which binds on all interfaces,
+	// matching how Docker treated an empty HostIP string. A malformed interface
+	// is rejected rather than also falling back to the zero address, which would
+	// publish loopback-only allocations on every host interface.
+	var iface netip.Addr
+	var ifaceErr error
+	if s := strings.TrimSpace(config.Get().Docker.Network.Interface); s != "" {
+		iface, ifaceErr = netip.ParseAddr(s)
+		if ifaceErr != nil {
+			ifaceErr = fmt.Errorf("environment: invalid docker.network.interface %q: %w", s, ifaceErr)
+		}
+	}
 	loopback := netip.AddrFrom4([4]byte{127, 0, 0, 1})
 
 	out := a.Bindings()
@@ -102,6 +112,9 @@ func (a *Allocations) DockerBindings() network.PortMap {
 			if config.Get().Docker.Network.ISPN {
 				out[p] = append(out[p][:i], out[p][i+1:]...)
 			} else {
+				if ifaceErr != nil {
+					return nil, ifaceErr
+				}
 				out[p][i] = network.PortBinding{
 					HostIP:   iface,
 					HostPort: alloc.HostPort,
@@ -110,19 +123,19 @@ func (a *Allocations) DockerBindings() network.PortMap {
 		}
 	}
 
-	return out
+	return out, nil
 }
 
 // Converts the server allocation mappings into a PortSet that can be understood
 // by Docker. This formatting is slightly different than "Bindings" as it should
 // return an empty struct rather than a binding.
 //
-// To accomplish this, we'll just get the values from "DockerBindings" and then set them
-// to empty structs. Because why not.
+// DockerBindings only rewrites or empties the bindings of a port and never
+// removes the port itself, so the keys of "Bindings" are the same set.
 func (a *Allocations) Exposed() network.PortSet {
 	out := network.PortSet{}
 
-	for port := range a.DockerBindings() {
+	for port := range a.Bindings() {
 		out[port] = struct{}{}
 	}
 
