@@ -217,8 +217,8 @@ schema has other keys. Values are sent as JSON of that type (a number is a JSON 
 stored value. There is no multiline `text` type. A client that meets a type or key it doesn't support shows
 that setting read-only and sends its stored value back unchanged.
 
-`can_update` means the plugin has an update URL and the node's level allows updates; whether a newer version
-exists comes from `update-check`.
+`can_update` means the plugin has an update URL, the node trusts it as it is on disk, and the node's level
+allows updates; whether a newer version exists comes from `update-check`.
 
 **A3.2 Available:** `{"name", "version", "registry": "<namespace>", "author"?, "description"?,
 "capability"?, "has_signature": bool, "installed": string|null}`. `installed` is the installed version, or

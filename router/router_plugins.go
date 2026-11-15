@@ -277,7 +277,8 @@ func describePlugin(info plugin.ProviderInfo, ts *plugin.TrustStore, level plugi
 	meta.CanEnable = level.Allows(plugin.ActionToggle) && !info.Enabled && runnable && meta.Error == ""
 	meta.CanDisable = level.Allows(plugin.ActionToggle) && info.Enabled
 	meta.CanConfigure = level.Allows(plugin.ActionSettings) && manifest != nil && info.Trusted && len(manifest.Settings) > 0
-	meta.CanUpdate = level.Allows(plugin.ActionInstallSigned) && manifest != nil && manifest.Update != ""
+	// Only trusted plugins: update refuses the others (409 untrusted).
+	meta.CanUpdate = level.Allows(plugin.ActionInstallSigned) && manifest != nil && manifest.Update != "" && info.Trusted
 	meta.CanUninstall = level.Allows(plugin.ActionInstallSigned) && external
 	p.Meta = meta
 	return p

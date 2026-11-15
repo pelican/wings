@@ -1151,3 +1151,31 @@ func TestPluginAPIImportRefusesASecondCopy(t *testing.T) {
 		t.Fatalf("the installed copy changed: %+v %v", m, err)
 	}
 }
+
+// TestPluginAPICanUpdateOnlyForTrustedPlugins: update refuses untrusted
+// plugins (409 untrusted), so can_update must not offer it for them.
+func TestPluginAPICanUpdateOnlyForTrustedPlugins(t *testing.T) {
+	a := newPluginAPI(t, string(plugin.PanelAccessSigned))
+	a.writePlugin("delta", "apiVersion: v1\nname: delta\ncapability: events\nversion: 1.0.0\nentrypoint: [\"./run\"]\nupdate: https://updates.example/delta.json\n")
+	canUpdate := func() any {
+		t.Helper()
+		rec, body := a.json(http.MethodGet, "/api/plugins/delta", "")
+		if rec.Code != http.StatusOK {
+			t.Fatalf("get delta: %d %s", rec.Code, rec.Body)
+		}
+		return body["meta"].(map[string]any)["can_update"]
+	}
+	if got := canUpdate(); got != false {
+		t.Fatalf("untrusted plugin: can_update = %v, want false", got)
+	}
+	m, err := plugin.LoadManifest(filepath.Join(a.dir, "delta", plugin.ManifestFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := install.RecordTrust(m); err != nil {
+		t.Fatal(err)
+	}
+	if got := canUpdate(); got != true {
+		t.Fatalf("trusted plugin: can_update = %v, want true", got)
+	}
+}
