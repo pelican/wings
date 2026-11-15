@@ -112,3 +112,32 @@ func TestCloseWaitsForStderrBeforeWait(t *testing.T) {
 		t.Fatalf("Close called Wait after %v, before the stderr reader finished", d)
 	}
 }
+
+// TestDataDirWorksWithARelativePluginsDirectory covers plugins.directory set
+// to a relative path: the plugin runs inside its own directory, so a relative
+// WINGS_PLUGIN_DATA would point somewhere else from there.
+func TestDataDirWorksWithARelativePluginsDirectory(t *testing.T) {
+	root := t.TempDir()
+	t.Chdir(root)
+	if err := os.MkdirAll(filepath.Join("plugins", "foo"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "apiVersion: v1\nname: foo\ncapability: events\n" +
+		"entrypoint: [\"sh\", \"-c\", \"echo ok > \\\"$WINGS_PLUGIN_DATA/seen\\\"\"]\n"
+	if err := os.WriteFile(filepath.Join("plugins", "foo", plugin.ManifestFile), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := plugin.LoadManifest(filepath.Join("plugins", "foo", plugin.ManifestFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !filepath.IsAbs(m.DataDir()) {
+		t.Errorf("DataDir() = %q, want an absolute path", m.DataDir())
+	}
+
+	_ = NewClient(m, nil).EventListener().OnEvent(context.Background(), plugin.Event{Type: "server.state"})
+	b, err := os.ReadFile(filepath.Join(root, "plugins", plugin.DataDirName, "foo", "seen"))
+	if err != nil || strings.TrimSpace(string(b)) != "ok" {
+		t.Fatalf("the plugin did not write into <plugins>/.data/foo: %q %v", b, err)
+	}
+}

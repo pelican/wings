@@ -98,7 +98,13 @@ func LoadManifest(path string) (Manifest, error) {
 	if err := yaml.Unmarshal(b, &m); err != nil {
 		return Manifest{}, fmt.Errorf("plugin: parsing manifest %s: %w", path, err)
 	}
-	m.dir = filepath.Dir(path)
+	// Absolute, because the plugin runs inside this directory: a relative
+	// plugins directory would make DataDir point somewhere else from there.
+	dir, err := filepath.Abs(filepath.Dir(path))
+	if err != nil {
+		return Manifest{}, fmt.Errorf("plugin: resolving manifest directory %s: %w", path, err)
+	}
+	m.dir = dir
 	if err := m.validate(); err != nil {
 		return Manifest{}, err
 	}
