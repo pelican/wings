@@ -3,6 +3,8 @@ package plugin
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
@@ -252,5 +254,48 @@ func TestRemoveEventListenerOnlyRemovesThatListener(t *testing.T) {
 	}
 	if r.RemoveEventListener(second) {
 		t.Fatal("removing twice reported success")
+	}
+}
+
+// externalListener stands in for an external plugin's client, which live
+// reload registers in the same registry as native listeners.
+type externalListener struct{ name string }
+
+func (e externalListener) Name() string                       { return e.name }
+func (externalListener) Events() []string                     { return []string{"*"} }
+func (externalListener) OnEvent(context.Context, Event) error { return nil }
+func (externalListener) External() bool                       { return true }
+
+// TestInventoryListsALoadedExternalPluginOnce covers a running node: the
+// loaded external plugin is in the registry and has a manifest, and it must be
+// listed once, as external, not also as a native copy (found in the lab: the
+// Panel then acted on the native copy and every action failed).
+func TestInventoryListsALoadedExternalPluginOnce(t *testing.T) {
+	c := setConfig(t)
+	c.Plugins.Directory = t.TempDir()
+	config.Set(c)
+	dir := filepath.Join(c.Plugins.Directory, "inv-ext")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ManifestFile), []byte("apiVersion: v1\nname: inv-ext\ncapability: events\nversion: 1.2.0\nentrypoint: [\"./run\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	l := externalListener{name: "inv-ext"}
+	RegisterEventListener(l)
+	t.Cleanup(func() { Default().RemoveEventListener(l) })
+
+	var found []ProviderInfo
+	inv, _ := Inventory()
+	for _, p := range inv {
+		if p.Name == "inv-ext" {
+			found = append(found, p)
+		}
+	}
+	if len(found) != 1 || found[0].Kind != KindExternal || found[0].Version != "1.2.0" {
+		t.Fatalf("inv-ext listed as %+v; want once, external, version 1.2.0", found)
+	}
+	if p, ok, _ := Find("inv-ext"); !ok || p.Kind != KindExternal {
+		t.Fatalf("Find(inv-ext) = %+v, %v; want the external entry", p, ok)
 	}
 }

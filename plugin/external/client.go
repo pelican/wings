@@ -172,6 +172,11 @@ func (s eventListener) Events() []string {
 }
 func (s eventListener) OnEvent(ctx context.Context, e plugin.Event) error { return s.c.emit(ctx, e) }
 
+var _ plugin.ExternalListener = eventListener{}
+
+// External marks this listener as an external plugin (plugin.ExternalListener).
+func (eventListener) External() bool { return true }
+
 // stderrDrainTimeout bounds how long Close waits for the stderr reader after
 // killing the plugin; a child process the plugin started can keep the pipe open.
 const stderrDrainTimeout = 2 * time.Second
