@@ -53,14 +53,28 @@ func stageArchive(ctx context.Context, download, wantSHA256, signature, destDir 
 	defer root.Close()
 	staging, err := mkdirHidden(root, ".wings-install-")
 	if err != nil {
-		return nil, err
+		return nil, hideStaging(err, "")
 	}
 
-	if err := extractArchive(ctx, archivePath, filepath.Join(parent, staging)); err != nil {
+	if err := extractPlugin(ctx, archivePath, filepath.Join(parent, staging)); err != nil {
 		_ = root.RemoveAll(staging)
-		return nil, err
+		return nil, hideStaging(err, filepath.Join(parent, staging))
 	}
 	return &StagedInstall{DestDir: destDir, StagingDir: filepath.Join(parent, staging)}, nil
+}
+
+// extractPlugin unpacks a plugin archive into dest and moves the plugin's
+// files to the top of it (normalizeLayout), so dest holds the manifest.
+func extractPlugin(ctx context.Context, archivePath, dest string) error {
+	if err := extractArchive(ctx, archivePath, dest); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(dest)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	return normalizeLayout(root)
 }
 
 // mkdirHidden creates a new, uniquely named directory "<prefix><random>" in
@@ -144,8 +158,11 @@ func (s *StagedInstall) unlock() {
 }
 
 // Manifest loads the staged plugin manifest without executing plugin code.
+// Errors name files by their path in the archive, not in the staging
+// directory.
 func (s *StagedInstall) Manifest() (plugin.Manifest, error) {
-	return plugin.LoadManifest(filepath.Join(s.StagingDir, plugin.ManifestFile))
+	m, err := plugin.LoadManifest(filepath.Join(s.StagingDir, plugin.ManifestFile))
+	return m, hideStaging(err, s.StagingDir)
 }
 
 // Commit moves StagingDir into place as DestDir. The previous version is kept
@@ -169,7 +186,7 @@ func (s *StagedInstall) Commit() error {
 	if err != nil {
 		_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
 		_ = lock.Close()
-		return err
+		return hideStaging(err, s.StagingDir)
 	}
 	s.lock = lock
 	s.backupHolder = holder
