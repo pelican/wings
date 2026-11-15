@@ -103,7 +103,8 @@ type Conn struct {
 	drained chan struct{} // closed once every queued notification is handled
 	dropped atomic.Uint64
 
-	inflight   chan struct{} // one slot per inbound request being handled
+	inflight   chan struct{}  // one slot per inbound request being handled
+	requests   sync.WaitGroup // inbound requests still being handled
 	maxMessage int
 }
 
@@ -143,11 +144,17 @@ func (c *Conn) notificationLoop() {
 	for m := range c.notes {
 		c.serveNotification(m)
 	}
+	// The read loop has stopped, so no request can start now; let the ones
+	// already running write their responses, then close.
+	c.requests.Wait()
+	c.close()
 }
 
 // Drained returns a channel that is closed once the peer has stopped sending
-// (its side of the stream ended) and every notification it sent before that
-// has been handled. Done alone closes as soon as the stream ends, while queued
+// (its side of the stream ended) and every notification and request it sent
+// before that has been handled, requests including their responses. The
+// connection closes (Done) at the same point, or earlier on a write error,
+// a write timeout or Close. Done alone closes as soon as the stream ends, while queued
 // notifications may still be waiting.
 func (c *Conn) Drained() <-chan struct{} { return c.drained }
 
@@ -167,8 +174,10 @@ func (c *Conn) readLoop(r io.Reader) {
 			err = json.Unmarshal(frame, &m)
 		}
 		if err != nil {
+			// The peer stopped sending. Close only once what it already sent
+			// is done (notificationLoop): answers to its requests must still
+			// be written, so don't close the connection here.
 			close(c.notes) // the read loop is the only sender
-			c.close()
 			return
 		}
 		hasID := len(m.ID) > 0 && string(m.ID) != "null"
@@ -176,8 +185,9 @@ func (c *Conn) readLoop(r io.Reader) {
 		case m.Method != "" && hasID:
 			select {
 			case c.inflight <- struct{}{}:
+				c.requests.Add(1)
 				go func(m message) {
-					defer func() { <-c.inflight }()
+					defer func() { <-c.inflight; c.requests.Done() }()
 					c.serveRequest(m)
 				}(m)
 			default:

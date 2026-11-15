@@ -2,9 +2,11 @@ package sdk
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -116,5 +118,19 @@ func TestServeEventListenerHandlesQueuedEventsBeforeReturning(t *testing.T) {
 	}
 	if n := handled.Load(); n != 20 {
 		t.Fatalf("returned after handling %d of 20 events", n)
+	}
+}
+
+// TestServeEventListenerAnswersBeforeReturning covers a host that closes stdin
+// right after a request: the plugin used to return, and usually exit, before
+// writing the response.
+func TestServeEventListenerAnswersBeforeReturning(t *testing.T) {
+	for i := 0; i < 50; i++ {
+		var out bytes.Buffer
+		in := strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"host":"wings","version":1}}` + "\n")
+		_ = serveEventListener(in, &out, io.Discard, recordingListener{got: make(chan plugin.Event, 1)})
+		if !strings.Contains(out.String(), `"id":1`) {
+			t.Fatalf("iteration %d: returned without answering initialize: %q", i, out.String())
+		}
 	}
 }
