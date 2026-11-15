@@ -125,12 +125,6 @@ func (a *Allocations) DockerBindings() (network.PortMap, error) {
 				HostPort: alloc.HostPort,
 			})
 		}
-		// Docker treats a port with an empty binding list as "publish on a random
-		// host port", which would expose an ISPN loopback allocation publicly.
-		if len(kept) == 0 {
-			delete(out, p)
-			continue
-		}
 		out[p] = kept
 	}
 

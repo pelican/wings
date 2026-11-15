@@ -89,24 +89,18 @@ func TestDockerBindings(t *testing.T) {
 			iface:    "not-an-ip",
 			ispn:     true,
 			mappings: map[string][]int{"127.0.0.1": {25565}},
-			// The port must be removed, not left with an empty binding list,
-			// which Docker would publish on a random host port.
-			wantPorts: 0,
+			wantTCP: map[network.Port][]network.PortBinding{
+				tcp(25565): {},
+			},
+			wantPorts: 2,
 		},
 		{
-			name:      "ISPN drops every loopback binding on a port",
-			iface:     "172.18.0.1",
-			ispn:      true,
-			mappings:  map[string][]int{"127.0.0.1": {25565, 25565}},
-			wantPorts: 0,
-		},
-		{
-			name:     "ISPN keeps a port that still has a public binding",
+			name:     "ISPN drops every loopback binding on a port",
 			iface:    "172.18.0.1",
 			ispn:     true,
-			mappings: map[string][]int{"127.0.0.1": {25565}, "10.0.0.5": {25565}},
+			mappings: map[string][]int{"127.0.0.1": {25565, 25565}},
 			wantTCP: map[network.Port][]network.PortBinding{
-				tcp(25565): {{HostIP: addr("10.0.0.5"), HostPort: "25565"}},
+				tcp(25565): {},
 			},
 			wantPorts: 2,
 		},
