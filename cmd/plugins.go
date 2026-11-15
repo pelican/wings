@@ -42,6 +42,7 @@ func newPluginsCommand() *cobra.Command {
 		newPluginsUntrustCommand(),
 		newPluginsKeygenCommand(),
 		newPluginsSignCommand(),
+		newPluginsPanelAccessCommand(),
 	)
 	return cmd
 }
