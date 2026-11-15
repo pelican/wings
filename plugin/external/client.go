@@ -165,7 +165,8 @@ func (p processCloser) Close() error {
 
 func pipeStderr(name string, r io.Reader) {
 	l := log.WithField("plugin", name)
-	pipeLines(r, maxStderrLine, func(line string) { l.Warn(line) })
+	// A plugin's stderr is its log, not a warning from Wings.
+	pipeLines(r, maxStderrLine, func(line string) { l.Info(line) })
 }
 
 // maxStderrLine is the longest stderr line logged in full.
