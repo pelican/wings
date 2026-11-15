@@ -838,3 +838,111 @@ func TestPluginAPIUninstallDeletesTheDirectoryHoldingTheManifest(t *testing.T) {
 		t.Fatalf("a directory that only has the plugin's name was removed: %v", err)
 	}
 }
+
+// "signed" says the signature verified, at full too, and such a stage can
+// still be approved after the node drops to signed.
+func TestPluginAPISignedMeansTheSignatureVerified(t *testing.T) {
+	a := newPluginAPI(t, string(plugin.PanelAccessFull))
+	pub, priv, _ := install.GenerateKeypair()
+	a.registry(gammaArchive(t, "1.0.0"), pub, priv)
+	rec, staged := a.json(http.MethodPost, "/api/plugins/gamma/install", "")
+	if rec.Code != http.StatusAccepted || staged["signed"] != true {
+		t.Fatalf("a verified signature at full: %d %s; want signed true", rec.Code, rec.Body)
+	}
+	t.Setenv(plugin.PanelAccessEnv, string(plugin.PanelAccessSigned))
+	rec, _ = a.json(http.MethodPost, "/api/plugins/gamma/install", `{"approve":"`+staged["approval_token"].(string)+`"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("approving a signed stage at signed: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// The approval re-checks the signature against the node's current keys and
+// require_signatures.
+func TestPluginAPIApprovalRechecksTheSignaturePolicy(t *testing.T) {
+	t.Run("trusted key removed", func(t *testing.T) {
+		a := newPluginAPI(t, string(plugin.PanelAccessSigned))
+		pub, priv, _ := install.GenerateKeypair()
+		a.registry(gammaArchive(t, "1.0.0"), pub, priv)
+		_, staged := a.json(http.MethodPost, "/api/plugins/gamma/install", "")
+		other, _, _ := install.GenerateKeypair()
+		c := config.Get()
+		c.Plugins.TrustedKeys = []string{other}
+		config.Set(c)
+		rec, _ := a.json(http.MethodPost, "/api/plugins/gamma/install", `{"approve":"`+staged["approval_token"].(string)+`"}`)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("approve after the key was removed: %d %s; want 422", rec.Code, rec.Body)
+		}
+		if _, err := os.Stat(filepath.Join(a.dir, "gamma")); !os.IsNotExist(err) {
+			t.Fatal("installed with a signature the node no longer trusts")
+		}
+	})
+	t.Run("signatures required", func(t *testing.T) {
+		a := newPluginAPI(t, string(plugin.PanelAccessFull))
+		a.registry(gammaArchive(t, "1.0.0"), "", "")
+		_, staged := a.json(http.MethodPost, "/api/plugins/gamma/install", "")
+		c := config.Get()
+		c.Plugins.RequireSignatures = true
+		config.Set(c)
+		rec, _ := a.json(http.MethodPost, "/api/plugins/gamma/install", `{"approve":"`+staged["approval_token"].(string)+`"}`)
+		if rec.Code != http.StatusUnprocessableEntity {
+			t.Fatalf("approve an unsigned stage after require_signatures: %d %s; want 422", rec.Code, rec.Body)
+		}
+		if _, err := os.Stat(filepath.Join(a.dir, "gamma")); !os.IsNotExist(err) {
+			t.Fatal("installed an unsigned archive the node now refuses")
+		}
+	})
+}
+
+// The approval refuses when the destination changed since staging, and keeps
+// what is there.
+func TestPluginAPIApprovalRefusesAChangedDestination(t *testing.T) {
+	t.Run("installed meanwhile", func(t *testing.T) {
+		a := newPluginAPI(t, string(plugin.PanelAccessSigned))
+		pub, priv, _ := install.GenerateKeypair()
+		a.registry(gammaArchive(t, "1.0.0"), pub, priv)
+		_, staged := a.json(http.MethodPost, "/api/plugins/gamma/install", "")
+		a.writePlugin("gamma", "apiVersion: v1\nname: gamma\ncapability: events\nversion: 9.0.0\nentrypoint: [\"./run\"]\n")
+		rec, _ := a.json(http.MethodPost, "/api/plugins/gamma/install", `{"approve":"`+staged["approval_token"].(string)+`"}`)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("approve over a plugin installed after staging: %d %s; want 409", rec.Code, rec.Body)
+		}
+		if m, err := plugin.LoadManifest(filepath.Join(a.dir, "gamma", plugin.ManifestFile)); err != nil || m.Version != "9.0.0" {
+			t.Fatalf("the plugin installed meanwhile was replaced: %+v %v", m, err)
+		}
+	})
+	t.Run("installed meanwhile under another directory name", func(t *testing.T) {
+		a := newPluginAPI(t, string(plugin.PanelAccessSigned))
+		pub, priv, _ := install.GenerateKeypair()
+		a.registry(gammaArchive(t, "1.0.0"), pub, priv)
+		_, staged := a.json(http.MethodPost, "/api/plugins/gamma/install", "")
+		a.writePlugin("gamma-main", "apiVersion: v1\nname: gamma\ncapability: events\nversion: 9.0.0\nentrypoint: [\"./run\"]\n")
+		rec, _ := a.json(http.MethodPost, "/api/plugins/gamma/install", `{"approve":"`+staged["approval_token"].(string)+`"}`)
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("approve while gamma is installed elsewhere: %d %s; want 409", rec.Code, rec.Body)
+		}
+		if _, err := os.Stat(filepath.Join(a.dir, "gamma")); !os.IsNotExist(err) {
+			t.Fatal("installed a second copy of gamma")
+		}
+	})
+	t.Run("removed meanwhile", func(t *testing.T) {
+		a := newPluginAPI(t, string(plugin.PanelAccessFull))
+		var buf bytes.Buffer
+		mw := multipart.NewWriter(&buf)
+		fw, _ := mw.CreateFormFile("plugin", "alpha.tar.gz")
+		_, _ = fw.Write(tarGz(t, map[string]string{"plugin.yaml": strings.Replace(alphaManifest, "1.0.0", "2.0.0", 1), "run": "#!/bin/sh\n"}))
+		_ = mw.Close()
+		rec := a.do(http.MethodPost, "/api/plugins/import", &buf, mw.FormDataContentType())
+		var staged map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &staged)
+		if rec.Code != http.StatusAccepted || staged["replaces"] != "1.0.0" {
+			t.Fatalf("stage: %d %s", rec.Code, rec.Body)
+		}
+		if err := os.RemoveAll(filepath.Join(a.dir, "alpha")); err != nil {
+			t.Fatal(err)
+		}
+		rec2, _ := a.json(http.MethodPost, "/api/plugins/import", `{"approve":"`+staged["approval_token"].(string)+`"}`)
+		if rec2.Code != http.StatusConflict {
+			t.Fatalf("approve after the replaced plugin was removed: %d %s; want 409", rec2.Code, rec2.Body)
+		}
+	})
+}

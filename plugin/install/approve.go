@@ -29,6 +29,13 @@ type Approver func(plugin.Manifest) (bool, error)
 // Commit takes the plugins directory's install lock, and the trust store takes
 // its own, so the CLI and the daemon can install at the same time.
 func Install(stage *StagedInstall, check func(plugin.Manifest) error, approve Approver) (plugin.Manifest, error) {
+	return InstallIf(stage, check, approve, nil)
+}
+
+// InstallIf is Install with one more check, locked, which runs under the
+// install lock right before the plugin is moved into place (see
+// StagedInstall.CommitIf). Its error is returned as is.
+func InstallIf(stage *StagedInstall, check func(plugin.Manifest) error, approve Approver, locked func(plugin.Manifest) error) (plugin.Manifest, error) {
 	defer stage.Cleanup()
 	m, err := stage.Manifest()
 	if err != nil {
@@ -46,7 +53,12 @@ func Install(stage *StagedInstall, check func(plugin.Manifest) error, approve Ap
 	if !ok {
 		return m, ErrNotApproved
 	}
-	if err := stage.Commit(); err != nil {
+	var underLock func() error
+	if locked != nil {
+		staged := m
+		underLock = func() error { return locked(staged) }
+	}
+	if err := stage.CommitIf(underLock); err != nil {
 		return m, err
 	}
 	m, err = plugin.LoadManifest(filepath.Join(stage.DestDir, plugin.ManifestFile))

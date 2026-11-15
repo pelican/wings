@@ -574,12 +574,15 @@ type pendingInstall struct {
 	stage  *install.StagedInstall
 	digest string
 	check  func(plugin.Manifest) error
-	// trustedSignature records that the archive was staged with
-	// install.RequireTrustedSignature, so it can still be approved if the
-	// node has since been moved down from full to signed.
-	trustedSignature bool
-	expires          time.Time
-	timer            *time.Timer
+	// signed records that the archive's signature verified against a
+	// trusted key when it was staged, at any level. Such a stage needs only
+	// the signed level to be approved; any other needs full.
+	signed bool
+	// destination is what the plugin's directory held at staging
+	// (destinationState); the approval is refused if it changed.
+	destination string
+	expires     time.Time
+	timer       *time.Timer
 }
 
 type pendingInstalls struct {
@@ -681,14 +684,17 @@ type stagedPluginJSON struct {
 
 // respondStaged vets a fresh stage, keeps it for approval and answers 202
 // with what is to be approved. The stage is cleaned up on every failure.
-func respondStaged(c *gin.Context, action, path string, stage *install.StagedInstall, check func(plugin.Manifest) error, trustedSignature bool) {
+func respondStaged(c *gin.Context, action, path string, stage *install.StagedInstall, check func(plugin.Manifest) error) {
 	m, err := stage.Manifest()
 	if err == nil && check != nil {
 		err = check(m)
 	}
-	var digest, token string
+	var digest, token, destination string
 	if err == nil {
 		digest, err = stage.Digest()
+	}
+	if err == nil {
+		destination, err = destinationState(stage, m.Name)
 	}
 	if err == nil {
 		token, err = newApprovalToken()
@@ -704,7 +710,7 @@ func respondStaged(c *gin.Context, action, path string, stage *install.StagedIns
 	} else if _, statErr := os.Lstat(stage.DestDir); statErr == nil {
 		replaces = ""
 	}
-	p := &pendingInstall{token: token, action: action, name: m.Name, stage: stage, digest: digest, check: check, trustedSignature: trustedSignature}
+	p := &pendingInstall{token: token, action: action, name: m.Name, stage: stage, digest: digest, check: check, signed: stage.Signed(), destination: destination}
 	if err := pending.add(p); err != nil {
 		_ = stage.Cleanup()
 		c.AbortWithStatusJSON(http.StatusTooManyRequests, gin.H{"error": err.Error()})
@@ -720,29 +726,81 @@ func respondStaged(c *gin.Context, action, path string, stage *install.StagedIns
 		"plugin":         stagedPluginJSON{Name: m.Name, Version: m.Version, Author: m.Author, Description: m.Description, Capability: m.Capability, Source: m.Source, Entrypoint: nonNil(m.Entrypoint), Events: nonNil(plugin.EffectiveEvents(m)), Settings: nonNil(m.Settings)},
 		"host_access":    nonNil(m.Requires.HostAPI),
 		"replaces":       replaces,
-		"signed":         trustedSignature,
+		"signed":         p.signed,
 		"approval_token": token,
 		"expires_at":     p.expires.UTC().Format(time.RFC3339),
 		"approve_with":   gin.H{"method": http.MethodPost, "path": path, "body": gin.H{"approve": token}},
 	})
 }
 
+// destinationState describes what the plugin named name has on disk now: the
+// contents of the directory the stage would replace, and every other
+// directory a plugin of that name was discovered in. The approval compares it
+// with the value at staging, so an install, removal or update made in between
+// (by the CLI, or another Panel request) is not silently overwritten.
+func destinationState(stage *install.StagedInstall, name string) (string, error) {
+	dest, err := stage.DestinationState()
+	if err != nil {
+		return "", err
+	}
+	state := "dest:" + dest
+	manifests, issues, err := plugin.DiscoverDetailed(filepath.Dir(stage.DestDir))
+	if err != nil {
+		return "", err
+	}
+	for _, m := range manifests {
+		if m.Name == name && m.Dir() != stage.DestDir {
+			state += "\x00elsewhere:" + m.Dir()
+		}
+	}
+	for _, issue := range issues {
+		if issue.Name == name {
+			state += "\x00elsewhere:" + issue.Dir
+		}
+	}
+	return state, nil
+}
+
+// Errors from the checks made at approval, under the install lock.
+var errDestinationChanged = errors.New("the plugin's directory changed since this install was staged (it was installed, removed or updated meanwhile); stage it again")
+
+type levelRefused struct{ level, need plugin.PanelAccess }
+
+func (e levelRefused) Error() string {
+	return fmt.Sprintf("plugins.panel_access is %q on this node; approving this stage needs %q", e.level, e.need)
+}
+
+type signatureRefused struct{ err error }
+
+func (e signatureRefused) Error() string {
+	return "the staged archive no longer passes this node's signature policy: " + e.err.Error()
+}
+
 // commitApproved installs a pending stage whose token the Panel sent back,
-// with the same install.Install the CLI uses after its prompt.
+// with the same install code the CLI uses after its prompt. Right before the
+// plugin is moved into place, under the install lock, it checks the node as
+// it is now: its access level still allows the stage (403), the archive still
+// passes its signature policy (422), and the destination is as it was when
+// staged (409).
 func commitApproved(c *gin.Context, action, name, token string) {
 	p, err := pending.take(token, action, name)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": err.Error()})
 		return
 	}
-	// The level is checked again: an install staged at full without a
-	// trusted signature can't be approved once the node is at signed.
-	if !p.trustedSignature && !plugin.CurrentPanelAccess().Allows(plugin.ActionInstallAny) {
-		_ = p.stage.Cleanup()
-		allowPlugins(c, plugin.ActionInstallAny)
-		return
-	}
-	m, err := install.Install(p.stage, func(m plugin.Manifest) error {
+	m, err := install.InstallIf(p.stage, nil, func(plugin.Manifest) (bool, error) { return true, nil }, func(m plugin.Manifest) error {
+		level := plugin.CurrentPanelAccess()
+		need := plugin.ActionInstallSigned
+		if action == "import" || !p.signed {
+			need = plugin.ActionInstallAny
+		}
+		if !level.Allows(need) {
+			return levelRefused{level: level, need: requiredLevel(need)}
+		}
+		opts := stageOptions()
+		if err := p.stage.CheckSignature(opts...); err != nil {
+			return signatureRefused{err}
+		}
 		d, err := p.stage.Digest()
 		if err != nil {
 			return err
@@ -754,11 +812,32 @@ func commitApproved(c *gin.Context, action, name, token string) {
 			return fmt.Errorf("staged manifest name %q does not match %q", m.Name, p.name)
 		}
 		if p.check != nil {
-			return p.check(m)
+			if err := p.check(m); err != nil {
+				return err
+			}
+		}
+		dest, err := destinationState(p.stage, p.name)
+		if err != nil {
+			return err
+		}
+		if dest != p.destination {
+			return errDestinationChanged
 		}
 		return nil
-	}, func(plugin.Manifest) (bool, error) { return true, nil })
-	if err != nil {
+	})
+	var lr levelRefused
+	var sr signatureRefused
+	switch {
+	case errors.As(err, &lr):
+		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": lr.Error(), "panel_access": lr.level, "required": lr.need})
+		return
+	case errors.As(err, &sr):
+		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"error": sr.Error()})
+		return
+	case errors.Is(err, errDestinationChanged):
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	case err != nil:
 		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
 		return
 	}
@@ -773,16 +852,21 @@ func commitApproved(c *gin.Context, action, name, token string) {
 
 // stageOptions is what the level requires of an archive: below full, a
 // signature by a key in plugins.trusted_keys.
-func stageOptions() ([]install.StageOption, bool) {
+func stageOptions() []install.StageOption {
 	if plugin.CurrentPanelAccess().Allows(plugin.ActionInstallAny) {
-		return nil, false
+		return nil
 	}
-	return []install.StageOption{install.RequireTrustedSignature()}, true
+	return []install.StageOption{install.RequireTrustedSignature()}
 }
 
+// isInstalled reports whether id has a directory in dir, or a plugin of that
+// name was discovered in a directory of another name.
 func isInstalled(dir, id string) bool {
-	_, err := os.Lstat(filepath.Join(dir, id))
-	return err == nil
+	if _, err := os.Lstat(filepath.Join(dir, id)); err == nil {
+		return true
+	}
+	info, ok, _ := plugin.Find(id)
+	return ok && info.Kind == plugin.KindExternal
 }
 
 // postPluginInstall installs a plugin from the node's configured registries.
@@ -830,13 +914,13 @@ func postPluginInstall(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
 		return
 	}
-	opts, signed := stageOptions()
+	opts := stageOptions()
 	stage, err := install.StageAdd(c.Request.Context(), resolved, dir, opts...)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
 		return
 	}
-	respondStaged(c, "install", "", stage, nil, signed)
+	respondStaged(c, "install", "", stage, nil)
 }
 
 // postPluginUpdate updates an installed plugin from its update manifest, in
@@ -888,7 +972,7 @@ func postPluginUpdate(c *gin.Context) {
 		c.JSON(http.StatusOK, gin.H{"status": "up_to_date", "installed": st.Installed, "latest": st.Latest})
 		return
 	}
-	opts, signed := stageOptions()
+	opts := stageOptions()
 	stage, err := install.StageUpdate(c.Request.Context(), st, opts...)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
@@ -902,7 +986,7 @@ func postPluginUpdate(c *gin.Context) {
 			return fmt.Errorf("staged manifest version %q does not match update version %q", m.Version, st.Latest)
 		}
 		return nil
-	}, signed)
+	})
 }
 
 // postPluginUninstall disables a plugin, revokes its approval and, with
@@ -1023,7 +1107,7 @@ func postPluginImport(c *gin.Context) {
 			c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
 			return
 		}
-		respondStaged(c, "import", "/api/plugins/import", stage, nil, false)
+		respondStaged(c, "import", "/api/plugins/import", stage, nil)
 		return
 	}
 
@@ -1056,7 +1140,7 @@ func postPluginImport(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})
 		return
 	}
-	respondStaged(c, "import", "/api/plugins/import", stage, nil, false)
+	respondStaged(c, "import", "/api/plugins/import", stage, nil)
 }
 
 // postPluginOrder exists because the Panel calls it. Wings has no load order.

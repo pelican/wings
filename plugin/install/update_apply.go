@@ -35,38 +35,40 @@ func stageArchive(ctx context.Context, download, wantSHA256, signature, destDir 
 		return nil, err
 	}
 	defer os.Remove(archivePath)
-	staging, err := extractToStaging(ctx, archivePath, digest, signature, filepath.Dir(destDir), o)
+	staging, signed, err := extractToStaging(ctx, archivePath, digest, signature, filepath.Dir(destDir), o)
 	if err != nil {
 		return nil, err
 	}
-	return &StagedInstall{DestDir: destDir, StagingDir: staging}, nil
+	return &StagedInstall{DestDir: destDir, StagingDir: staging, archiveDigest: digest, signature: signature, signed: signed}, nil
 }
 
 // extractToStaging applies the signing policy to a verified archive and
 // unpacks it into a new hidden staging directory in parent, returning its
-// path. Staging inside the plugins directory makes the final swap an atomic
-// same-filesystem rename (no cross-device copy).
-func extractToStaging(ctx context.Context, archivePath string, digest []byte, signature, parent string, o stageOptions) (string, error) {
-	if err := enforceSignature(digest, signature, o); err != nil {
-		return "", err
+// path and whether the archive's signature verified. Staging inside the
+// plugins directory makes the final swap an atomic same-filesystem rename (no
+// cross-device copy).
+func extractToStaging(ctx context.Context, archivePath string, digest []byte, signature, parent string, o stageOptions) (string, bool, error) {
+	signed, err := enforceSignature(digest, signature, o)
+	if err != nil {
+		return "", false, err
 	}
 	if err := os.MkdirAll(parent, 0o755); err != nil {
-		return "", err
+		return "", false, err
 	}
 	root, err := os.OpenRoot(parent)
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	defer root.Close()
 	staging, err := mkdirHidden(root, ".wings-install-")
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
 	if err := extractArchive(ctx, archivePath, filepath.Join(parent, staging)); err != nil {
 		_ = root.RemoveAll(staging)
-		return "", err
+		return "", false, err
 	}
-	return filepath.Join(parent, staging), nil
+	return filepath.Join(parent, staging), signed, nil
 }
 
 // mkdirHidden creates a new, uniquely named directory "<prefix><random>" in
@@ -106,6 +108,28 @@ type StagedInstall struct {
 	// lock is the plugins directory's install lock, held from Commit until
 	// Finish or Rollback.
 	lock *os.File
+	// archiveDigest and signature are the archive's sha256 and the signature
+	// offered with it, kept so the signing policy can be applied again at
+	// approval (CheckSignature). signed is whether that signature verified.
+	archiveDigest []byte
+	signature     string
+	signed        bool
+}
+
+// Signed reports whether the archive's signature verified against a key in
+// plugins.trusted_keys when it was staged. An unsigned archive staged where
+// no signature was required is not signed.
+func (s *StagedInstall) Signed() bool { return s.signed }
+
+// CheckSignature applies the signing policy, as configured now, to the staged
+// archive again: plugins.trusted_keys or plugins.require_signatures may have
+// changed since it was staged.
+func (s *StagedInstall) CheckSignature(opts ...StageOption) error {
+	if s.archiveDigest == nil {
+		return errors.New("plugin: the staged archive's digest is unknown")
+	}
+	_, err := enforceSignature(s.archiveDigest, s.signature, applyStageOptions(opts))
+	return err
 }
 
 // installLockName is the lock file installs take in the plugins directory.
@@ -158,7 +182,12 @@ func (s *StagedInstall) Manifest() (plugin.Manifest, error) {
 // until Finish discards it or Rollback restores it, so a caller that still has
 // work to do after the swap (recording the operator's approval) can undo it.
 // If the swap itself fails, the previous version is already back in place.
-func (s *StagedInstall) Commit() error {
+func (s *StagedInstall) Commit() error { return s.CommitIf(nil) }
+
+// CommitIf is Commit, but runs ok under the install lock first and commits
+// only if it returns nil: a check of the destination there can't be raced by
+// another install.
+func (s *StagedInstall) CommitIf(ok func() error) error {
 	if s.committed {
 		return nil
 	}
@@ -171,10 +200,19 @@ func (s *StagedInstall) Commit() error {
 	if err != nil {
 		return err
 	}
-	holder, err := swapIn(root, name, staging)
-	if err != nil {
+	release := func() {
 		_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
 		_ = lock.Close()
+	}
+	if ok != nil {
+		if err := ok(); err != nil {
+			release()
+			return err
+		}
+	}
+	holder, err := swapIn(root, name, staging)
+	if err != nil {
+		release()
 		return err
 	}
 	s.lock = lock

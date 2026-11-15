@@ -3,6 +3,7 @@ package install
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -13,7 +14,23 @@ import (
 // contents and link targets. The Panel API ties an approval token to it, so
 // what is committed is what was shown when the token was issued.
 func (s *StagedInstall) Digest() (string, error) {
-	root, err := os.OpenRoot(s.StagingDir)
+	return dirDigest(s.StagingDir)
+}
+
+// DestinationState hashes what is at DestDir now, like Digest, or returns ""
+// when nothing is there. Comparing it with the value at staging time tells
+// whether the plugin was installed, removed or changed in between.
+func (s *StagedInstall) DestinationState() (string, error) {
+	if _, err := os.Lstat(s.DestDir); errors.Is(err, fs.ErrNotExist) {
+		return "", nil
+	} else if err != nil {
+		return "", err
+	}
+	return dirDigest(s.DestDir)
+}
+
+func dirDigest(dir string) (string, error) {
+	root, err := os.OpenRoot(dir)
 	if err != nil {
 		return "", err
 	}
@@ -56,7 +73,7 @@ func (s *StagedInstall) Digest() (string, error) {
 			}
 			write(name, "file", mode.String(), hex.EncodeToString(fh.Sum(nil)))
 		default:
-			return fmt.Errorf("plugin: unexpected file type in staged plugin: %s", name)
+			return fmt.Errorf("plugin: unexpected file type in plugin directory: %s", name)
 		}
 		return nil
 	})

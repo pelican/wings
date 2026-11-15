@@ -59,13 +59,13 @@ func stageNamedByManifest(ctx context.Context, archivePath string, digest []byte
 	if err := os.MkdirAll(pluginsDir, 0o755); err != nil {
 		return nil, fmt.Errorf("plugin: creating plugins directory: %w", err)
 	}
-	staging, err := extractToStaging(ctx, archivePath, digest, signature, pluginsDir, o)
+	staging, signed, err := extractToStaging(ctx, archivePath, digest, signature, pluginsDir, o)
 	if err != nil {
 		return nil, err
 	}
 	// DestDir is set below; until then Cleanup only needs the plugins
 	// directory, which is the staging directory's parent.
-	stage := &StagedInstall{DestDir: filepath.Join(pluginsDir, ".unnamed"), StagingDir: staging}
+	stage := &StagedInstall{DestDir: filepath.Join(pluginsDir, ".unnamed"), StagingDir: staging, archiveDigest: digest, signature: signature, signed: signed}
 	m, err := stage.Manifest()
 	if err != nil {
 		_ = stage.Cleanup()
