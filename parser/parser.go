@@ -98,7 +98,8 @@ func newReplaceValue(v jsontext.Value) ReplaceValue {
 	if rv.valueType == StringValue {
 		// The decoder has already checked v's syntax, so the only error
 		// AppendUnquote can still report is invalid UTF-8, which it has
-		// already replaced with U+FFFD, just as encoding/json v1 did.
+		// already replaced with U+FFFD. (The old jsonparser path passed the
+		// raw bytes through instead.)
 		rv.value, _ = jsontext.AppendUnquote(nil, v)
 	} else {
 		rv.value = bytes.Clone(v)
@@ -160,10 +161,9 @@ type ConfigurationFile struct {
 	configuration []byte
 }
 
-// UnmarshalJSON is a custom unmarshaler for configuration files. If there is an
-// error while parsing out the replacements, don't fail the entire operation,
-// just log a global warning so someone can find the issue, and return an empty
-// array of replacements.
+// UnmarshalJSON is a custom unmarshaler for configuration files. A replacement
+// that fails to decode doesn't fail the entire operation: it is logged so
+// someone can find the issue and skipped, and the other replacements are kept.
 func (f *ConfigurationFile) UnmarshalJSON(data []byte) error {
 	return jsonv2.Unmarshal(data, f, legacyDecodeOptions)
 }
@@ -241,7 +241,8 @@ func (f *ConfigurationFile) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	var file, parser stringField
 	var haveCreate bool
 	var replace []ConfigurationFileReplacement
-	var replaceErr, createErr error
+	var replaceErrs []error
+	var createErr error
 	f.AllowCreateFile = true
 	err := readObject(dec, func(key string) error {
 		switch key {
@@ -250,15 +251,41 @@ func (f *ConfigurationFile) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 		case "parser":
 			return parser.read(dec, key)
 		case "replace":
-			val, err := dec.ReadValue()
-			if err != nil {
+			replace, replaceErrs = nil, nil
+			switch k := dec.PeekKind(); k {
+			case 'n':
+				_, err := dec.ReadToken()
+				return err
+			case '[':
+			default:
+				replaceErrs = []error{errors.Errorf("parser: 'replace' must be an array, got %s", k)}
+				return dec.SkipValue()
+			}
+			if _, err := dec.ReadToken(); err != nil {
 				return err
 			}
-			// Decode from the already-read value so a bad replacement is
-			// reported after the loop without desyncing the decoder.
-			replace, replaceErr = nil, nil
-			if val.Kind() != 'n' {
-				replaceErr = jsonv2.Unmarshal(val, &replace, dec.Options())
+			// Each replacement is decoded from its own already-read value, so
+			// a bad one is skipped and reported after the loop without
+			// desyncing the decoder or dropping the good ones around it.
+			replace = []ConfigurationFileReplacement{}
+			for i := 0; dec.PeekKind() != ']'; i++ {
+				val, err := dec.ReadValue()
+				if err != nil {
+					return err
+				}
+				if val.Kind() == 'n' {
+					replaceErrs = append(replaceErrs, errors.Errorf("replace[%d]: replacement is null", i))
+					continue
+				}
+				var r ConfigurationFileReplacement
+				if err := jsonv2.Unmarshal(val, &r, dec.Options()); err != nil {
+					replaceErrs = append(replaceErrs, errors.Wrapf(err, "replace[%d]", i))
+					continue
+				}
+				replace = append(replace, r)
+			}
+			if _, err := dec.ReadToken(); err != nil {
+				return err
 			}
 		case "create_file":
 			val, err := dec.ReadValue()
@@ -300,11 +327,13 @@ func (f *ConfigurationFile) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
 	}
 	f.FileName, f.Parser = file.s, ConfigurationParser(parser.s)
 
-	f.Replace = []ConfigurationFileReplacement{}
-	if replaceErr != nil {
-		log.WithField("file", f.FileName).WithField("error", replaceErr).Warn("failed to unmarshal configuration file replacement")
-	} else if replace != nil {
-		f.Replace = replace
+	// Bad replacements are logged and skipped; the rest still apply.
+	for _, err := range replaceErrs {
+		log.WithField("file", f.FileName).WithField("error", err).Warn("failed to unmarshal configuration file replacement")
+	}
+	f.Replace = replace
+	if f.Replace == nil {
+		f.Replace = []ConfigurationFileReplacement{}
 	}
 
 	// create_file is assumed true when it is missing or invalid.

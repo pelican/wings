@@ -126,6 +126,36 @@ func TestConfigurationFileUnmarshalEdgeCases(t *testing.T) {
 				t.Errorf("bad replacement should give an empty slice, got %#v", f.Replace)
 			}
 
+			// Only the bad replacements are dropped; the good ones around
+			// them are kept, in order.
+			f, err = decodeConfigFile(t, name, `{"file":"a.yml","parser":"yaml","replace":[
+				{"match":"a","replace_with":"1"},
+				{"match":2,"replace_with":"x"},
+				{"match":"b"},
+				null,
+				"junk",
+				{"match":"c","replace_with":"3"}
+			]}`)
+			if err != nil {
+				t.Fatalf("bad replacements should not fail the file: %v", err)
+			}
+			var got []string
+			for _, r := range f.Replace {
+				got = append(got, r.Match+"="+r.ReplaceWith.String())
+			}
+			if len(got) != 2 || got[0] != "a=1" || got[1] != "c=3" {
+				t.Errorf("want only the good replacements [a=1 c=3], got %v", got)
+			}
+
+			// A replace that isn't an array is logged and gives an empty slice.
+			f, err = decodeConfigFile(t, name, `{"file":"a.yml","parser":"yaml","replace":{"match":"a","replace_with":"1"}}`)
+			if err != nil {
+				t.Fatalf("non-array replace should not fail the file: %v", err)
+			}
+			if f.Replace == nil || len(f.Replace) != 0 {
+				t.Errorf("non-array replace should give an empty slice, got %#v", f.Replace)
+			}
+
 			// replace_with wins over the legacy value key regardless of order.
 			f, err = decodeConfigFile(t, name, `{"file":"a.yml","parser":"yaml","replace":[{"value":"old","match":"k","replace_with":"new"}]}`)
 			if err != nil {
