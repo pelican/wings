@@ -224,3 +224,65 @@ func TestDefaultPluginsDirectoryIsOutsideTheRootDirectory(t *testing.T) {
 			c.Plugins.Directory, c.System.RootDirectory)
 	}
 }
+
+// TestPrepareDataDirRefusesASymlinkedDataDirectory: someone who can write the
+// plugins directory plants ".data" as a symlink to another tree (/ in the
+// real attack). Wings, as root, must not chmod that tree or give a directory
+// in it (/etc, for a plugin named "etc") to the plugin's user.
+func TestPrepareDataDirRefusesASymlinkedDataDirectory(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to change owners")
+	}
+	base := t.TempDir()
+	victim := filepath.Join(base, "victim")
+	if err := os.MkdirAll(filepath.Join(victim, "etc"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	plugins := filepath.Join(base, "plugins")
+	if err := os.MkdirAll(plugins, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, filepath.Join(plugins, DataDirName)); err != nil {
+		t.Fatal(err)
+	}
+
+	u := ProcessUser{Name: strconv.Itoa(65534), Uid: 65534, Gid: 65534, Switch: true}
+	err := PrepareDataDir(filepath.Join(plugins, DataDirName, "etc"), u)
+	if err == nil {
+		t.Error("a symlinked data directory must be refused")
+	}
+	if mode := statMode(t, victim); mode != 0o755 {
+		t.Errorf("the symlink's target was chmodded to %o", mode)
+	}
+	info, _ := os.Stat(filepath.Join(victim, "etc"))
+	if st := info.Sys().(*syscall.Stat_t); st.Uid != 0 {
+		t.Errorf("a directory in the symlink's target was given to uid %d", st.Uid)
+	}
+
+	// A plugin's own data directory replaced by a symlink is refused too.
+	if err := os.Remove(filepath.Join(plugins, DataDirName)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(filepath.Join(plugins, DataDirName), 0o711); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(victim, "etc"), filepath.Join(plugins, DataDirName, "demo")); err != nil {
+		t.Fatal(err)
+	}
+	if err := PrepareDataDir(filepath.Join(plugins, DataDirName, "demo"), u); err == nil {
+		t.Error("a symlinked plugin data directory must be refused")
+	}
+	info, _ = os.Stat(filepath.Join(victim, "etc"))
+	if st := info.Sys().(*syscall.Stat_t); st.Uid != 0 {
+		t.Errorf("the target of a symlinked plugin data directory was given to uid %d", st.Uid)
+	}
+}
+
+func statMode(t *testing.T, p string) os.FileMode {
+	t.Helper()
+	info, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.Mode().Perm()
+}

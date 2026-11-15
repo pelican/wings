@@ -57,11 +57,11 @@ func ExternalProcessUser() (ProcessUser, error) {
 		// The daemon fills these in at startup (config.EnsurePelicanUser);
 		// `wings plugins` commands don't, so look the user up by name.
 		if u, err := user.Lookup(c.System.Username); err == nil {
-			// 32 bits, the size of a Linux uid/gid.
-			if n, err := strconv.ParseUint(u.Uid, 10, 32); err == nil {
+			// 32 bits signed, so the value fits an int on every platform.
+			if n, err := strconv.ParseInt(u.Uid, 10, 32); err == nil && n >= 0 {
 				uid = int(n)
 			}
-			if n, err := strconv.ParseUint(u.Gid, 10, 32); err == nil {
+			if n, err := strconv.ParseInt(u.Gid, 10, 32); err == nil && n >= 0 {
 				gid = int(n)
 			}
 		}
@@ -102,47 +102,69 @@ func userName(uid int) string {
 // earlier version left owned by root (when plugins ran as root) over to u,
 // and back to root when plugins.run_as_root is set. When Wings isn't root,
 // dir is only created.
+//
+// As root, every change goes through an os.Root on the plugins directory,
+// and neither .data nor dir may be a symlink: someone able to write there
+// could otherwise point .data at / and have Wings chmod it and give a
+// directory such as /etc to u.
 func PrepareDataDir(dir string, u ProcessUser) error {
 	if os.Geteuid() != 0 {
 		return os.MkdirAll(dir, 0o700)
 	}
 	parent := filepath.Dir(dir)
-	if err := os.MkdirAll(parent, 0o711); err != nil {
-		return err
-	}
-	// An earlier Wings created it 0700 (mode bits are also cut by the umask).
-	if err := os.Chmod(parent, 0o711); err != nil {
-		return err
-	}
-	if err := os.Mkdir(dir, 0o700); err != nil && !errors.Is(err, fs.ErrExist) {
-		return err
-	}
-	info, err := os.Lstat(dir)
-	if err != nil {
-		return err
-	}
-	if !info.IsDir() {
-		return fmt.Errorf("plugin: data directory %s is not a directory", dir)
-	}
-	if err := chownTree(dir, u.Uid, u.Gid); err != nil {
-		return fmt.Errorf("plugin: giving the data directory to %s: %w", u.Name, err)
-	}
-	return os.Chmod(dir, 0o700)
-}
-
-// chownTree gives dir and the files and directories in it to uid:gid. It runs
-// as root on a directory the plugin's user can write while it runs, so every
-// change goes through a file descriptor opened under an os.Root on dir: a
-// path swapped for a symlink in between can't redirect it outside, and the
-// checks are made on what was actually opened. Symlinks, special files and
-// files with more than one hard link are skipped: a hard link could be any
-// file on the system that the plugin's user linked in.
-func chownTree(dir string, uid, gid int) error {
-	root, err := os.OpenRoot(dir)
+	data, name := filepath.Base(parent), filepath.Base(dir)
+	root, err := os.OpenRoot(filepath.Dir(parent))
 	if err != nil {
 		return err
 	}
 	defer root.Close()
+	// An earlier Wings created .data 0700 (mode bits are also cut by the umask).
+	if err := mkdirNoSymlink(root, data, 0o711); err != nil {
+		return err
+	}
+	if err := root.Chmod(data, 0o711); err != nil {
+		return err
+	}
+	rel := filepath.Join(data, name)
+	if err := mkdirNoSymlink(root, rel, 0o700); err != nil {
+		return err
+	}
+	sub, err := root.OpenRoot(rel)
+	if err != nil {
+		return err
+	}
+	defer sub.Close()
+	if err := chownTree(sub, u.Uid, u.Gid); err != nil {
+		return fmt.Errorf("plugin: giving the data directory to %s: %w", u.Name, err)
+	}
+	return root.Chmod(rel, 0o700)
+}
+
+// mkdirNoSymlink creates name under root if it's missing, and refuses it when
+// it exists as anything but a directory, a symlink included.
+func mkdirNoSymlink(root *os.Root, name string, perm fs.FileMode) error {
+	if err := root.Mkdir(name, perm); err != nil && !errors.Is(err, fs.ErrExist) {
+		return err
+	}
+	info, err := root.Lstat(name)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("plugin: %s in %s is not a directory (a symlink is refused)", name, root.Name())
+	}
+	return nil
+}
+
+// chownTree gives the directory root is opened on, and the files and
+// directories in it, to uid:gid. It runs as root on a directory the plugin's
+// user can write while it runs, so every change goes through a file
+// descriptor opened under root: a path swapped for a symlink in between can't
+// redirect it outside, and the checks are made on what was actually opened.
+// Symlinks, special files and files with more than one hard link are
+// skipped: a hard link could be any file on the system that the plugin's user
+// linked in.
+func chownTree(root *os.Root, uid, gid int) error {
 	return fs.WalkDir(root.FS(), ".", func(name string, d fs.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, fs.ErrNotExist) {
