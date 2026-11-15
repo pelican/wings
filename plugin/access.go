@@ -95,18 +95,27 @@ func CurrentPanelAccess() PanelAccess {
 	return a
 }
 
-// AfterPolicyChange, if set, runs after ApplyPolicy changes the plugins block
-// in memory. The daemon sets it to load external plugins that just became
-// enabled.
+// AfterPolicyChange, if set, runs after the running plugins block changed
+// (PolicyChanged). The daemon sets it to load external plugins that just
+// became enabled and stop ones that were disabled or untrusted.
 var AfterPolicyChange func()
 
-// ApplyPolicy makes p the running daemon's plugins block and runs
-// AfterPolicyChange. Enable state is read live by event delivery, plugin
-// routes and plugin tasks, so enabling or disabling takes effect at once.
-// Callers have written p to the config file first (config.UpdatePluginsOnDisk).
-func ApplyPolicy(p config.PluginConfiguration) {
-	config.Update(func(c *config.Configuration) { c.Plugins = p })
+// PolicyChanged runs AfterPolicyChange. Call it after the running plugins
+// block was changed through config.UpdatePluginsOnDisk or
+// config.ReloadPluginsFromDisk, which set it under the config file lock.
+// Enable state is read live by event delivery, plugin routes and plugin tasks,
+// so enabling or disabling takes effect at once.
+func PolicyChanged() {
 	if AfterPolicyChange != nil {
 		AfterPolicyChange()
 	}
+}
+
+// ApplyPolicy makes p the running plugins block and runs AfterPolicyChange,
+// without touching the config file. For tests and code that has no file;
+// code that writes the file uses config.UpdatePluginsOnDisk and then
+// PolicyChanged, so the two can't disagree.
+func ApplyPolicy(p config.PluginConfiguration) {
+	config.Update(func(c *config.Configuration) { c.Plugins = p })
+	PolicyChanged()
 }

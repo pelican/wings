@@ -113,8 +113,8 @@ func logPluginChange(c *gin.Context, action, name string) *log.Entry {
 }
 
 // pluginsChanged lets the daemon pick up a plugin that just became loadable
-// (installed, trusted or updated). Enable and disable go through
-// plugin.ApplyPolicy, which does the same.
+// (installed, trusted or updated), like enable and disable do through
+// plugin.PolicyChanged.
 func pluginsChanged() {
 	if plugin.AfterPolicyChange != nil {
 		plugin.AfterPolicyChange()
@@ -459,14 +459,14 @@ func postPluginToggle(enable bool) gin.HandlerFunc {
 				return
 			}
 		}
-		block, err := config.UpdatePluginsOnDisk(config.Get(), func(p *config.PluginConfiguration) {
+		// UpdatePluginsOnDisk also sets the running block, under the file lock.
+		if _, err := config.UpdatePluginsOnDisk(config.Get(), func(p *config.PluginConfiguration) {
 			install.Toggle(p, id, enable)
-		})
-		if err != nil {
+		}); err != nil {
 			abortInternal(c, fmt.Errorf("writing the config file: %w", err))
 			return
 		}
-		plugin.ApplyPolicy(block)
+		plugin.PolicyChanged()
 		logPluginChange(c, verb, id).Info("plugin changed through the Panel API")
 		respondPlugin(c, http.StatusOK, id, gin.H{"status": verb + "d"})
 	}
@@ -929,14 +929,13 @@ func postPluginUninstall(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "native plugins ship with Wings and can't be uninstalled; disable it instead"})
 		return
 	}
-	block, err := config.UpdatePluginsOnDisk(config.Get(), func(p *config.PluginConfiguration) {
+	if _, err := config.UpdatePluginsOnDisk(config.Get(), func(p *config.PluginConfiguration) {
 		install.Toggle(p, id, false)
-	})
-	if err != nil {
+	}); err != nil {
 		abortInternal(c, fmt.Errorf("writing the config file: %w", err))
 		return
 	}
-	plugin.ApplyPolicy(block)
+	plugin.PolicyChanged()
 	ts, err := plugin.LoadTrustStore()
 	if err == nil {
 		err = ts.Revoke(id)

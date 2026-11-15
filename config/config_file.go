@@ -122,7 +122,9 @@ func WriteToDiskKeepingPlugins(c *Configuration) error {
 // configuration file and returns the block it wrote. The whole file is read
 // again under the write locks and written back with only that block changed,
 // so concurrent `wings plugins` commands, or a daemon writing at the same
-// time, don't undo each other.
+// time, don't undo each other. The running configuration's plugins block is
+// set to the result under the same locks, so it can't be overtaken by an
+// older copy (see ReloadPluginsFromDisk).
 func UpdatePluginsOnDisk(c *Configuration, change func(*PluginConfiguration)) (PluginConfiguration, error) {
 	var out PluginConfiguration
 	err := withFileLock(c, func() error {
@@ -139,9 +141,43 @@ func UpdatePluginsOnDisk(c *Configuration, change func(*PluginConfiguration)) (P
 		}
 		change(&fresh.Plugins)
 		out = fresh.Plugins
-		return writeFile(fresh)
+		if err := writeFile(fresh); err != nil {
+			return err
+		}
+		setRunningPlugins(out)
+		return nil
 	})
 	return out, err
+}
+
+// ReloadPluginsFromDisk reads the plugins block from c's configuration file
+// and makes it the running configuration's block, both under the write
+// locks. Every change to the running block made through this package happens
+// together with the file read or write it belongs to, so the running block
+// always ends up as the file's latest one; a reader that applied its copy after
+// releasing the lock could put back an older block.
+func ReloadPluginsFromDisk(c *Configuration) (PluginConfiguration, error) {
+	var out PluginConfiguration
+	err := withFileLock(c, func() error {
+		p, err := pluginsFromFile(c.path)
+		if err != nil {
+			return err
+		}
+		out = p
+		setRunningPlugins(p)
+		return nil
+	})
+	return out, err
+}
+
+// setRunningPlugins sets the plugins block of the running configuration, if
+// this process has one (Set was called).
+func setRunningPlugins(p PluginConfiguration) {
+	mu.Lock()
+	defer mu.Unlock()
+	if _config != nil {
+		_config.Plugins = p
+	}
 }
 
 // PluginsOnDisk returns the plugins block as it is in c's configuration file

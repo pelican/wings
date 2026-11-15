@@ -44,8 +44,9 @@ func approvals() map[string]string {
 // interval it looks at the configuration file at path (modification time and
 // size), the plugins directory (modification time, which changes when a plugin
 // is added or removed) and the approvals in the trust store. When any of them
-// changed it reads the plugins block from the file, under the file lock, and
-// applies it with plugin.ApplyPolicy, which runs plugin.AfterPolicyChange.
+// changed it reloads the plugins block from the file into the running
+// configuration, both under the file lock (config.ReloadPluginsFromDisk), and
+// runs plugin.PolicyChanged.
 // It returns when ctx is done.
 //
 // At the start it applies the block on disk if it differs from the one in
@@ -80,7 +81,8 @@ type policyWatch struct {
 
 func (w *policyWatch) start() {
 	w.cfg = stampOf(w.path)
-	p, err := config.PluginsOnDisk(w.c)
+	before := config.Get().Plugins
+	p, err := config.ReloadPluginsFromDisk(w.c)
 	if err != nil {
 		log.WithField("error", err).Warn("could not read the plugins block from the config file; will retry")
 		w.cfg = fileStamp{} // read it again on the next poll
@@ -90,7 +92,7 @@ func (w *policyWatch) start() {
 	}
 	w.dir = stampOf(w.block.Directory)
 	w.approved = approvals()
-	if w.haveBlock && !samePolicy(w.block, config.Get().Plugins) {
+	if w.haveBlock && !samePolicy(w.block, before) {
 		w.apply("the plugins block on disk differs from the one in memory")
 	}
 }
@@ -98,7 +100,7 @@ func (w *policyWatch) start() {
 func (w *policyWatch) poll() {
 	var reasons []string
 	if s := stampOf(w.path); s != w.cfg {
-		p, err := config.PluginsOnDisk(w.c)
+		p, err := config.ReloadPluginsFromDisk(w.c)
 		if err != nil {
 			// Keep the old stamp so the next poll tries again.
 			log.WithField("error", err).Warn("could not read the plugins block from the config file; will retry")
@@ -130,7 +132,7 @@ func (w *policyWatch) apply(reasons ...string) {
 		}
 	}()
 	log.WithField("changed", reasons).Info("plugin policy changed on disk; applying it")
-	plugin.ApplyPolicy(w.block)
+	plugin.PolicyChanged()
 }
 
 // samePolicy reports whether a and b would be written to the file the same
