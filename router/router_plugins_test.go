@@ -1179,3 +1179,24 @@ func TestPluginAPICanUpdateOnlyForTrustedPlugins(t *testing.T) {
 		t.Fatalf("trusted plugin: can_update = %v, want true", got)
 	}
 }
+
+// zeros reads as an endless run of zero bytes.
+type zeros struct{}
+
+func (zeros) Read(p []byte) (int, error) {
+	clear(p)
+	return len(p), nil
+}
+
+// TestPluginAPIImportRefusesAnOversizedUploadWith413: the contract (A1) says a
+// body over its cap is a 413 (the lab got 400).
+func TestPluginAPIImportRefusesAnOversizedUploadWith413(t *testing.T) {
+	a := newPluginAPI(t, string(plugin.PanelAccessFull))
+	const boundary = "wingsboundary"
+	head := "--" + boundary + "\r\nContent-Disposition: form-data; name=\"plugin\"; filename=\"big.tar.gz\"\r\nContent-Type: application/gzip\r\n\r\n"
+	body := io.MultiReader(strings.NewReader(head), io.LimitReader(zeros{}, install.MaxArchiveBytes+(2<<20)), strings.NewReader("\r\n--"+boundary+"--\r\n"))
+	rec := a.do(http.MethodPost, "/api/plugins/import", body, "multipart/form-data; boundary="+boundary)
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversized upload: %d %s; want 413", rec.Code, rec.Body)
+	}
+}

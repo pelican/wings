@@ -1245,6 +1245,11 @@ func postPluginImport(c *gin.Context) {
 		c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, install.MaxArchiveBytes+(1<<20))
 		fh, err := c.FormFile("plugin")
 		if err != nil {
+			var tooLarge *http.MaxBytesError
+			if errors.As(err, &tooLarge) {
+				c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("the upload is larger than %d bytes", install.MaxArchiveBytes)})
+				return
+			}
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "upload the archive in the multipart field \"plugin\": " + err.Error()})
 			return
 		}

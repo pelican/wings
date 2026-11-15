@@ -88,7 +88,7 @@ Errors are JSON, `{"error": "..."}`, with these statuses:
   "directory": "/var/lib/pelican/plugins",
   "panel_access": "signed",
   "data": [ { "id": "state-log", "...": "one plugin, below" } ],
-  "error": "only when discovery found a bad manifest; the plugins that loaded are still listed"
+  "error": "only when the plugins directory could not be read; a bad manifest is listed as its own errored entry"
 }
 ```
 

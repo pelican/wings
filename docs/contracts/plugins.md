@@ -168,7 +168,7 @@ this section disagree, this section wins and the document is a bug.
 
 | Method and path | Level | Result |
 |---|---|---|
-| `GET /api/plugins` | view | `{"enabled": true, "directory": string, "panel_access": level, "data": [Plugin], "error"?: string}`. `panel_access` is always present; `enabled` is always `true` (reserved) |
+| `GET /api/plugins` | view | `{"enabled": true, "directory": string, "panel_access": level, "data": [Plugin], "error"?: string}`. `panel_access` is always present; `enabled` is always `true` (reserved); `error` only when the plugins directory couldn't be read (a bad manifest is its own entry with `meta.status: "errored"`) |
 | `GET /api/plugins/available` | signed | `{"data": [Available], "errors": {"<namespace>": "<message>"}}`: the `target: "wings"` entries of every configured registry (A3.2); a registry that couldn't be read is in `errors`, not a failure of the call |
 | `GET /api/plugins/{id}/update-check` | view | `{"installed": string, "latest": string\|null, "available": bool, "error"?: string}`: reads the plugin's update URL without staging anything. No update URL (or native): `latest: null`, `available: false`. A failed fetch: 200 with `error` set and `available: false`. An untrusted external plugin: 409 `reason: "untrusted"`, and nothing is fetched |
 | `GET /api/plugins/{id}` | view | Plugin |
