@@ -191,6 +191,11 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 		if file == "." {
 			return nil
 		}
+		// The server configuration Wings stored with the backup is for the Panel, it
+		// is not one of the server's files.
+		if backup.IsPelicanConfigEntry(info) {
+			return nil
+		}
 
 		s.Events().Publish(DaemonMessageEvent, "(restoring): "+file)
 		if info.IsDir() {

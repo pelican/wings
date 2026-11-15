@@ -65,6 +65,28 @@ type Archive struct {
 	ignored  *ignore.GitIgnore
 	matching []string
 	p        *progress.Progress
+	prelude  *PreludeFile
+}
+
+// PreludeOwner is the user and group name set on a prelude entry, so it can be
+// told apart from a file of the same name that was in the server's directory.
+const PreludeOwner = "pelican"
+
+// PreludeFile is a file that is not on the disk but is written as the first
+// entry of an archive, such as the .pelicanconfig stored with a backup.
+type PreludeFile struct {
+	Name string
+	Data []byte
+}
+
+// IsPreludeHeader reports whether a tar header is a prelude entry with the given
+// name, as written by WithPrelude.
+func IsPreludeHeader(header *tar.Header, name string) bool {
+	return header != nil &&
+		strings.TrimPrefix(header.Name, "./") == name &&
+		header.Typeflag == tar.TypeReg &&
+		header.Uname == PreludeOwner &&
+		header.Gname == PreludeOwner
 }
 
 // NewArchive returns a new archive instance that can be used for generating an
@@ -150,6 +172,19 @@ func WithMatching(files []string) ArchiveOption {
 	}
 }
 
+// WithPrelude writes the given file as the first entry of the archive, before
+// any of the files on the disk. A file of the same name on the disk is still
+// archived after it, so restoring the archive keeps that file.
+func WithPrelude(name string, data []byte) ArchiveOption {
+	return func(a *Archive) error {
+		if name = normalize(name); name == "." || strings.Contains(name, "/") {
+			return errors.NewPlain("archive prelude must be a file in the base directory")
+		}
+		a.prelude = &PreludeFile{Name: name, Data: data}
+		return nil
+	}
+}
+
 func (a *Archive) Progress() *progress.Progress {
 	return a.p
 }
@@ -203,6 +238,14 @@ func (a *Archive) Stream(ctx context.Context, w io.Writer) error {
 	tw := tar.NewWriter(gw)
 
 	a.pw = NewTarProgress(tw, a.p)
+
+	if a.prelude != nil {
+		if err := a.writePrelude(); err != nil {
+			_ = tw.Close()
+			_ = gw.Close()
+			return err
+		}
+	}
 
 	// The walk is performed through the os.Root instance, so nothing outside the
 	// server's data directory can ever be reached, and symlinks are not followed.
@@ -384,6 +427,28 @@ func (a *Archive) addToArchive(p, rel string) error {
 		return errors.Wrap(err, "server/filesystem: archive: failed to copy file to archive")
 	}
 
+	return nil
+}
+
+// writePrelude writes the prelude file as a USTAR entry. USTAR keeps it the very
+// first header in the stream, a PAX header would be written before it.
+func (a *Archive) writePrelude() error {
+	header := &tar.Header{
+		Typeflag: tar.TypeReg,
+		Name:     a.prelude.Name,
+		Size:     int64(len(a.prelude.Data)),
+		Mode:     0o600,
+		ModTime:  time.Now().Truncate(time.Second),
+		Uname:    PreludeOwner,
+		Gname:    PreludeOwner,
+		Format:   tar.FormatUSTAR,
+	}
+	if err := a.writeHeader(header); err != nil {
+		return err
+	}
+	if _, err := a.pw.Write(a.prelude.Data); err != nil {
+		return errors.Wrap(err, "server/filesystem: archive: failed to write prelude")
+	}
 	return nil
 }
 

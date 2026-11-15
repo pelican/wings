@@ -73,6 +73,9 @@ func Configure(m *wserver.Manager, client remote.Client) *gin.Engine {
 	protected.GET("/api/system/utilization", getSystemUtilization)
 	protected.GET("/api/servers", getAllServers)
 	protected.POST("/api/servers", postCreateServer)
+
+	// Deletes a backup kept after its server was deleted from this node.
+	protected.DELETE("/api/backups/:server/:backup", deleteKeptBackup)
 	protected.DELETE("/api/transfers/:server", deleteTransfer)
 	protected.POST("/api/deauthorize-user", postDeauthorizeUser)
 
