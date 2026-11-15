@@ -355,10 +355,16 @@ func (ip *InstallationProcess) AfterExecute(containerId string) error {
 		ShowStderr: true,
 		Follow:     false,
 	})
-
-	if err != nil && !cerrdefs.IsNotFound(err) {
+	if err != nil {
+		// The container can be removed out from under us (for example by a
+		// "docker container prune"). There are no logs to save in that case.
+		if cerrdefs.IsNotFound(err) {
+			ip.Server.Log().WithField("container_id", containerId).Warn("installation container no longer exists, skipping installation log")
+			return nil
+		}
 		return err
 	}
+	defer reader.Close()
 
 	v, err := system.KernelVersion()
 	if err != nil {
