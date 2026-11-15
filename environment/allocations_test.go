@@ -94,6 +94,28 @@ func TestDockerBindings(t *testing.T) {
 			},
 			wantPorts: 2,
 		},
+		{
+			name:     "ISPN drops every loopback binding on a port",
+			iface:    "172.18.0.1",
+			ispn:     true,
+			mappings: map[string][]int{"127.0.0.1": {25565, 25565}},
+			wantTCP: map[network.Port][]network.PortBinding{
+				tcp(25565): {},
+			},
+			wantPorts: 2,
+		},
+		{
+			name:     "every loopback binding on a port is rewritten",
+			iface:    "172.18.0.1",
+			mappings: map[string][]int{"127.0.0.1": {25565, 25565}},
+			wantTCP: map[network.Port][]network.PortBinding{
+				tcp(25565): {
+					{HostIP: addr("172.18.0.1"), HostPort: "25565"},
+					{HostIP: addr("172.18.0.1"), HostPort: "25565"},
+				},
+			},
+			wantPorts: 2,
+		},
 	}
 
 	for _, tc := range tests {
