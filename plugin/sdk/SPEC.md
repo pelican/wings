@@ -48,6 +48,11 @@ Config splits by ownership:
   operator approved: `wings plugins update` replaces it, and the approval
   covers its contents, so a file changed there is deleted by the next update
   and makes the plugin unapproved until `wings plugins trust` is run again.
+  A running Wings notices such a change and stops the plugin (within about a
+  minute). Mind tools that write caches next to the code: Python writes
+  `__pycache__` for imported modules unless `PYTHONDONTWRITEBYTECODE=1` is set
+  (for example `entrypoint: ["env", "PYTHONDONTWRITEBYTECODE=1", "python3",
+  "plugin.py"]`) or the code is a single script.
 - **Host policy** (whether a plugin is enabled/disabled and which host
   capabilities it is granted) is **not** in the plugin directory — it lives in
   Wings' `config.yml` under `plugins:` (`autoload`, `disabled`, `grants`). A

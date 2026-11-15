@@ -63,9 +63,10 @@ var (
 //     unchanged is left alone: its process keeps running.
 //   - A registered plugin that was approved again with a different
 //     fingerprint (it was updated and re-trusted), whose grants in
-//     plugins.grants changed, or whose directory moved, is replaced: the old process is stopped and the
-//     new version starts on first use. The grants are fixed when the process's
-//     host handler is built, so a narrower grant must not wait for a restart.
+//     plugins.grants changed, or whose directory moved, is replaced: the old
+//     process is stopped and the new version starts on first use. The grants
+//     are fixed when the process's host handler is built, so a narrower grant
+//     must not wait for a restart.
 //   - A registered plugin that is now disabled, untrusted, no longer approved
 //     for what is on disk (its files changed without a new approval), or gone
 //     from the directory is unregistered and its process stopped. A disabled
@@ -77,8 +78,8 @@ var (
 // while it is still enabled, its approval in the trust store is the one it
 // was loaded under, its files still match that approval, and its grants are
 // unchanged; anything that can't be checked stops it. Nothing new is
-// registered. If the trust store can't be
-// read, every external plugin is treated as untrusted, as at startup.
+// registered. If the trust store can't be read, every external plugin is
+// treated as untrusted, as at startup.
 func Reconcile(dir string, api plugin.HostAPI) error {
 	reconcileMu.Lock()
 	defer reconcileMu.Unlock()
