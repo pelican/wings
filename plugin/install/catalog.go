@@ -37,9 +37,9 @@ type CatalogEntry struct {
 	Signature   string            `json:"signature"` // base64 Ed25519 signature over the archive sha256
 }
 
-// FetchCatalog downloads and parses a registry index from an https URL, sending
+// fetchCatalog downloads and parses a registry index from an https URL, sending
 // any private-registry auth.
-func FetchCatalog(ctx context.Context, url string, a auth) (Catalog, error) {
+func fetchCatalog(ctx context.Context, url string, a auth) (Catalog, error) {
 	body, err := httpsGet(ctx, url, maxCatalogBytes, a)
 	if err != nil {
 		return Catalog{}, err
@@ -63,7 +63,7 @@ func (c Catalog) find(name string) (CatalogEntry, bool) {
 }
 
 // ResolvedPlugin is a registry entry together with the (opaque) credentials
-// needed to download it. Obtain one from Resolve and pass it to Add.
+// needed to download it. Obtain one from Resolve and pass it to StageAdd.
 type ResolvedPlugin struct {
 	Entry CatalogEntry
 	auth  auth
@@ -102,7 +102,7 @@ func Resolve(ctx context.Context, ref string) (ResolvedPlugin, error) {
 	switch {
 	case strings.Contains(ref, "#"):
 		url, name, _ := strings.Cut(ref, "#")
-		cat, err := FetchCatalog(ctx, url, auth{})
+		cat, err := fetchCatalog(ctx, url, auth{})
 		if err != nil {
 			return ResolvedPlugin{}, err
 		}
@@ -121,7 +121,7 @@ func Resolve(ctx context.Context, ref string) (ResolvedPlugin, error) {
 			return ResolvedPlugin{}, fmt.Errorf("plugin: unknown registry namespace %q; configure it under plugins.registries", ns)
 		}
 		a := authFor(reg)
-		cat, err := FetchCatalog(ctx, reg.URL, a)
+		cat, err := fetchCatalog(ctx, reg.URL, a)
 		if err != nil {
 			return ResolvedPlugin{}, err
 		}
@@ -148,7 +148,7 @@ func Resolve(ctx context.Context, ref string) (ResolvedPlugin, error) {
 		var where []string
 		for _, ns := range namespaces {
 			a := authFor(regs[ns])
-			cat, err := FetchCatalog(ctx, regs[ns].URL, a)
+			cat, err := fetchCatalog(ctx, regs[ns].URL, a)
 			if err != nil {
 				return ResolvedPlugin{}, fmt.Errorf("plugin: could not read registry %q (%v); install with @namespace/name to use a specific registry", ns, err)
 			}
@@ -169,21 +169,6 @@ func Resolve(ctx context.Context, ref string) (ResolvedPlugin, error) {
 }
 
 func registries() map[string]config.PluginRegistry { return config.Get().Plugins.Registries }
-
-// Add installs a resolved plugin into pluginsDir, reusing the same verified
-// download + signature check + extract + atomic swap the updater uses. The
-// running Wings must be restarted to load the new plugin.
-func Add(ctx context.Context, r ResolvedPlugin, pluginsDir string) error {
-	stage, err := StageAdd(ctx, r, pluginsDir)
-	if err != nil {
-		return err
-	}
-	defer stage.Cleanup()
-	if err := stage.Commit(); err != nil {
-		return err
-	}
-	return stage.Finish()
-}
 
 // StageAdd downloads and extracts a registry plugin without committing it. The
 // staged manifest must match the registry entry name.

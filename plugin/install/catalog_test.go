@@ -27,7 +27,7 @@ func TestCatalogFind(t *testing.T) {
 func TestAddRejectsUnsafeName(t *testing.T) {
 	unsafe := []string{"", ".", ".hidden", "../evil", "a/b", `a\b`, "x..y"}
 	for _, name := range unsafe {
-		err := Add(context.Background(),
+		_, err := StageAdd(context.Background(),
 			ResolvedPlugin{Entry: CatalogEntry{Name: name, Download: "https://example.com/a.tgz", SHA256: "abc"}},
 			t.TempDir())
 		if err == nil || !strings.Contains(err.Error(), "invalid plugin name") {

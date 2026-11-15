@@ -20,24 +20,6 @@ import (
 	"github.com/pelican/wings/plugin"
 )
 
-// ApplyUpdate downloads the archive named in a prior CheckUpdate, verifies its
-// sha256, extracts it to a staging directory next to the plugin, then atomically
-// swaps it into place (keeping the old version in a hidden backup until the
-// caller finishes or rolls back).
-// The archive is expected to contain the plugin's files at its root (plugin.yaml
-// at the top). A running plugin process must be restarted to pick up the change.
-func ApplyUpdate(ctx context.Context, st UpdateStatus) error {
-	stage, err := StageUpdate(ctx, st)
-	if err != nil {
-		return err
-	}
-	defer stage.Cleanup()
-	if err := stage.Commit(); err != nil {
-		return err
-	}
-	return stage.Finish()
-}
-
 // StageUpdate downloads, verifies, and extracts an update without replacing the
 // live plugin directory. Callers can inspect stage.Manifest before Commit.
 func StageUpdate(ctx context.Context, st UpdateStatus) (*StagedInstall, error) {
@@ -307,138 +289,154 @@ func extractArchive(ctx context.Context, archivePath, dest string) error {
 	}
 	defer root.Close()
 
+	x := &extractor{root: root, known: map[string]bool{".": true}, remaining: maxUpdateExtractBytes}
+	if err := ex.Extract(ctx, input, x.entry); err != nil {
+		return err
+	}
+	return x.createLinks()
+}
+
+// extractor writes one archive into root, enforcing the extraction limits.
+type extractor struct {
+	root *os.Root
+
 	// Symlinks are created only after every file and directory is written, so
 	// no entry is ever written through one, and each must then resolve inside
-	// dest. Checking each link's text on its own is not enough: a chain of
+	// the root. Checking each link's text on its own is not enough: a chain of
 	// links that each look harmless can still lead outside.
-	type link struct{ name, target string }
-	var links []link
+	links []archiveLink
 
-	// Every file, directory and symlink extraction creates counts against
-	// maxUpdateExtractEntries, including parent directories an entry's path
-	// implies but the archive never lists: one entry "a/b/c/.../f" would
-	// otherwise create as many directories as its path has parts.
-	var entries, created int
-	create := func() error {
-		created++
-		if created > maxUpdateExtractEntries {
-			return fmt.Errorf("plugin: archive creates more than %d files and directories", maxUpdateExtractEntries)
-		}
-		return nil
-	}
-	known := map[string]bool{".": true}
-	var mkdirs func(dir string) error
-	mkdirs = func(dir string) error {
-		if known[dir] {
-			return nil
-		}
-		if err := mkdirs(path.Dir(dir)); err != nil {
-			return err
-		}
-		info, err := root.Lstat(dir)
-		switch {
-		case err == nil:
-			if !info.IsDir() {
-				return fmt.Errorf("plugin: archive path %q is not a directory", dir)
-			}
-		case errors.Is(err, fs.ErrNotExist):
-			if err := create(); err != nil {
-				return err
-			}
-			if err := root.Mkdir(dir, 0o755); err != nil {
-				return err
-			}
-		default:
-			return err
-		}
-		known[dir] = true
-		return nil
-	}
+	entries   int             // archive entries read
+	created   int             // files, directories and links created
+	known     map[string]bool // directories known to exist
+	remaining int64           // bytes the rest of the archive may expand to
+}
 
-	remaining := maxUpdateExtractBytes
-	err = ex.Extract(ctx, input, func(ctx context.Context, af archives.FileInfo) error {
-		entries++
-		if entries > maxUpdateExtractEntries {
-			return fmt.Errorf("plugin: archive has more than %d entries", maxUpdateExtractEntries)
-		}
-		name, err := entryName(af.NameInArchive)
-		if err != nil {
-			return err
-		}
-		if name == "." {
-			// The archive's own top-level directory. Anything else under that
-			// name would be skipped unread, outside the size limits.
-			if !af.IsDir() {
-				return fmt.Errorf("plugin: archive entry %q names the root but is not a directory", af.NameInArchive)
-			}
-			return nil
-		}
-		if af.Mode()&os.ModeSymlink != 0 {
-			if af.LinkTarget == "" || filepath.IsAbs(af.LinkTarget) {
-				return fmt.Errorf("plugin: archive symlink %q must have a relative target", af.NameInArchive)
-			}
-			links = append(links, link{name: name, target: af.LinkTarget})
-			return nil
-		}
-		if af.LinkTarget != "" {
-			return fmt.Errorf("plugin: archive entry %q is a hard link, which is not supported", af.NameInArchive)
-		}
-		if af.IsDir() {
-			return mkdirs(name)
-		}
-		if !af.Mode().IsRegular() {
-			return fmt.Errorf("plugin: archive entry %q is not a regular file, directory or symlink", af.NameInArchive)
-		}
-		if err := mkdirs(path.Dir(name)); err != nil {
-			return err
-		}
-		if err := create(); err != nil {
-			return err
-		}
-		r, err := af.Open()
-		if err != nil {
-			return err
-		}
-		defer r.Close()
-		out, err := root.OpenFile(name, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
-		if err != nil {
-			return err
-		}
-		defer out.Close()
-		limit := int64(maxUpdateFileBytes)
-		if remaining < limit {
-			limit = remaining
-		}
-		n, err := copyLimited(out, r, limit)
-		remaining -= n
-		if err != nil {
-			if limit < maxUpdateFileBytes {
-				return fmt.Errorf("plugin: archive expands to more than %d bytes", maxUpdateExtractBytes)
-			}
-			return err
-		}
-		return nil
-	})
+type archiveLink struct{ name, target string }
+
+// entry handles one archive entry: it checks the entry's type, then writes a
+// file or directory, or records a symlink for createLinks.
+func (x *extractor) entry(_ context.Context, af archives.FileInfo) error {
+	x.entries++
+	if x.entries > maxUpdateExtractEntries {
+		return fmt.Errorf("plugin: archive has more than %d entries", maxUpdateExtractEntries)
+	}
+	name, err := entryName(af.NameInArchive)
 	if err != nil {
 		return err
 	}
+	switch {
+	case name == ".":
+		// The archive's own top-level directory. Anything else under that
+		// name would be skipped unread, outside the size limits.
+		if !af.IsDir() {
+			return fmt.Errorf("plugin: archive entry %q names the root but is not a directory", af.NameInArchive)
+		}
+		return nil
+	case af.Mode()&os.ModeSymlink != 0:
+		if af.LinkTarget == "" || filepath.IsAbs(af.LinkTarget) {
+			return fmt.Errorf("plugin: archive symlink %q must have a relative target", af.NameInArchive)
+		}
+		x.links = append(x.links, archiveLink{name: name, target: af.LinkTarget})
+		return nil
+	case af.LinkTarget != "":
+		return fmt.Errorf("plugin: archive entry %q is a hard link, which is not supported", af.NameInArchive)
+	case af.IsDir():
+		return x.mkdirs(name)
+	case !af.Mode().IsRegular():
+		return fmt.Errorf("plugin: archive entry %q is not a regular file, directory or symlink", af.NameInArchive)
+	default:
+		return x.writeFile(name, af)
+	}
+}
 
-	for _, l := range links {
-		if err := mkdirs(path.Dir(l.name)); err != nil {
+// writeFile writes a regular file, within the per-file and total size limits.
+func (x *extractor) writeFile(name string, af archives.FileInfo) error {
+	if err := x.mkdirs(path.Dir(name)); err != nil {
+		return err
+	}
+	if err := x.create(); err != nil {
+		return err
+	}
+	r, err := af.Open()
+	if err != nil {
+		return err
+	}
+	defer r.Close()
+	out, err := x.root.OpenFile(name, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	if err != nil {
+		return err
+	}
+	defer out.Close()
+	limit := min(int64(maxUpdateFileBytes), x.remaining)
+	n, err := copyLimited(out, r, limit)
+	x.remaining -= n
+	if err != nil {
+		if limit < maxUpdateFileBytes {
+			return fmt.Errorf("plugin: archive expands to more than %d bytes", maxUpdateExtractBytes)
+		}
+		return err
+	}
+	return nil
+}
+
+// mkdirs creates dir and any missing parents. Each one it creates counts
+// against maxUpdateExtractEntries: one entry "a/b/c/.../f" would otherwise
+// create as many directories as its path has parts.
+func (x *extractor) mkdirs(dir string) error {
+	if x.known[dir] {
+		return nil
+	}
+	if err := x.mkdirs(path.Dir(dir)); err != nil {
+		return err
+	}
+	info, err := x.root.Lstat(dir)
+	switch {
+	case err == nil:
+		if !info.IsDir() {
+			return fmt.Errorf("plugin: archive path %q is not a directory", dir)
+		}
+	case errors.Is(err, fs.ErrNotExist):
+		if err := x.create(); err != nil {
 			return err
 		}
-		if err := create(); err != nil {
+		if err := x.root.Mkdir(dir, 0o755); err != nil {
 			return err
 		}
-		if err := root.Symlink(l.target, l.name); err != nil {
+	default:
+		return err
+	}
+	x.known[dir] = true
+	return nil
+}
+
+// create counts one file, directory or symlink about to be created.
+func (x *extractor) create() error {
+	x.created++
+	if x.created > maxUpdateExtractEntries {
+		return fmt.Errorf("plugin: archive creates more than %d files and directories", maxUpdateExtractEntries)
+	}
+	return nil
+}
+
+// createLinks creates the recorded symlinks, then checks each resolves inside
+// the root. os.Root follows a link only while it stays inside the root, so
+// Stat fails for a link that leads outside, directly or through a chain, and
+// for a dangling one.
+func (x *extractor) createLinks() error {
+	for _, l := range x.links {
+		if err := x.mkdirs(path.Dir(l.name)); err != nil {
+			return err
+		}
+		if err := x.create(); err != nil {
+			return err
+		}
+		if err := x.root.Symlink(l.target, l.name); err != nil {
 			return fmt.Errorf("plugin: creating archive symlink: %w", err)
 		}
 	}
-	// os.Root follows a link only while it stays inside the root, so Stat
-	// fails for a link that leads outside, directly or through a chain, and
-	// for a dangling one.
-	for _, l := range links {
-		if _, err := root.Stat(l.name); err != nil {
+	for _, l := range x.links {
+		if _, err := x.root.Stat(l.name); err != nil {
 			return fmt.Errorf("plugin: archive symlink %s points outside the plugin directory or nowhere: %w", l.name, err)
 		}
 	}

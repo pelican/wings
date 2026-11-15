@@ -3,6 +3,7 @@ package cmd
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -144,50 +145,16 @@ func newPluginsAddCommand() *cobra.Command {
 				fmt.Fprintf(os.Stderr, "install failed: %v\n", err)
 				os.Exit(1)
 			}
-			// os.Exit skips deferred calls, so every exit below removes the
-			// staging directory itself.
-			defer stage.Cleanup()
-
-			// Read the staged manifest and ask the operator to approve it
-			// before it is committed and allowed to run.
-			m, err := stage.Manifest()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "install failed: could not read staged manifest for trust approval: %v\n", err)
-				stage.Cleanup()
-				os.Exit(1)
-			}
-			ok, err := reviewPlugin(m, assumeYes)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "%v\n", err)
-				stage.Cleanup()
-				os.Exit(1)
-			}
-			if !ok {
+			m, err := installStaged(stage, nil, assumeYes)
+			switch {
+			case errors.Is(err, errNotApproved):
 				fmt.Printf("did not install %s; it was not trusted.\n", m.Name)
-				return
-			}
-			if err := stage.Commit(); err != nil {
+			case err != nil:
 				fmt.Fprintf(os.Stderr, "install failed: %v\n", err)
-				stage.Cleanup()
 				os.Exit(1)
+			default:
+				fmt.Printf("installed and trusted %s %s. Restart Wings to load it.\n", m.Name, m.Version)
 			}
-			// Until the approval is saved the install can still be undone; a
-			// plugin left installed without an approval would never load.
-			m, err = plugin.LoadManifest(filepath.Join(dir, m.Name, plugin.ManifestFile))
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "install failed: could not read the installed manifest for trust approval: %v\n", err)
-				rollbackOrWarn(stage)
-				os.Exit(1)
-			}
-			if err := recordPluginTrust(m); err != nil {
-				fmt.Fprintf(os.Stderr, "install failed: recording trust: %v\n", err)
-				rollbackOrWarn(stage)
-				os.Exit(1)
-			}
-			if err := stage.Finish(); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: could not remove the previous version's backup: %v\n", err)
-			}
-			fmt.Printf("installed and trusted %s %s. Restart Wings to load it.\n", m.Name, m.Version)
 		},
 	}
 	cmd.Flags().BoolVarP(&assumeYes, "yes", "y", false, "approve the plugin without prompting")
@@ -248,14 +215,56 @@ func newPluginsUntrustCommand() *cobra.Command {
 	}
 }
 
-// rollbackOrWarn undoes a committed install after a later step failed, and
-// says so if even that fails, since the plugins directory then needs a look.
-func rollbackOrWarn(stage *install.StagedInstall) {
-	if err := stage.Rollback(); err != nil {
-		fmt.Fprintf(os.Stderr, "could not restore the previous state: %v\n", err)
-		return
+// errNotApproved means the operator declined the plugin at the prompt.
+var errNotApproved = errors.New("not approved")
+
+// installStaged takes a staged add or update the rest of the way: it shows the
+// staged manifest for approval, moves the plugin into place and records the
+// approval. check, if set, vets the staged manifest first. The staging
+// directory is removed on every return. Once the plugin is in place, a failure
+// to record the approval rolls it back: a plugin left installed without one
+// would never load, and for an update the old version would be gone.
+func installStaged(stage *install.StagedInstall, check func(plugin.Manifest) error, assumeYes bool) (plugin.Manifest, error) {
+	defer stage.Cleanup()
+	m, err := stage.Manifest()
+	if err != nil {
+		return m, fmt.Errorf("could not read the staged manifest: %w", err)
 	}
-	fmt.Fprintln(os.Stderr, "the previous state was restored.")
+	if check != nil {
+		if err := check(m); err != nil {
+			return m, err
+		}
+	}
+	ok, err := reviewPlugin(m, assumeYes)
+	if err != nil {
+		return m, err
+	}
+	if !ok {
+		return m, errNotApproved
+	}
+	if err := stage.Commit(); err != nil {
+		return m, err
+	}
+	m, err = plugin.LoadManifest(filepath.Join(stage.DestDir, plugin.ManifestFile))
+	if err != nil {
+		return m, rollBack(stage, fmt.Errorf("could not read the installed manifest for trust approval: %w", err))
+	}
+	if err := recordPluginTrust(m); err != nil {
+		return m, rollBack(stage, fmt.Errorf("recording trust: %w", err))
+	}
+	if err := stage.Finish(); err != nil {
+		fmt.Fprintf(os.Stderr, "warning: could not remove the previous version's backup: %v\n", err)
+	}
+	return m, nil
+}
+
+// rollBack undoes a committed install after err, and says in the returned
+// error whether that worked, since the plugins directory otherwise needs a look.
+func rollBack(stage *install.StagedInstall, err error) error {
+	if rbErr := stage.Rollback(); rbErr != nil {
+		return fmt.Errorf("%w; could not restore the previous state: %v", err, rbErr)
+	}
+	return fmt.Errorf("%w; the previous state was restored", err)
 }
 
 // reviewPlugin prints the plugin's details + requested host access and asks the
@@ -367,58 +376,24 @@ func newPluginsUpdateCommand() *cobra.Command {
 				fmt.Fprintf(os.Stderr, "update failed: %v\n", err)
 				os.Exit(1)
 			}
-			// os.Exit skips deferred calls, so every exit below removes the
-			// staging directory itself.
-			defer stage.Cleanup()
-			m, err = stage.Manifest()
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "update failed: could not read staged manifest: %v\n", err)
-				stage.Cleanup()
-				os.Exit(1)
-			}
-			if m.Name != st.Name {
-				fmt.Fprintf(os.Stderr, "update failed: staged manifest name %q does not match plugin %q\n", m.Name, st.Name)
-				stage.Cleanup()
-				os.Exit(1)
-			}
-			if m.Version != st.Latest {
-				fmt.Fprintf(os.Stderr, "update failed: staged manifest version %q does not match update version %q\n", m.Version, st.Latest)
-				stage.Cleanup()
-				os.Exit(1)
-			}
-			ok, err = reviewPlugin(m, assumeYes)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "%v\n", err)
-				stage.Cleanup()
-				os.Exit(1)
-			}
-			if !ok {
+			_, err = installStaged(stage, func(m plugin.Manifest) error {
+				if m.Name != st.Name {
+					return fmt.Errorf("staged manifest name %q does not match plugin %q", m.Name, st.Name)
+				}
+				if m.Version != st.Latest {
+					return fmt.Errorf("staged manifest version %q does not match update version %q", m.Version, st.Latest)
+				}
+				return nil
+			}, assumeYes)
+			switch {
+			case errors.Is(err, errNotApproved):
 				fmt.Printf("did not update %s to %s; it was not trusted.\n", st.Name, st.Latest)
-				return
-			}
-			if err := stage.Commit(); err != nil {
+			case err != nil:
 				fmt.Fprintf(os.Stderr, "update failed: %v\n", err)
-				stage.Cleanup()
 				os.Exit(1)
+			default:
+				fmt.Printf("updated and trusted %s to %s. Restart Wings to load the new version.\n", st.Name, st.Latest)
 			}
-			// Until the approval is saved the update can still be undone; the
-			// new version without an approval would never load, and the old
-			// one would be gone.
-			m, err = plugin.LoadManifest(info.Manifest)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "update failed: could not read the installed manifest for trust approval: %v\n", err)
-				rollbackOrWarn(stage)
-				os.Exit(1)
-			}
-			if err := recordPluginTrust(m); err != nil {
-				fmt.Fprintf(os.Stderr, "update failed: recording trust: %v\n", err)
-				rollbackOrWarn(stage)
-				os.Exit(1)
-			}
-			if err := stage.Finish(); err != nil {
-				fmt.Fprintf(os.Stderr, "warning: could not remove the previous version's backup: %v\n", err)
-			}
-			fmt.Printf("updated and trusted %s to %s. Restart Wings to load the new version.\n", st.Name, st.Latest)
 		},
 	}
 	cmd.Flags().BoolVar(&checkOnly, "check", false, "only check for an update; do not install")
