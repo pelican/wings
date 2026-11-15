@@ -418,6 +418,15 @@ func getPluginUpdateCheck(c *gin.Context) {
 		return
 	}
 	resp["installed"] = m.Version
+	// Only trusted plugins: otherwise the Panel could make the node fetch any
+	// URL an unapproved manifest names (contract v3.1).
+	if ts, err := plugin.LoadTrustStore(); err != nil || !ts.IsTrusted(m) {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error":  fmt.Sprintf("plugin %q is not trusted on this node; the node operator must run `wings plugins trust %s` first", id, id),
+			"reason": "untrusted",
+		})
+		return
+	}
 	if m.Update == "" {
 		c.JSON(http.StatusOK, resp)
 		return
@@ -886,7 +895,7 @@ func (e signatureRefused) Error() string {
 func commitApproved(c *gin.Context, action, name, token string) {
 	p, err := pending.take(token, action, name)
 	if err != nil {
-		c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": err.Error()})
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": err.Error(), "reason": "token"})
 		return
 	}
 	m, err := install.InstallIf(p.stage, nil, func(plugin.Manifest) (bool, error) { return true, nil }, func(m plugin.Manifest) error {
@@ -936,7 +945,7 @@ func commitApproved(c *gin.Context, action, name, token string) {
 		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"error": sr.Error()})
 		return
 	case errors.Is(err, errDestinationChanged):
-		c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": err.Error()})
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": err.Error(), "reason": "destination_changed"})
 		return
 	case err != nil:
 		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"error": err.Error()})

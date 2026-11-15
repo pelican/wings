@@ -604,8 +604,8 @@ func TestPluginAPIInstallNeedsApproval(t *testing.T) {
 		t.Fatalf("staging dirs left: %v", a.stagingDirs())
 	}
 	// The token is single use.
-	if rec, _ := a.json(http.MethodPost, "/api/plugins/gamma/install", `{"approve":"`+token+`"}`); rec.Code != http.StatusConflict {
-		t.Fatalf("token reuse: %d %s", rec.Code, rec.Body)
+	if rec, _ := a.json(http.MethodPost, "/api/plugins/gamma/install", `{"approve":"`+token+`"}`); rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"reason":"token"`) {
+		t.Fatalf("token reuse: %d %s; want 409 with reason token", rec.Code, rec.Body)
 	}
 	// Installing again is an update's job.
 	if rec, _ := a.json(http.MethodPost, "/api/plugins/gamma/install", ""); rec.Code != http.StatusConflict {
@@ -905,8 +905,8 @@ func TestPluginAPIApprovalRefusesAChangedDestination(t *testing.T) {
 		_, staged := a.json(http.MethodPost, "/api/plugins/gamma/install", "")
 		a.writePlugin("gamma", "apiVersion: v1\nname: gamma\ncapability: events\nversion: 9.0.0\nentrypoint: [\"./run\"]\n")
 		rec, _ := a.json(http.MethodPost, "/api/plugins/gamma/install", `{"approve":"`+staged["approval_token"].(string)+`"}`)
-		if rec.Code != http.StatusConflict {
-			t.Fatalf("approve over a plugin installed after staging: %d %s; want 409", rec.Code, rec.Body)
+		if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"reason":"destination_changed"`) {
+			t.Fatalf("approve over a plugin installed after staging: %d %s; want 409 with reason destination_changed", rec.Code, rec.Body)
 		}
 		if m, err := plugin.LoadManifest(filepath.Join(a.dir, "gamma", plugin.ManifestFile)); err != nil || m.Version != "9.0.0" {
 			t.Fatalf("the plugin installed meanwhile was replaced: %+v %v", m, err)
@@ -1039,6 +1039,17 @@ func TestPluginAPIUpdateCheck(t *testing.T) {
 	}
 	if code, body := check("alpha"); code != http.StatusOK || body != `{"available":false,"installed":"1.0.0","latest":null}` {
 		t.Fatalf("no update URL: %d %s", code, body)
+	}
+	// Contract v3.1: an untrusted plugin's update URL is never fetched.
+	if code, body := check("delta"); code != http.StatusConflict || !strings.Contains(body, `"reason":"untrusted"`) {
+		t.Fatalf("untrusted plugin: %d %s; want 409 with reason untrusted", code, body)
+	}
+	m, err := plugin.LoadManifest(filepath.Join(a.dir, "delta", plugin.ManifestFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := install.RecordTrust(m); err != nil {
+		t.Fatal(err)
 	}
 	if code, body := check("delta"); code != http.StatusOK || body != `{"available":true,"installed":"1.0.0","latest":"2.0.0"}` {
 		t.Fatalf("newer version: %d %s", code, body)

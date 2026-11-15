@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -140,10 +141,15 @@ func (m Manifest) validate() error {
 // so is a leading ".": filepath.Join(dir, ".") is dir itself, so installing a
 // plugin named "." would replace every plugin and the trust store, and hidden
 // directories are where installs keep their staging and backup copies, which
-// discovery skips.
+// discovery skips. ReservedNames are refused too.
 func InvalidName(name string) bool {
-	return name == "" || strings.HasPrefix(name, ".") || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..")
+	return name == "" || strings.HasPrefix(name, ".") || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..") ||
+		slices.Contains(ReservedNames, name)
 }
+
+// ReservedNames can't be plugin names: they are paths of the Panel plugin API
+// next to /api/plugins/{id} (contract v3.1).
+var ReservedNames = []string{"available"}
 
 // DiscoveryIssue is a per-plugin discovery failure. It lets operator tooling
 // show every bad manifest instead of losing later valid plugins after the first
