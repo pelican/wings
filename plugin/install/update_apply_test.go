@@ -7,9 +7,11 @@ import (
 	"compress/gzip"
 	"context"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -444,5 +446,41 @@ func TestExtractArchiveAcceptsZip(t *testing.T) {
 		if _, err := os.Stat(filepath.Join(dest, name)); err != nil {
 			t.Errorf("%s missing after extracting a zip: %v", name, err)
 		}
+	}
+}
+
+// TestStagedFilesAreReadableButNotWritableByOthers covers the modes a plugin
+// is installed with: Wings extracts as root, and the plugin runs as
+// system.user, which must be able to read and run its files but not change
+// them, whatever the umask Wings runs with.
+func TestStagedFilesAreReadableButNotWritableByOthers(t *testing.T) {
+	old := syscall.Umask(0o077)
+	t.Cleanup(func() { syscall.Umask(old) })
+
+	archive := writeTar(t, []tarEntry{
+		{name: "demo/", typ: tar.TypeDir},
+		{name: "demo/plugin.yaml", typ: tar.TypeReg, body: demoManifest},
+		{name: "demo/bin/run", typ: tar.TypeReg, body: "#!/bin/sh\n"},
+	})
+	r := stagePaths(t, archive)["add"]
+	if r.err != nil {
+		t.Fatal(r.err)
+	}
+	defer r.stage.Cleanup()
+	err := filepath.WalkDir(r.stage.StagingDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if got := info.Mode().Perm(); got != 0o755 {
+			t.Errorf("%s has mode %o, want 755", strings.TrimPrefix(path, r.stage.StagingDir), got)
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
 	}
 }

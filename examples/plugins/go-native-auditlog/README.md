@@ -20,8 +20,9 @@ import _ "github.com/pelican/wings/examples/plugins/go-native-auditlog"
 That is the only change to Wings' own files. A fork keeps its plugins in its own packages the same way, so
 merging a new Wings release touches one import list.
 
-Native plugins are trusted like the rest of Wings (they are part of the binary). They still follow the
-operator's policy: `wings plugins disable auditlog` stops the listener, the route and the task.
+Native plugins run inside Wings, as Wings' own user and with all of its access: they are as trusted as the
+Wings build that includes them, and nothing at runtime limits them. They still follow the operator's policy:
+`wings plugins disable auditlog` stops the listener, the route and the task.
 
 ## Test
 

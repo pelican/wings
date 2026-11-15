@@ -37,18 +37,21 @@ Config splits by ownership:
 
 - **Per-plugin settings and state** live in the plugin's **data directory**,
   `<plugins directory>/.data/<name>/`, whose path Wings passes as
-  `WINGS_PLUGIN_DATA` (created with mode 0700 before the first start). Put a
-  `config.yaml`, a cache or a database there. Apart from `settings.json`
-  (below), **Wings never reads or writes files there** — a plugin may use any
-  format it likes.
+  `WINGS_PLUGIN_DATA` (created with mode 0700, owned by the user the plugin
+  runs as, before the first start; `HOME` points there too when Wings starts
+  the plugin as `system.user`). Put a `config.yaml`, a cache or a database
+  there. Apart from `settings.json` (below), **Wings never reads or writes
+  files there** — a plugin may use any format it likes.
 - **Declared settings** are the exception: values the operator or the Panel
   sets for a plugin, described by `settings:` in `plugin.yaml` and stored by
   Wings in `$WINGS_PLUGIN_DATA/settings.json` (see Settings).
 - **Don't write to the plugin's own directory.** It holds the code the
   operator approved: `wings plugins update` replaces it, and the approval
-  covers its contents, so a file changed there is deleted by the next update
-  and makes the plugin unapproved until `wings plugins trust` is run again.
-  A running Wings notices such a change and stops the plugin (within about a
+  covers its contents. When Wings runs as root, the plugin runs as
+  `system.user` and its own directory is read-only to it, so writes there
+  fail. Otherwise a file changed there is deleted by the next update and
+  makes the plugin unapproved until `wings plugins trust` is run again: a
+  running Wings notices such a change and stops the plugin (within about a
   minute). Mind tools that write caches next to the code: Python writes
   `__pycache__` for imported modules unless `PYTHONDONTWRITEBYTECODE=1` is set
   (for example `entrypoint: ["env", "PYTHONDONTWRITEBYTECODE=1", "python3",

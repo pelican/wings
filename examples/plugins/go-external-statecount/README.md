@@ -7,12 +7,20 @@ directory (`$WINGS_PLUGIN_DATA/counts.json`), which survives restarts and plugin
 Compare with [go-native-auditlog](../go-native-auditlog): same language, but this one is a separate process
 the operator installs and approves, instead of code compiled into Wings.
 
+## A compiled plugin is a binary plugin
+
+Go has to be compiled, so this plugin ships an executable, and Wings shows it to the operator as **binary**
+when they approve it, listing `wings-plugin-statecount`: they can't read what they are approving, only decide
+whether they trust you. If people should be able to read your plugin, write it in an interpreted language
+(see [python-install-log](../python-install-log) or [state-log](../state-log)). If you ship a compiled one,
+publish its source (`source:` in `plugin.yaml`) and sign your releases (`wings plugins sign`).
+
 ## Build and install
 
 ```bash
 go build -o wings-plugin-statecount .        # inside this repo; elsewhere, a module that requires github.com/pelican/wings
 cp -r . /var/lib/pelican/plugins/statecount  # or package it and publish it to a registry
-wings plugins trust statecount               # review and approve
+wings plugins trust statecount               # shows what it is (binary, runs as system.user) and asks to approve
 ```
 
 Restart Wings. The plugin starts on the first state change.

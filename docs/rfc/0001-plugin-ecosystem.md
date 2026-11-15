@@ -52,7 +52,7 @@ autoload, enabled/disabled lists, grants) — never per-plugin plumbing. Native
 providers self-register in code via `init()`.
 
 Security rule — **discover ≠ execute**: every trust decision (run it? what may it
-access?) is made pre-spawn from the manifest. Plugin processes are spawned
+ask Wings for?) is made pre-spawn from the manifest. Plugin processes are spawned
 lazily, on first use.
 
 ### Phased trust (the load-bearing decision)
@@ -61,8 +61,10 @@ Trust is **phased**: native first-party providers are compiled in, while
 external plugins require operator approval before loading. The constant across
 both is a single mediated boundary — every plugin→host call goes through
 `HostHandler`, **deny-by-default**, where granted = `manifest.requires ∩
-policy`. Opening a public marketplace later means adding stronger sandbox
-transport and user-approved grant subsets, not re-architecting the boundary.
+policy`. That boundary mediates what a plugin asks Wings; it does not confine
+the plugin's process, which has its OS user's access (see Threat model).
+Opening a public marketplace later means adding stronger sandbox transport and
+user-approved grant subsets, not re-architecting the boundary.
 
 ### Transport choice: stdio JSON-RPC
 
@@ -91,7 +93,8 @@ notifications (`event`, later `progress`) share the connection.
 | **M3** | `EventListener` capability + `plugin.Emit` (wired to server state, stats and install), `HostAPI` + grant-gated host callbacks, native `RegisterRoutes` / `RegisterTask` | **Done** |
 | **M4** | `BackupProvider` contract + **restic** provider (bundled binary, `exec --json`); requires Panel snapshot-chain model | **Deferred** |
 | **M5** | content-bound trust, archive signing, registry install, updater | **Done** |
-| **M6** | per-plugin server scoping of host calls and events, subprocess sandboxing (unprivileged uid, seccomp/namespaces), WASM transport | Next |
+| **M5.1** | archive layout (manifest at the root or in one top-level directory), external plugins run as `system.user` instead of root, source/binary and process-user disclosure at approval (contract v3.2) | **Done** |
+| **M6** | per-plugin server scoping of host calls and events, subprocess sandboxing beyond the OS user (seccomp/namespaces), WASM transport | Next |
 
 ## The Pelican Hub as the first registry
 
@@ -142,15 +145,59 @@ Deferred until the Panel-side chain model + a `Server.Backup` quiesce hook land.
 
 ## Security
 
-- Plugins run as a subprocess; unprivileged-uid drop + seccomp/namespaces are a
-  follow-up before untrusted use.
+- External plugins run as a subprocess, as `system.user` when Wings is root
+  (never root unless the operator sets `plugins.run_as_root`).
+  Seccomp/namespaces are a follow-up before untrusted use.
 - Host callbacks are deny-by-default and grant-scoped, and return projections:
   never the Panel client, raw server configuration or container inspect.
 - Host calls and events are **not yet scoped per server**: a plugin granted a
   method can use it on any server on the node (M6).
 - Archive signing is enforced when signatures are present or required by policy;
-  external plugins also require operator trust approval before loading. Sandbox
-  transport remains a marketplace follow-up.
+  external plugins also require operator approval before loading. A signature
+  says who published an archive, not that it is safe. Sandbox transport remains
+  a marketplace follow-up.
+
+### Threat model
+
+From the plugin contract, section S. A plugin is code the operator chooses to
+run. Wings can't make arbitrary code safe or readable; it makes the operator's
+decision informed, makes it stick, and limits the damage when trust is
+misplaced.
+
+Guaranteed:
+
+- Nothing runs until it is approved.
+- What runs is exactly what was approved: the approval covers a hash of the
+  plugin's files, and a plugin whose files changed needs a new approval.
+- Host access is deny by default: a plugin can call only the host methods it
+  requested and was granted.
+- Downloads are https only, sha256-checked, signature-checked when a signature
+  is offered or required, and registry credentials stay on the registry's
+  origin.
+
+Not guaranteed, and said so at every approval:
+
+- That the code is safe, or readable: Wings does not review it, and a plugin
+  may ship compiled binaries. Every approval shows whether the plugin is
+  **source** (every file is valid UTF-8 with no NUL bytes) or **binary**, and
+  which files are binary.
+- That host access bounds the plugin: it limits what the plugin can ask Wings.
+  The process has the access of the OS user it runs as, `system.user` by
+  default, which owns every server's files.
+
+Every approval also shows the signature status, the requested host access, the
+OS user, and the sentence "This plugin runs on this node as <user>, with that
+user's access to the machine. The host access listed only limits what it can ask
+Wings."
+
+Responsibilities: Wings provides the guarantees, the disclosure, safe defaults
+and honest documentation; the node operator decides what to install and which
+registries and keys to trust; the plugin author publishes an honest manifest,
+the source and signed releases; a registry (and the Hub) reviews, signs and
+takes down bad releases.
+
+Not yet: sandboxing beyond the OS user (seccomp, namespaces), host access scoped
+per server, registry-driven revocation, and a source-only policy.
 
 ## Testing
 

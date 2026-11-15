@@ -11,7 +11,7 @@ it under the plugin's name) and to `installs.log` in its data directory (`$WINGS
 
 ```bash
 cp -r . /var/lib/pelican/plugins/install-log
-wings plugins trust install-log   # review and approve
+wings plugins trust install-log   # shows what it is (source, runs as system.user) and asks to approve
 ```
 
 Restart Wings. The plugin starts on the first install event. The node needs `python3`.

@@ -39,6 +39,9 @@ func usePluginsDir(t *testing.T, change func(*config.PluginConfiguration)) (stri
 	}
 	c.AuthenticationToken = "test-token"
 	c.Plugins.Directory = filepath.Join(root, "plugins")
+	// As root (in a container), plugins would run as system.user, which
+	// can't enter t.TempDir's directories; see TestMain.
+	c.Plugins.RunAsRoot = os.Geteuid() == 0
 	if change != nil {
 		change(&c.Plugins)
 	}
