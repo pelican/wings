@@ -93,6 +93,37 @@ notifications (`event`, later `progress`) share the connection.
 | **M5** | content-bound trust, archive signing, registry install, updater | **Done** |
 | **M6** | per-plugin server scoping of host calls and events, subprocess sandboxing (unprivileged uid, seccomp/namespaces), WASM transport | Next |
 
+## The Pelican Hub as the first registry
+
+Wings reads any `registry.json` (format in `plugin/README.md`), so a registry
+can be a static file. The Pelican Hub (pelican/hub) is the natural first
+public one: it already reviews, versions and serves Panel plugins, and almost
+every field a Wings entry needs maps to data it has.
+
+| `registry.json` entry field | Hub source today |
+|---|---|
+| `name` | `plugins.slug` |
+| `version` | the latest approved stable `plugin_versions.version` (as its `update.json` picks it) |
+| `author`, `description` | `author_name`, `description` (as in `PluginSummaryData`) |
+| `download` | the existing public route `plugins.download`, `/plugins/{slug}/download/{version-id}/{slug}.zip` |
+| `sha256` | `plugin_versions.package_sha256` |
+| `capability` | optional: Wings compares it with the archive's `plugin.yaml` only when present, so the Hub can add it later |
+| `signature` | optional; the Hub has no signing yet |
+
+What the Hub would add:
+
+1. A way to mark a plugin as a Wings plugin. `PluginType` has `plugin`,
+   `theme` and `language`, all for the Panel, so this is a new type or a new
+   "target" field.
+2. `GET /wings/registry.json`, next to the other machine-polled routes in
+   `routes/panel.php` (no session, `throttle:downloads`): published Wings
+   plugins with their latest approved stable version, in the format above.
+
+Updates need nothing new on the Hub: Wings reads the Hub's existing
+`/plugins/{slug}/update.json` (the `"*"` release with `download_url`), and
+`.zip` archives install like `.tar.gz`. Beta channels, which the Hub gates on
+a Panel key, are left out for Wings.
+
 ## Backups (M4) — why deferred, and the shape
 
 Incremental backup is the motivating "hard" capability, but it is **not
