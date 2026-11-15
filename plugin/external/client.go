@@ -157,6 +157,15 @@ func (c *Client) command() (*exec.Cmd, error) {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = c.manifest.Dir()
 	cmd.Env = append(pluginEnv(os.Environ()), "WINGS_PLUGIN=1")
+	// The checks come before PrepareDataDir changes anything as root.
+	if u.Switch {
+		if err := plugin.CheckReadOnlyTo(c.manifest.Dir(), u); err != nil {
+			return nil, fmt.Errorf("plugin %q: %w", c.manifest.Name, err)
+		}
+		if err := plugin.CheckReachableBy(c.manifest.Dir(), u); err != nil {
+			return nil, fmt.Errorf("plugin %q: %w", c.manifest.Name, err)
+		}
+	}
 	dir := c.manifest.DataDir()
 	if dir != "" {
 		if err := plugin.PrepareDataDir(dir, u); err != nil {
@@ -166,12 +175,6 @@ func (c *Client) command() (*exec.Cmd, error) {
 	}
 	if !u.Switch {
 		return cmd, nil
-	}
-	if err := plugin.CheckReadOnlyTo(c.manifest.Dir(), u); err != nil {
-		return nil, fmt.Errorf("plugin %q: %w", c.manifest.Name, err)
-	}
-	if err := plugin.CheckReachableBy(c.manifest.Dir(), u); err != nil {
-		return nil, fmt.Errorf("plugin %q: %w", c.manifest.Name, err)
 	}
 	uid, gid, err := u.IDs()
 	if err != nil {
