@@ -2,14 +2,16 @@ package environment
 
 import (
 	"context"
-	"strings"
+	"net/netip"
 	"strconv"
+	"strings"
 	"sync"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
 
 	"github.com/pelican/wings/config"
 )
@@ -25,7 +27,7 @@ var (
 func Docker() (*client.Client, error) {
 	var err error
 	_conce.Do(func() {
-		_client, err = client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+		_client, err = client.New(client.FromEnv)
 	})
 	return _client, errors.Wrap(err, "environment/docker: could not create client")
 }
@@ -39,9 +41,9 @@ func ConfigureDocker(ctx context.Context) error {
 	}
 
 	nw := config.Get().Docker.Network
-	resource, err := cli.NetworkInspect(ctx, nw.Name, network.InspectOptions{})
+	inspect, err := cli.NetworkInspect(ctx, nw.Name, client.NetworkInspectOptions{})
 	if err != nil {
-		if !client.IsErrNotFound(err) {
+		if !cerrdefs.IsNotFound(err) {
 			return err
 		}
 
@@ -51,11 +53,12 @@ func ConfigureDocker(ctx context.Context) error {
 		}
 
 		// Re-inspect the network after creation to get the actual configuration
-		resource, err = cli.NetworkInspect(ctx, nw.Name, network.InspectOptions{})
+		inspect, err = cli.NetworkInspect(ctx, nw.Name, client.NetworkInspectOptions{})
 		if err != nil {
 			return errors.Wrap(err, "environment/docker: failed to inspect newly created network")
 		}
 	}
+	resource := inspect.Network
 
 	config.Update(func(c *config.Configuration) {
 		c.Docker.Network.Driver = resource.Driver
@@ -76,20 +79,19 @@ func ConfigureDocker(ctx context.Context) error {
 		// Skip IPAM processing for special drivers that don't have normal IPAM configs
 		if c.Docker.Network.Driver != "host" && c.Docker.Network.Driver != "overlay" && c.Docker.Network.Driver != "weavemesh" {
 			for _, ipamCfg := range resource.IPAM.Config {
-				if ipamCfg.Subnet == "" {
+				if !ipamCfg.Subnet.IsValid() {
 					continue
 				}
-				// IPv6 subnets contain colons
-				if strings.Contains(ipamCfg.Subnet, ":") {
-					c.Docker.Network.Interfaces.V6.Subnet = ipamCfg.Subnet
-					if ipamCfg.Gateway != "" {
-						c.Docker.Network.Interfaces.V6.Gateway = ipamCfg.Gateway
+				if ipamCfg.Subnet.Addr().Is6() {
+					c.Docker.Network.Interfaces.V6.Subnet = ipamCfg.Subnet.String()
+					if ipamCfg.Gateway.IsValid() {
+						c.Docker.Network.Interfaces.V6.Gateway = ipamCfg.Gateway.String()
 					}
 				} else {
-					c.Docker.Network.Interfaces.V4.Subnet = ipamCfg.Subnet
-					if ipamCfg.Gateway != "" {
-						c.Docker.Network.Interfaces.V4.Gateway = ipamCfg.Gateway
-						c.Docker.Network.Interface = ipamCfg.Gateway
+					c.Docker.Network.Interfaces.V4.Subnet = ipamCfg.Subnet.String()
+					if ipamCfg.Gateway.IsValid() {
+						c.Docker.Network.Interfaces.V4.Gateway = ipamCfg.Gateway.String()
+						c.Docker.Network.Interface = ipamCfg.Gateway.String()
 					}
 				}
 			}
@@ -108,19 +110,21 @@ func createDockerNetwork(ctx context.Context, cli *client.Client) error {
 	// Build IPAM config with the configured subnets
 	ipamConfigs := []network.IPAMConfig{}
 	if nw.Interfaces.V4.Subnet != "" {
-		ipamConfigs = append(ipamConfigs, network.IPAMConfig{
-			Subnet:  nw.Interfaces.V4.Subnet,
-			Gateway: nw.Interfaces.V4.Gateway,
-		})
+		cfg, err := ipamConfig(nw.Interfaces.V4.Subnet, nw.Interfaces.V4.Gateway)
+		if err != nil {
+			return errors.Wrap(err, "environment/docker: invalid IPv4 network interface configuration")
+		}
+		ipamConfigs = append(ipamConfigs, cfg)
 	}
 	if enableIPv6 && nw.Interfaces.V6.Subnet != "" {
-		ipamConfigs = append(ipamConfigs, network.IPAMConfig{
-			Subnet:  nw.Interfaces.V6.Subnet,
-			Gateway: nw.Interfaces.V6.Gateway,
-		})
+		cfg, err := ipamConfig(nw.Interfaces.V6.Subnet, nw.Interfaces.V6.Gateway)
+		if err != nil {
+			return errors.Wrap(err, "environment/docker: invalid IPv6 network interface configuration")
+		}
+		ipamConfigs = append(ipamConfigs, cfg)
 	}
 
-	createOpts := network.CreateOptions{
+	createOpts := client.NetworkCreateOptions{
 		Driver:     nw.Driver,
 		EnableIPv6: &enableIPv6,
 		Internal:   nw.IsInternal,
@@ -164,4 +168,23 @@ func createDockerNetwork(ctx context.Context, cli *client.Client) error {
 	}
 
 	return nil
+}
+
+// ipamConfig parses a subnet and optional gateway from the Wings configuration
+// into the form expected by the Docker API.
+func ipamConfig(subnet, gateway string) (network.IPAMConfig, error) {
+	var cfg network.IPAMConfig
+	prefix, err := netip.ParsePrefix(strings.TrimSpace(subnet))
+	if err != nil {
+		return cfg, errors.Wrapf(err, "invalid subnet %q", subnet)
+	}
+	cfg.Subnet = prefix
+	if gateway = strings.TrimSpace(gateway); gateway != "" {
+		addr, err := netip.ParseAddr(gateway)
+		if err != nil {
+			return cfg, errors.Wrapf(err, "invalid gateway %q", gateway)
+		}
+		cfg.Gateway = addr
+	}
+	return cfg, nil
 }

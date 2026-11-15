@@ -2,19 +2,20 @@ package docker
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"net"
 	"net/http"
-	"reflect"
 	"strings"
 	"sync"
 
 	"emperror.dev/errors"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/versions"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/errdefs"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/containerd/errdefs/pkg/errhttp"
 	"github.com/goccy/go-json"
+	"github.com/moby/moby/api/types/common"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 
 	"github.com/pelican/wings/config"
 )
@@ -26,22 +27,41 @@ var (
 )
 
 type cliSettings struct {
-	enabled bool
-	proto   string
-	host    string
-	scheme  string
-	version string
+	// http is a client that talks to the same daemon as the Docker client,
+	// dialing through the Docker client's own dialer so unix sockets, named
+	// pipes and TLS connections all behave the same way.
+	http *http.Client
+	// host is the value sent as the request host.
+	host string
 }
 
 func configure(c *client.Client) {
 	o.Do(func() {
 		fastEnabled = config.Get().Docker.UsePerformantInspect
+		if !fastEnabled {
+			return
+		}
 
-		r := reflect.ValueOf(c).Elem()
-		cli.proto = r.FieldByName("proto").String()
-		cli.host = r.FieldByName("addr").String()
-		cli.scheme = r.FieldByName("scheme").String()
-		cli.version = r.FieldByName("version").String()
+		u, err := client.ParseHostURL(c.DaemonHost())
+		if err != nil {
+			// Fall back to the standard client if the host cannot be parsed.
+			fastEnabled = false
+			return
+		}
+
+		cli.host = u.Host
+		if u.Scheme == "unix" || u.Scheme == "npipe" {
+			cli.host = "docker"
+		}
+
+		dial := c.Dialer()
+		cli.http = &http.Client{
+			Transport: &http.Transport{
+				DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+					return dial(ctx)
+				},
+			},
+		}
 	})
 }
 
@@ -57,38 +77,28 @@ func (e *Environment) ContainerInspect(ctx context.Context) (container.InspectRe
 	// wrong for now it is easy enough for people to switch back to the older method
 	// of fetching stats.
 	if !fastEnabled {
-		return e.client.ContainerInspect(ctx, e.Id)
+		res, err := e.client.ContainerInspect(ctx, e.Id, client.ContainerInspectOptions{})
+		return res.Container, err
 	}
 
 	var st container.InspectResponse
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "/containers/"+e.Id+"/json", nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://"+cli.host+"/containers/"+e.Id+"/json", nil)
 	if err != nil {
 		return st, errors.WithStack(err)
 	}
 
-	if cli.proto == "unix" || cli.proto == "npipe" {
-		req.Host = "docker"
-	}
-
-	req.URL.Host = cli.host
-	req.URL.Scheme = cli.scheme
-
-	res, err := e.client.HTTPClient().Do(req)
+	res, err := cli.http.Do(req)
 	if err != nil {
-		if res == nil {
-			return st, errdefs.Unknown(err)
-		}
-		_ = res.Body.Close()
-		return st, errdefs.FromStatusCode(err, res.StatusCode)
+		return st, fmt.Errorf("%w: %w", cerrdefs.ErrUnknown, err)
 	}
 	defer res.Body.Close()
-	
+
 	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		return st, errors.Wrap(err, "failed to read response body from Docker")
 	}
 	if err := parseErrorFromResponse(res, body); err != nil {
-		return st, errdefs.FromStatusCode(err, res.StatusCode)
+		return st, fmt.Errorf("%w: %w", errhttp.ToNative(res.StatusCode), err)
 	}
 	if err := json.Unmarshal(body, &st); err != nil {
 		return st, errors.WithStack(err)
@@ -109,8 +119,8 @@ func parseErrorFromResponse(res *http.Response, body []byte) error {
 	}
 
 	var emsg string
-	if (cli.version == "" || versions.GreaterThan(cli.version, "1.23")) && ct == "application/json" {
-		var errResp types.ErrorResponse
+	if ct == "application/json" {
+		var errResp common.ErrorResponse
 		if err := json.Unmarshal(body, &errResp); err != nil {
 			return errors.WithStack(err)
 		}
