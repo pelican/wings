@@ -12,12 +12,12 @@ import (
 	"github.com/pelican/wings/config"
 )
 
-
 // DefaultAllocationMapping defines the IP and port mapping for a server
 type DefaultAllocationMapping struct {
 	Ip   string `json:"ip"`
 	Port int    `json:"port"`
 }
+
 // Defines the allocations available for a given server. When using the Docker environment
 // driver these correspond to mappings for the container that allow external connections.
 type Allocations struct {
@@ -26,7 +26,7 @@ type Allocations struct {
 	// the DefaultMapping's IP. This is important to servers which rely on external
 	// services that check the IP of the server (Source Engine servers, for example).
 	ForceOutgoingIP bool `json:"force_outgoing_ip"`
-	
+
 	// Defines the default allocation that should be used for this server. This is
 	// what will be used for {SERVER_IP} and {SERVER_PORT} when modifying configuration
 	// files or the startup arguments for a server.

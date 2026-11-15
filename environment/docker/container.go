@@ -512,9 +512,9 @@ type imagePullMessage struct {
 	Status         string `json:"status"`
 	Progress       string `json:"progress"` // Fallback for older daemons
 	ProgressDetail *struct {
-		Current int64 `json:"current"`
-		Total   int64 `json:"total"`
-		Units string `json:"units"`
+		Current int64  `json:"current"`
+		Total   int64  `json:"total"`
+		Units   string `json:"units"`
 	} `json:"progressDetail"`
 	Error       string `json:"error"`
 	ErrorDetail *struct {
