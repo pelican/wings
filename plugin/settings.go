@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 
 	"gopkg.in/yaml.v3"
 )
@@ -320,8 +321,21 @@ func LoadSettings(m Manifest) (map[string]any, error) {
 	return readSettings(root, file)
 }
 
+// readSettings reads file (path.Join(dataDir, SettingsFile)) under root. The
+// plugin's user owns its data directory, so the file is opened through a root
+// on that directory, without blocking, and only read if it is a regular file:
+// a symlink can't lead to Wings' own files next to it, and a FIFO can't hang
+// the reader.
 func readSettings(root *os.Root, file string) (map[string]any, error) {
-	f, err := root.Open(file)
+	dataRoot, err := root.OpenRoot(path.Dir(file))
+	if errors.Is(err, fs.ErrNotExist) {
+		return map[string]any{}, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	defer dataRoot.Close()
+	f, err := dataRoot.OpenFile(SettingsFile, os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if errors.Is(err, fs.ErrNotExist) {
 		return map[string]any{}, nil
 	}
@@ -329,6 +343,11 @@ func readSettings(root *os.Root, file string) (map[string]any, error) {
 		return nil, err
 	}
 	defer f.Close()
+	if info, err := f.Stat(); err != nil {
+		return nil, err
+	} else if !info.Mode().IsRegular() {
+		return nil, fmt.Errorf("plugin: %s is not a regular file", SettingsFile)
+	}
 	b, err := io.ReadAll(io.LimitReader(f, maxSettingsFileBytes+1))
 	if err != nil {
 		return nil, err
@@ -431,6 +450,9 @@ func writeFileAtomic(root *os.Root, dir, file string, b []byte) error {
 	}
 	_, werr := f.Write(b)
 	if werr == nil {
+		werr = giveToProcessUser(f)
+	}
+	if werr == nil {
 		werr = f.Sync()
 	}
 	if cerr := f.Close(); werr == nil {
@@ -444,4 +466,18 @@ func writeFileAtomic(root *os.Root, dir, file string, b []byte) error {
 		return fmt.Errorf("plugin: writing %s: %w", SettingsFile, werr)
 	}
 	return nil
+}
+
+// giveToProcessUser makes f owned by the user plugins run as, when Wings is
+// root and that is another user: the plugin reads its settings file as that
+// user. If plugins can't run (ExternalProcessUser fails), f stays root's.
+func giveToProcessUser(f *os.File) error {
+	if os.Geteuid() != 0 {
+		return nil
+	}
+	u, err := ExternalProcessUser()
+	if err != nil {
+		return nil
+	}
+	return f.Chown(u.Uid, u.Gid)
 }
