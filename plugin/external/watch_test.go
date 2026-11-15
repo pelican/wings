@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -197,5 +198,49 @@ func TestClientDoesNotStartAChangedPlugin(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 	if _, err := os.Stat(filepath.Join(m.DataDir(), "pid")); err == nil {
 		t.Fatal("the changed plugin was started")
+	}
+}
+
+// TestWatchPolicySeesAnEditWithTheSameSizeAndTime: Linux keeps file times to
+// a clock tick, and the config file is rewritten in place, so two writes
+// within one tick that leave it the same size look like no change by time
+// and size. The watcher must compare the block itself.
+func TestWatchPolicySeesAnEditWithTheSameSizeAndTime(t *testing.T) {
+	dir, path := usePluginsDir(t, func(p *config.PluginConfiguration) { p.Disabled = []string{"watch-same"} })
+	approve(t, writePlugin(t, dir, "watch-same", "1.0.0"))
+	plugin.AfterPolicyChange = func() { _ = Reconcile(config.Get().Plugins.Directory, nil) }
+	t.Cleanup(func() { plugin.AfterPolicyChange = nil })
+	c, err := config.NewAtPath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := policyWatch{path: path, c: c}
+	w.start()
+	if listener("watch-same") != nil {
+		t.Fatal("a disabled plugin was loaded")
+	}
+
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Same length: the plugin is no longer disabled.
+	edited := strings.Replace(string(b), "- watch-same", "- other-same", 1)
+	if edited == string(b) {
+		t.Fatal("the disabled entry wasn't found in the config file")
+	}
+	if err := os.WriteFile(path, []byte(edited), info.Mode()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(path, info.ModTime(), info.ModTime()); err != nil {
+		t.Fatal(err)
+	}
+	w.poll()
+	if listener("watch-same") == nil {
+		t.Fatal("an edit with the same size and time was missed")
 	}
 }
