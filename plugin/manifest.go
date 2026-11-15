@@ -41,6 +41,11 @@ type Manifest struct {
 	Provides   Provides `yaml:"provides"`
 	Requires   Requires `yaml:"requires"`
 
+	// Settings declares the values an operator (or the Panel) can set for
+	// this plugin. Wings validates them against this schema and keeps them in
+	// <DataDir>/settings.json; see settings.go.
+	Settings []Setting `yaml:"settings"`
+
 	// dir is the absolute directory the manifest was loaded from; entrypoint
 	// paths are resolved relative to it.
 	dir string
@@ -123,6 +128,9 @@ func (m Manifest) validate() error {
 		return fmt.Errorf("plugin: manifest for %q missing capability", m.Name)
 	case len(m.Entrypoint) == 0:
 		return fmt.Errorf("plugin: manifest for %q missing entrypoint", m.Name)
+	}
+	if err := validateSettingsSchema(m.Settings); err != nil {
+		return fmt.Errorf("plugin: manifest for %q: %w", m.Name, err)
 	}
 	return nil
 }

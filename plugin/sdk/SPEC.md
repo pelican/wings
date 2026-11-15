@@ -38,8 +38,12 @@ Config splits by ownership:
 - **Per-plugin settings and state** live in the plugin's **data directory**,
   `<plugins directory>/.data/<name>/`, whose path Wings passes as
   `WINGS_PLUGIN_DATA` (created with mode 0700 before the first start). Put a
-  `config.yaml`, a cache or a database there. **Wings never parses per-plugin
-  config** — a plugin may use any format it likes.
+  `config.yaml`, a cache or a database there. Apart from `settings.json`
+  (below), **Wings never reads or writes files there** — a plugin may use any
+  format it likes.
+- **Declared settings** are the exception: values the operator or the Panel
+  sets for a plugin, described by `settings:` in `plugin.yaml` and stored by
+  Wings in `$WINGS_PLUGIN_DATA/settings.json` (see Settings).
 - **Don't write to the plugin's own directory.** It holds the code the
   operator approved: `wings plugins update` replaces it, and the approval
   covers its contents, so a file changed there is deleted by the next update
@@ -49,6 +53,60 @@ Config splits by ownership:
   Wings' `config.yml` under `plugins:` (`autoload`, `disabled`, `grants`). A
   plugin cannot enable or grant itself; the manifest only *requests*
   capabilities and the operator's policy decides.
+
+## Settings
+
+A plugin that wants to be configured from the Panel declares its settings in
+`plugin.yaml`:
+
+```yaml
+settings:
+  - key: webhook_url          # letters, digits, _ . - (at most 64)
+    label: Webhook URL        # optional; the key is shown otherwise
+    description: Where to post state changes.
+    type: string              # string | number | boolean | select (default string)
+    required: true
+    secret: true              # string only; never shown back, see below
+  - key: level
+    type: select
+    options: [info, warn, {value: error, label: Errors only}]
+    default: warn
+  - key: retries
+    type: number
+    default: 3
+```
+
+Wings validates the schema when it reads the manifest; a bad schema makes the
+manifest invalid, like a missing entrypoint. The schema is part of the
+approved content, so changing it needs a new approval like any other edit.
+
+Values are saved through the Panel API (`PUT /api/plugins/<name>/settings`,
+see [`plugin/API.md`](../API.md)). Wings refuses unknown keys, values of the
+wrong type, select values that are not an option, and a missing required
+setting that has no default. It then writes them to
+**`$WINGS_PLUGIN_DATA/settings.json`**, mode 0600, as one flat JSON object:
+
+```json
+{ "webhook_url": "https://hooks.example.test/abc", "level": "error" }
+```
+
+- A key that is not in the file has not been set: use the `default` from your
+  own manifest. Wings does not write defaults into the file.
+- Numbers are JSON numbers, booleans are `true`/`false`, select values are the
+  option's `value`.
+- The file is replaced with a rename, never rewritten in place, so a read
+  always sees either the old or the new file, complete.
+
+**When changes are seen:** Wings does not restart or signal the plugin when
+settings change. Read the file when you start, and before using a setting
+check whether the file's modification time changed since you read it; if it
+did, read it again. A `stat` per event is cheap; a plugin that does not want
+that can instead re-read it on a timer (every few seconds). A missing file
+means "no values set".
+
+Secret settings are write-only from the Panel: the API shows a stored secret
+as `********`, and saving `********` back keeps the stored value. They are
+still plain text in `settings.json`, readable by the Wings user.
 
 ## Methods
 
