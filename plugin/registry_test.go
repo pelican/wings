@@ -189,6 +189,9 @@ func (p parkedListener) OnEvent(context.Context, Event) error {
 // listeners that don't want the event. It must cost the same with 40
 // listeners as with one.
 func TestEmitReadsThePolicyOncePerEvent(t *testing.T) {
+	if raceDetector {
+		t.Skip("the race detector changes allocation counts; the plain test run covers this")
+	}
 	setConfig(t)
 	release := make(chan struct{})
 	t.Cleanup(func() { close(release) })
