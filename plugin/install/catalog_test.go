@@ -114,3 +114,27 @@ func TestRegistryCredentialsOnlyGoToTheRegistryHost(t *testing.T) {
 		t.Fatalf("another port is another host, got %+v", got)
 	}
 }
+
+// TestCatalogFindSkipsPanelEntries covers registries that list Panel and Wings
+// plugins together (contract v1, section R1): Wings uses entries whose target
+// is "wings" or missing, and never a "panel" one, even for a bare name.
+func TestCatalogFindSkipsPanelEntries(t *testing.T) {
+	var c Catalog
+	if err := json.Unmarshal([]byte(`{"plugins":[
+		{"name":"both","version":"1.0.0","target":"panel"},
+		{"name":"both","version":"2.0.0","target":"wings"},
+		{"name":"panel-only","version":"1.0.0","target":"panel"},
+		{"name":"legacy","version":"3.0.0"}
+	]}`), &c); err != nil {
+		t.Fatal(err)
+	}
+	if e, ok := c.find("both"); !ok || e.Version != "2.0.0" {
+		t.Fatalf("both = %+v, %v; want the wings entry 2.0.0", e, ok)
+	}
+	if _, ok := c.find("panel-only"); ok {
+		t.Fatal("a target=panel entry must not be found by Wings")
+	}
+	if e, ok := c.find("legacy"); !ok || e.Version != "3.0.0" {
+		t.Fatalf("an entry without target must count as wings, got %+v, %v", e, ok)
+	}
+}

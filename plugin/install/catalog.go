@@ -35,6 +35,9 @@ type CatalogEntry struct {
 	Download    string            `json:"download"`  // https URL to the plugin archive
 	SHA256      string            `json:"sha256"`    // hex digest of the archive
 	Signature   string            `json:"signature"` // base64 Ed25519 signature over the archive sha256
+	// Target is which side installs the entry: "wings", or "panel" for a Panel
+	// plugin listed in the same registry. Missing means "wings".
+	Target string `json:"target,omitempty"`
 }
 
 // fetchCatalog downloads and parses a registry index from an https URL, sending
@@ -55,6 +58,9 @@ func fetchCatalog(ctx context.Context, url string, a auth) (Catalog, error) {
 
 func (c Catalog) find(name string) (CatalogEntry, bool) {
 	for _, e := range c.Plugins {
+		if e.Target != "" && e.Target != "wings" {
+			continue // a Panel plugin, or a target this Wings doesn't know
+		}
 		if e.Name == name {
 			return e, true
 		}
