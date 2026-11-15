@@ -36,6 +36,7 @@ import (
 	"github.com/pelican/wings/remote"
 	"github.com/pelican/wings/router"
 	"github.com/pelican/wings/server"
+	"github.com/pelican/wings/server/backup"
 	"github.com/pelican/wings/sftp"
 	"github.com/pelican/wings/system"
 )
@@ -237,7 +238,7 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 		s := serv
 
 		// For each server we encounter make sure the root data directory exists.
-		if err := s.EnsureDataDirectoryExists(); err != nil {
+		if _, err := s.EnsureDataDirectoryExists(); err != nil {
 			s.Log().Error("could not create root data directory for server: not loading server...")
 			continue
 		}
@@ -350,6 +351,18 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	// Ensure the backup directory exists.
 	if err := os.MkdirAll(sys.BackupDirectory, 0o755); err != nil {
 		log.WithField("error", err).Error("failed to create backup directory")
+	}
+
+	// Report local backups still stored in the legacy location. They are moved
+	// into their server's backup directory when the Panel next accesses them.
+	if count, size, err := backup.LegacyLocalArchives(); err != nil {
+		log.WithField("error", err).Warn("failed to check for local backups in the legacy location")
+	} else if count > 0 {
+		log.WithFields(log.Fields{
+			"count":      count,
+			"size_bytes": size,
+			"path":       sys.BackupDirectory,
+		}).Warn("found local backups stored in the legacy location, they will be moved into their server's backup directory when next downloaded, restored, deleted or transferred")
 	}
 
 	autotls, _ := cmd.Flags().GetBool("auto-tls")

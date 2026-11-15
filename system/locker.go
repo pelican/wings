@@ -12,12 +12,19 @@ var ErrLockerLocked = errors.Sentinel("locker: cannot acquire lock, already lock
 type Locker struct {
 	mu sync.RWMutex
 	ch chan bool
+	// done is closed when the locker is destroyed, waking anything waiting in
+	// TryAcquire. The lock channel itself is never closed, as a send on a closed
+	// channel panics, and acquiring can race with destroying the locker when a
+	// server is deleted.
+	done      chan struct{}
+	destroyed bool
 }
 
 // NewLocker returns a new Locker instance.
 func NewLocker() *Locker {
 	return &Locker{
-		ch: make(chan bool, 1),
+		ch:   make(chan bool, 1),
+		done: make(chan struct{}),
 	}
 }
 
@@ -31,9 +38,13 @@ func (l *Locker) IsLocked() bool {
 
 // Acquire will acquire the power lock if it is not currently locked. If it is
 // already locked, acquire will fail to acquire the lock, and will return false.
+// A destroyed locker can never be acquired.
 func (l *Locker) Acquire() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.destroyed {
+		return ErrLockerLocked
+	}
 	select {
 	case l.ch <- true:
 	default:
@@ -43,11 +54,22 @@ func (l *Locker) Acquire() error {
 }
 
 // TryAcquire will attempt to acquire a power-lock until the context provided
-// is canceled.
+// is canceled or the locker is destroyed.
 func (l *Locker) TryAcquire(ctx context.Context) error {
 	select {
 	case l.ch <- true:
+		// The locker may have been destroyed while we were waiting, a destroyed
+		// locker must never be handed out.
+		l.mu.RLock()
+		destroyed := l.destroyed
+		l.mu.RUnlock()
+		if destroyed {
+			l.Release()
+			return ErrLockerLocked
+		}
 		return nil
+	case <-l.done:
+		return ErrLockerLocked
 	case <-ctx.Done():
 		if err := ctx.Err(); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
@@ -70,15 +92,20 @@ func (l *Locker) Release() {
 	l.mu.Unlock()
 }
 
-// Destroy cleans up the power locker by closing the channel.
+// Destroy releases the power locker and stops it from being acquired again.
+// Anything waiting in TryAcquire returns ErrLockerLocked. It is safe to call
+// Destroy more than once, and to call it while other goroutines are acquiring
+// or releasing the lock.
 func (l *Locker) Destroy() {
 	l.mu.Lock()
-	if l.ch != nil {
-		select {
-		case <-l.ch:
-		default:
-		}
-		close(l.ch)
+	defer l.mu.Unlock()
+	if l.destroyed {
+		return
 	}
-	l.mu.Unlock()
+	l.destroyed = true
+	select {
+	case <-l.ch:
+	default:
+	}
+	close(l.done)
 }

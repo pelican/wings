@@ -128,20 +128,58 @@ func TestPower(t *testing.T) {
 		})
 
 		g.Describe("PowerLocker#Destroy", func() {
-			g.It("should unlock and close the channel", func() {
+			g.It("should unlock and refuse to be acquired again", func() {
 				l.Acquire()
 				g.Assert(l.IsLocked()).IsTrue()
 				l.Destroy()
 				g.Assert(l.IsLocked()).IsFalse()
 
-				defer func() {
-					r := recover()
+				err := l.Acquire()
+				g.Assert(errors.Is(err, ErrLockerLocked)).IsTrue()
+				g.Assert(l.IsLocked()).IsFalse()
 
-					g.Assert(r).IsNotNil()
-					g.Assert(r.(error).Error()).Equal("send on closed channel")
-				}()
+				err = l.TryAcquire(context.Background())
+				g.Assert(errors.Is(err, ErrLockerLocked)).IsTrue()
+				g.Assert(l.IsLocked()).IsFalse()
+			})
+
+			g.It("should not panic when acquired with a canceled context after being destroyed", func() {
+				// This is the order a server deletion runs in: the server context is
+				// canceled and then the locker is destroyed. Both select cases used to
+				// be ready, so TryAcquire panicked about half of the time.
+				for i := 0; i < 200; i++ {
+					l := NewLocker()
+					l.Acquire()
+					ctx, cancel := context.WithCancel(context.Background())
+					cancel()
+					l.Destroy()
+
+					err := l.TryAcquire(ctx)
+					g.Assert(errors.Is(err, ErrLockerLocked)).IsTrue()
+				}
+			})
+
+			g.It("should wake a waiting TryAcquire", func() {
+				g.Timeout(time.Second)
 
 				l.Acquire()
+				errs := make(chan error, 1)
+				go func() {
+					errs <- l.TryAcquire(context.Background())
+				}()
+				time.Sleep(time.Millisecond * 50)
+				l.Destroy()
+
+				err := <-errs
+				g.Assert(errors.Is(err, ErrLockerLocked)).IsTrue()
+				g.Assert(l.IsLocked()).IsFalse()
+			})
+
+			g.It("should be safe to call more than once", func() {
+				l.Destroy()
+				l.Destroy()
+				l.Release()
+				g.Assert(l.IsLocked()).IsFalse()
 			})
 		})
 	})
