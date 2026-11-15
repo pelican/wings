@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"os/user"
 	"path/filepath"
@@ -25,6 +26,16 @@ type ProcessUser struct {
 	// Switch is set when Wings, running as root, starts the process as this
 	// other user.
 	Switch bool
+}
+
+// IDs returns the uid and gid for syscall credentials, refusing values that
+// don't fit a uint32 (a negative or oversized id in config.yml would otherwise
+// wrap to some other user).
+func (u ProcessUser) IDs() (uid, gid uint32, err error) {
+	if u.Uid < 0 || int64(u.Uid) > math.MaxUint32 || u.Gid < 0 || int64(u.Gid) > math.MaxUint32 {
+		return 0, 0, fmt.Errorf("plugin: user %s has an out-of-range uid %d or gid %d", u.Name, u.Uid, u.Gid)
+	}
+	return uint32(u.Uid), uint32(u.Gid), nil
 }
 
 // ExternalProcessUser returns the user external plugins run as:
@@ -204,19 +215,36 @@ func CheckReadOnlyTo(dir string, u ProcessUser) error {
 		}
 		return nil
 	}
-	for p := filepath.Dir(dir); ; p = filepath.Dir(p) {
-		info, err := os.Stat(p)
-		if err != nil {
-			return err
-		}
-		if err := check(p, info, true); err != nil {
-			return err
-		}
-		if p == filepath.Dir(p) {
-			break
+	// The ancestors of both the path as given and the real path: a symlink
+	// in the path leads to directories its lexical parents don't cover, and
+	// replacing the symlink itself needs write access to its lexical parent.
+	real, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return err
+	}
+	ancestors := func(from string) error {
+		for p := filepath.Dir(from); ; p = filepath.Dir(p) {
+			info, err := os.Stat(p)
+			if err != nil {
+				return err
+			}
+			if err := check(p, info, true); err != nil {
+				return err
+			}
+			if p == filepath.Dir(p) {
+				return nil
+			}
 		}
 	}
-	return filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
+	if err := ancestors(dir); err != nil {
+		return err
+	}
+	if real != dir {
+		if err := ancestors(real); err != nil {
+			return err
+		}
+	}
+	return filepath.WalkDir(real, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
 			return err
 		}
