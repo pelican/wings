@@ -20,6 +20,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/pelican/wings/config"
+	"github.com/pelican/wings/environment"
 	"github.com/pelican/wings/router/middleware"
 	"github.com/pelican/wings/router/tokens"
 	"github.com/pelican/wings/server"
@@ -120,14 +121,27 @@ func postTransfers(c *gin.Context) {
 	// can be used until they expire, and a repeated request would otherwise extract
 	// over the live server and, if it failed, delete it. Refusing an existing data
 	// directory also means that a failed transfer only removes what it created.
-	if _, exists := manager.Get(id); exists {
+	//
+	// A manager configured with WithTransfersIntoExistingServers fills a server it
+	// already has instead, as long as that server is offline and not installing.
+	// The server and its data directory existed before the transfer, so a failed
+	// transfer leaves both in place.
+	existing, exists := manager.Get(id)
+	intoExisting := exists && manager.TransfersIntoExistingServers()
+	if exists && !intoExisting {
 		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
 			"error": "This server already exists on this node.",
 		})
 		return
 	}
+	if intoExisting && (existing.IsInstalling() || existing.Environment == nil || existing.Environment.State() != environment.ProcessOfflineState) {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "This server must be offline and not installing to receive a transfer.",
+		})
+		return
+	}
 	dataDir := filepath.Join(config.Get().System.Data, id)
-	if !pooled {
+	if !pooled && !intoExisting {
 		if _, err := os.Lstat(dataDir); err == nil {
 			log.WithField("server", id).WithField("path", dataDir).
 				Warn("refusing incoming transfer: files for this server already exist on this node")
@@ -147,29 +161,33 @@ func postTransfers(c *gin.Context) {
 	ctx, cancel := context.WithCancel(trnsfr.Context())
 	defer cancel()
 
-	i, err := installer.New(ctx, manager, installer.ServerDetails{
-		UUID:              id,
-		StartOnCompletion: false,
-	})
-	if err != nil {
-		trnsfr.Log().WithError(err).Error("failed to initialize transfer; no server instance created")
-		// Initializing the server can fail after its data directory and quota were
-		// created. Neither existed before (see above), so remove them again.
-		if _, statErr := os.Lstat(dataDir); !pooled && statErr == nil {
-			if !removeFailedTransferFiles(trnsfr.Log(), id, dataDir, false, nil, "") {
-				keepClaim = true
-				trnsfr.Log().Error("could not remove the files of a failed transfer; new transfers of this server are refused until Wings is restarted")
+	if intoExisting {
+		trnsfr.Server = existing
+	} else {
+		i, err := installer.New(ctx, manager, installer.ServerDetails{
+			UUID:              id,
+			StartOnCompletion: false,
+		})
+		if err != nil {
+			trnsfr.Log().WithError(err).Error("failed to initialize transfer; no server instance created")
+			// Initializing the server can fail after its data directory and quota were
+			// created. Neither existed before (see above), so remove them again.
+			if _, statErr := os.Lstat(dataDir); !pooled && statErr == nil {
+				if !removeFailedTransferFiles(trnsfr.Log(), id, dataDir, false, nil, "") {
+					keepClaim = true
+					trnsfr.Log().Error("could not remove the files of a failed transfer; new transfers of this server are refused until Wings is restarted")
+				}
 			}
+			middleware.CaptureAndAbort(c, err)
+			return
 		}
-		middleware.CaptureAndAbort(c, err)
-		return
+		manager.Add(i.Server())
+		trnsfr.Server = i.Server()
 	}
 
-	i.Server().SetTransferring(true)
-	manager.Add(i.Server())
+	trnsfr.Server.SetTransferring(true)
 
 	// We add the transfer to the list of transfers once we have a server instance to use.
-	trnsfr.Server = i.Server()
 	transfer.Incoming().Add(trnsfr)
 
 	// Any errors past this point (until the transfer is complete) will abort
@@ -194,7 +212,13 @@ func postTransfers(c *gin.Context) {
 		// Remove the transfer from the list of incoming transfers.
 		transfer.Incoming().Remove(trnsfr)
 
-		if !successful {
+		if !successful && intoExisting {
+			trnsfr.Server.Events().Publish(server.TransferStatusEvent, "failure")
+			// The server and its files were here before the transfer: keep them, and
+			// remove only the backups the transfer received.
+			removeReceivedBackups(trnsfr.Log(), id, receivedBackups)
+			trnsfr.Server.SetTransferring(false)
+		} else if !successful {
 			trnsfr.Server.Events().Publish(server.TransferStatusEvent, "failure")
 			// Only this request's instance can have this ID, see the checks above.
 			manager.Remove(func(match *server.Server) bool {
@@ -607,15 +631,7 @@ func removeFailedTransferFiles(l *log.Entry, id, dataDir string, pooled bool, re
 		}
 	}
 
-	for _, p := range receivedBackups {
-		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-			l.WithField("backup", filepath.Base(p)).WithError(err).Warn("failed to delete a backup received by a failed transfer")
-		}
-	}
-	// Only removed when empty, so backups this node already had are kept.
-	if cfg.System.BackupDirectory != "" {
-		_ = os.Remove(filepath.Join(cfg.System.BackupDirectory, id))
-	}
+	removeReceivedBackups(l, id, receivedBackups)
 
 	if installLogPath != "" {
 		if err := os.Remove(installLogPath); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -630,4 +646,19 @@ func removeFailedTransferFiles(l *log.Entry, id, dataDir string, pooled bool, re
 
 	l.WithField("pooled", pooled).Info("removed the partial copy of a failed incoming transfer")
 	return ok
+}
+
+// removeReceivedBackups deletes the backup files a failed incoming transfer of the
+// server with the given ID created, and its backup directory if that is now empty.
+// Backups this node already had are kept.
+func removeReceivedBackups(l *log.Entry, id string, receivedBackups []string) {
+	for _, p := range receivedBackups {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			l.WithField("backup", filepath.Base(p)).WithError(err).Warn("failed to delete a backup received by a failed transfer")
+		}
+	}
+	// Only removed when empty, so backups this node already had are kept.
+	if dir := config.Get().System.BackupDirectory; dir != "" {
+		_ = os.Remove(filepath.Join(dir, id))
+	}
 }

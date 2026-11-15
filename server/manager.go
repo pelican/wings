@@ -31,6 +31,9 @@ type Manager struct {
 	// installer runs installation scripts for servers initialized through this
 	// manager. Defaults to the Docker based installer.
 	installer Installer
+	// transfersIntoExisting lets an incoming transfer fill a server the manager
+	// already has, see WithTransfersIntoExistingServers.
+	transfersIntoExisting bool
 }
 
 // ManagerOption configures optional behaviour of a Manager.
@@ -52,6 +55,24 @@ func WithInstaller(i Installer) ManagerOption {
 	return func(m *Manager) {
 		m.installer = i
 	}
+}
+
+// WithTransfersIntoExistingServers lets an incoming transfer fill a server the
+// manager already has, instead of refusing it. It is meant for embedders that
+// create the server before the transfer arrives, with an empty data directory.
+// The server must be offline and not installing. A failed transfer leaves that
+// server, its environment and its files in place, and removes only the backups
+// the transfer received.
+func WithTransfersIntoExistingServers() ManagerOption {
+	return func(m *Manager) {
+		m.transfersIntoExisting = true
+	}
+}
+
+// TransfersIntoExistingServers reports whether an incoming transfer may fill a
+// server the manager already has, see WithTransfersIntoExistingServers.
+func (m *Manager) TransfersIntoExistingServers() bool {
+	return m.transfersIntoExisting
 }
 
 // NewManager returns a new server manager instance. This will boot up all the
