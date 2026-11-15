@@ -315,7 +315,6 @@ func TestWatchPolicyAppliesChangesFromOtherProcesses(t *testing.T) {
 		_ = WatchPolicy(ctx, path, 20*time.Millisecond)
 	}()
 	t.Cleanup(func() { cancel(); <-done })
-	time.Sleep(60 * time.Millisecond) // let it take its first look
 
 	wait := func(what string) {
 		t.Helper()
@@ -325,6 +324,8 @@ func TestWatchPolicyAppliesChangesFromOtherProcesses(t *testing.T) {
 			t.Fatalf("the watcher did not apply %s", what)
 		}
 	}
+	wait("the reconcile at start")
+	time.Sleep(60 * time.Millisecond) // let it take its first look
 
 	// Another process (here: the same code the CLI runs) disables a plugin.
 	other, err := config.NewAtPath(path)

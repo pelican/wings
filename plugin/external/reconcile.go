@@ -1,6 +1,8 @@
 package external
 
 import (
+	"errors"
+	"fmt"
 	"slices"
 	"sync"
 
@@ -15,6 +17,34 @@ type loaded struct {
 	listener plugin.EventListener
 	approval string   // the trust store fingerprint it was loaded under
 	grants   []string // the host methods it was given
+	dir      string   // the plugin directory it runs in
+}
+
+// stillValid reports whether l may keep running as it is, judged without the
+// plugins directory's listing: it is enabled, its files on disk still match
+// the approval it was loaded under, and its host grants are the ones it was
+// given.
+func (l *loaded) stillValid(trust *plugin.TrustStore) bool {
+	m := l.client.manifest
+	return plugin.Enabled(m.Name) && trust != nil && trust.Approved[m.Name] == l.approval &&
+		trust.IsTrusted(m) && slices.Equal(plugin.GrantsFor(m), l.grants)
+}
+
+// verifyApproval returns the check a client runs before it starts the plugin
+// process: the files on disk must still be the ones approved as approval. The
+// watcher stops a changed plugin within a poll or two; this keeps it from
+// being started (or restarted after a crash) in between.
+func verifyApproval(m plugin.Manifest, approval string) func() error {
+	return func() error {
+		ts, err := plugin.LoadTrustStore()
+		if err != nil {
+			return fmt.Errorf("reading the trust store: %w", err)
+		}
+		if ts.Approved[m.Name] != approval || !ts.IsTrusted(m) {
+			return errors.New("its files or approval changed since it was loaded; run `wings plugins trust " + m.Name + "` to approve them")
+		}
+		return nil
+	}
 }
 
 var (
@@ -32,8 +62,8 @@ var (
 //   - A registered plugin whose approval fingerprint and host grants are
 //     unchanged is left alone: its process keeps running.
 //   - A registered plugin that was approved again with a different
-//     fingerprint (it was updated and re-trusted), or whose grants in
-//     plugins.grants changed, is replaced: the old process is stopped and the
+//     fingerprint (it was updated and re-trusted), whose grants in
+//     plugins.grants changed, or whose directory moved, is replaced: the old process is stopped and the
 //     new version starts on first use. The grants are fixed when the process's
 //     host handler is built, so a narrower grant must not wait for a restart.
 //   - A registered plugin that is now disabled, untrusted, no longer approved
@@ -43,9 +73,11 @@ var (
 //     process could still call the host API over its connection, so it is
 //     not left running.
 //
-// If the plugins directory can't be read, a registered plugin is kept only
-// while it is still enabled and its approval in the trust store is the one it
-// was loaded under; nothing new is registered. If the trust store can't be
+// If the plugins directory can't be listed, a registered plugin is kept only
+// while it is still enabled, its approval in the trust store is the one it
+// was loaded under, its files still match that approval, and its grants are
+// unchanged; anything that can't be checked stops it. Nothing new is
+// registered. If the trust store can't be
 // read, every external plugin is treated as untrusted, as at startup.
 func Reconcile(dir string, api plugin.HostAPI) error {
 	reconcileMu.Lock()
@@ -85,12 +117,13 @@ func Reconcile(dir string, api plugin.HostAPI) error {
 		approval := trust.Approved[m.Name]
 		grants := plugin.GrantsFor(m)
 		cur := running[m.Name]
-		if cur != nil && cur.approval == approval && slices.Equal(cur.grants, grants) && registered(cur.listener) {
+		if cur != nil && cur.approval == approval && slices.Equal(cur.grants, grants) && cur.dir == m.Dir() && registered(cur.listener) {
 			continue
 		}
 
 		client := NewClient(m, plugin.HostHandler(api, grants))
-		next := &loaded{client: client, listener: client.EventListener(), approval: approval, grants: grants}
+		client.verify = verifyApproval(m, approval)
+		next := &loaded{client: client, listener: client.EventListener(), approval: approval, grants: grants, dir: m.Dir()}
 		// Registering under the same name replaces the old listener, so no
 		// event reaches the old process after this.
 		plugin.RegisterEventListener(next.listener)
@@ -108,8 +141,8 @@ func Reconcile(dir string, api plugin.HostAPI) error {
 		if keep[name] {
 			continue
 		}
-		if err != nil && plugin.Enabled(name) && trust != nil && trust.Approved[name] == cur.approval {
-			continue // directory unreadable; nothing says this one changed
+		if err != nil && cur.stillValid(trust) {
+			continue // directory unreadable, but this one is checked unchanged
 		}
 		plugin.Default().RemoveEventListener(cur.listener)
 		_ = cur.client.Close()

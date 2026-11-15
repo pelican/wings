@@ -31,6 +31,10 @@ const (
 type Client struct {
 	manifest plugin.Manifest
 	handler  jsonrpc.Handler // inbound host-callback handler; nil rejects every call
+	// verify, if set, runs before every process start; an error keeps the
+	// process from starting. Reconcile uses it to check the plugin's files
+	// still match its approval.
+	verify func() error
 
 	mu        sync.Mutex
 	conn      *jsonrpc.Conn
@@ -93,6 +97,11 @@ func (c *Client) ensureSession(ctx context.Context) (*jsonrpc.Conn, error) {
 		return nil, fmt.Errorf("plugin %q: in respawn backoff", c.manifest.Name)
 	}
 	c.lastSpawn = time.Now()
+	if c.verify != nil {
+		if err := c.verify(); err != nil {
+			return nil, fmt.Errorf("plugin %q: not starting it: %w", c.manifest.Name, err)
+		}
+	}
 
 	argv := c.manifest.Entrypoint
 	cmd := exec.Command(argv[0], argv[1:]...)
