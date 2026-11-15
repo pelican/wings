@@ -157,7 +157,7 @@ func TestProcessUserIDsRefusesOutOfRange(t *testing.T) {
 	if uid, gid, err := (ProcessUser{Name: "pelican", Uid: 988, Gid: 988}).IDs(); err != nil || uid != 988 || gid != 988 {
 		t.Fatalf("IDs = %d %d %v", uid, gid, err)
 	}
-	for _, u := range []ProcessUser{{Name: "neg", Uid: -1, Gid: 0}, {Name: "big", Uid: 0, Gid: 1 << 33}} {
+	for _, u := range []ProcessUser{{Name: "neg", Uid: -1, Gid: 0}, {Name: "big", Uid: 0, Gid: 1 << 33}, {Name: "over-int32", Uid: 1 << 31, Gid: 0}} {
 		if _, _, err := u.IDs(); err == nil {
 			t.Errorf("%s: an out-of-range id must be refused", u.Name)
 		}
