@@ -736,3 +736,81 @@ func TestPluginAPIImportUpload(t *testing.T) {
 		t.Fatalf("import with nothing: %d", rec.Code)
 	}
 }
+
+// The expiry timer normally removes a stale stage; take refuses one whose
+// time is up even if the timer has not run yet.
+func TestPluginAPIRefusesAnExpiredTokenBeforeTheTimerRuns(t *testing.T) {
+	a := newPluginAPI(t, string(plugin.PanelAccessSigned))
+	pub, priv, _ := install.GenerateKeypair()
+	a.registry(gammaArchive(t, "1.0.0"), pub, priv)
+	_, staged := a.json(http.MethodPost, "/api/plugins/gamma/install", "")
+	token := staged["approval_token"].(string)
+	pending.mu.Lock()
+	pending.entries[token].expires = time.Now().Add(-time.Second)
+	pending.mu.Unlock()
+	if rec, _ := a.json(http.MethodPost, "/api/plugins/gamma/install", `{"approve":"`+token+`"}`); rec.Code != http.StatusConflict {
+		t.Fatalf("expired token: %d %s", rec.Code, rec.Body)
+	}
+	if len(a.stagingDirs()) != 0 {
+		t.Fatalf("the expired stage was not removed: %v", a.stagingDirs())
+	}
+}
+
+func TestPluginAPIUpdateNeedsApproval(t *testing.T) {
+	a := newPluginAPI(t, string(plugin.PanelAccessSigned))
+	pub, priv, _ := install.GenerateKeypair()
+	c := config.Get()
+	c.Plugins.TrustedKeys = []string{pub}
+	config.Set(c)
+
+	var archive []byte
+	var sig string
+	var sum [32]byte
+	latest := "2.0.0"
+	var srv *httptest.Server
+	srv = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, ".tar.gz") {
+			_, _ = w.Write(archive)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(install.UpdateManifest{Version: latest, Download: srv.URL + "/delta.tar.gz", SHA256: hex.EncodeToString(sum[:]), Signature: sig})
+	}))
+	archive = tarGz(t, map[string]string{
+		"plugin.yaml": "apiVersion: v1\nname: delta\ncapability: events\nversion: 2.0.0\nentrypoint: [\"./run\"]\nupdate: " + srv.URL + "/update.json\n",
+		"run":         "#!/bin/sh\necho v2\n",
+	})
+	sig, _ = install.SignArchive(priv, bytes.NewReader(archive))
+	sum = sha256.Sum256(archive)
+	t.Cleanup(srv.Close)
+	t.Cleanup(install.UseTransport(srv.Client().Transport))
+
+	a.writePlugin("delta", "apiVersion: v1\nname: delta\ncapability: events\nversion: 1.0.0\nentrypoint: [\"./run\"]\nupdate: "+srv.URL+"/update.json\n")
+	m, _ := plugin.LoadManifest(filepath.Join(a.dir, "delta", plugin.ManifestFile))
+	if err := install.RecordTrust(m); err != nil {
+		t.Fatal(err)
+	}
+
+	rec, staged := a.json(http.MethodPost, "/api/plugins/delta/update", "")
+	if rec.Code != http.StatusAccepted || staged["replaces"] != "1.0.0" || staged["plugin"].(map[string]any)["version"] != "2.0.0" {
+		t.Fatalf("stage update: %d %s", rec.Code, rec.Body)
+	}
+	if got, _ := plugin.LoadManifest(filepath.Join(a.dir, "delta", plugin.ManifestFile)); got.Version != "1.0.0" {
+		t.Fatalf("staging replaced the installed version: %s", got.Version)
+	}
+	rec, done := a.json(http.MethodPost, "/api/plugins/delta/update", `{"approve":"`+staged["approval_token"].(string)+`"}`)
+	if rec.Code != http.StatusOK || done["status"] != "updated" {
+		t.Fatalf("approve update: %d %s", rec.Code, rec.Body)
+	}
+	m2, err := plugin.LoadManifest(filepath.Join(a.dir, "delta", plugin.ManifestFile))
+	if err != nil || m2.Version != "2.0.0" {
+		t.Fatalf("installed = %+v %v", m2, err)
+	}
+	ts, _ := plugin.LoadTrustStore()
+	if !ts.IsTrusted(m2) {
+		t.Fatal("the updated plugin is not trusted")
+	}
+	rec, body := a.json(http.MethodPost, "/api/plugins/delta/update", "")
+	if rec.Code != http.StatusOK || body["status"] != "up_to_date" {
+		t.Fatalf("update when current: %d %s", rec.Code, rec.Body)
+	}
+}
