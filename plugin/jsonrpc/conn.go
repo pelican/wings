@@ -99,9 +99,10 @@ type Conn struct {
 	closer       io.Closer
 	writeTimeout time.Duration
 
-	notes   chan message  // inbound notifications, in arrival order
-	drained chan struct{} // closed once every queued notification is handled
-	dropped atomic.Uint64
+	readDone chan struct{} // closed when the peer stops sending
+	notes    chan message  // inbound notifications, in arrival order
+	drained  chan struct{} // closed once every queued notification is handled
+	dropped  atomic.Uint64
 
 	inflight   chan struct{}  // one slot per inbound request being handled
 	requests   sync.WaitGroup // inbound requests still being handled
@@ -119,6 +120,8 @@ func NewConn(r io.Reader, w io.Writer, handler Handler, closer io.Closer) *Conn 
 		handler: handler,
 		closed:  make(chan struct{}),
 		closer:  closer,
+
+		readDone: make(chan struct{}),
 
 		writeTimeout: WriteTimeout,
 		notes:        make(chan message, NotificationQueueSize),
@@ -176,7 +179,9 @@ func (c *Conn) readLoop(r io.Reader) {
 		if err != nil {
 			// The peer stopped sending. Close only once what it already sent
 			// is done (notificationLoop): answers to its requests must still
-			// be written, so don't close the connection here.
+			// be written, so don't close the connection here. Calls still
+			// waiting can't be answered any more; readDone tells them.
+			close(c.readDone)
 			close(c.notes) // the read loop is the only sender
 			return
 		}
@@ -316,7 +321,9 @@ func (c *Conn) write(m message) error {
 }
 
 // Call issues a request and waits for the response or ctx cancellation. result
-// may be nil to discard the payload.
+// may be nil to discard the payload. It fails with ErrClosed once the peer has
+// stopped sending without answering, even while the connection is still open
+// for the replies to requests it sent earlier.
 func (c *Conn) Call(ctx context.Context, method string, params any, result any) error {
 	raw, err := marshalParams(params)
 	if err != nil {
@@ -344,17 +351,27 @@ func (c *Conn) Call(ctx context.Context, method string, params any, result any) 
 	case <-ctx.Done():
 		return ctx.Err()
 	case <-c.closed:
-		// The read loop hands a response over before it closes the
-		// connection, so a peer that answered and then hung up has its
-		// answer waiting here; don't report that call as failed.
-		select {
-		case resp := <-ch:
-			return decodeResponse(resp, result)
-		default:
-			return ErrClosed
-		}
+		return answerAfterEnd(ch, result)
+	case <-c.readDone:
+		// The peer stopped sending, so no answer can arrive after this.
+		// The connection stays open until requests already received have
+		// answered, but this call must not wait for it.
+		return answerAfterEnd(ch, result)
 	case resp := <-ch:
 		return decodeResponse(resp, result)
+	}
+}
+
+// answerAfterEnd returns the response a call got before the connection closed
+// or the peer stopped sending, or ErrClosed if none came. The read loop hands a
+// response over before either happens, so a peer that answered and then hung
+// up has its answer waiting in ch; that call is not reported as failed.
+func answerAfterEnd(ch chan message, result any) error {
+	select {
+	case resp := <-ch:
+		return decodeResponse(resp, result)
+	default:
+		return ErrClosed
 	}
 }
 

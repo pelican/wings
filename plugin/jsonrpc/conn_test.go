@@ -503,3 +503,44 @@ func TestWriteErrorClosesTheConnection(t *testing.T) {
 		t.Fatalf("a call after the write error = %v, want ErrClosed", err)
 	}
 }
+
+// TestCallFailsOnceThePeerStopsSending covers a handler that calls the peer
+// back after the peer's stream has ended: no answer can arrive any more, so
+// the call must fail instead of waiting forever and keeping the connection
+// open.
+func TestCallFailsOnceThePeerStopsSending(t *testing.T) {
+	in := `{"jsonrpc":"2.0","method":"event"}` + "\n" +
+		`{"jsonrpc":"2.0","id":1,"method":"work"}` + "\n"
+	results := make(chan error, 2)
+	var c *Conn
+	ready := make(chan struct{})
+	handler := func(ctx context.Context, method string, _ json.RawMessage) (any, error) {
+		<-ready
+		err := c.Call(ctx, "host.lookup", nil, nil)
+		results <- err
+		return nil, err
+	}
+	c = NewConn(strings.NewReader(in), io.Discard, handler, nil)
+	close(ready)
+
+	for i := 0; i < 2; i++ {
+		select {
+		case err := <-results:
+			if !errors.Is(err, ErrClosed) {
+				t.Fatalf("Call = %v, want ErrClosed", err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("a Call made after the peer stopped sending is still waiting")
+		}
+	}
+	select {
+	case <-c.Drained():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the connection never finished after the peer stopped sending")
+	}
+	select {
+	case <-c.Done():
+	default:
+		t.Fatal("Drained fired but the connection is not closed")
+	}
+}
