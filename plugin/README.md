@@ -48,7 +48,7 @@ modular monolith). Each has one job and a short list of what it may import.
 | `plugin/external` | spawns and supervises external plugin processes | `config`, `plugin`, `jsonrpc` |
 | `plugin/builtin` | blank-imports native plugins so they register | the native plugins |
 | `cmd/pluginhost*.go` | the concrete `HostAPI` (server/fs/events methods); the only place plugin code meets `server` | |
-| `cmd/plugins.go` | the `wings plugins list/get/enable/disable/doctor/add/update/trust` CLI | |
+| `cmd/plugins.go` | the `wings plugins list/get/enable/disable/doctor/add/update/trust/panel-access` CLI | |
 
 `plugin/boundaries_test.go` enforces the last column (with `config`'s own
 dependency, `system`): it fails if, say, `plugin/sdk` starts importing
@@ -143,11 +143,30 @@ plugins:
   autoload: true                        # discovered plugins run unless disabled
   disabled: []                          # exceptions
   grants: {}                            # per-plugin host-capability overrides
+  panel_access: view                    # what the Panel may do; see "Panel access"
 ```
 
 The `plugins:` block is read only from the file: a configuration push from the
 Panel (`POST /api/update`) keeps the node's existing plugin policy, because the
 plugins directory also holds the operator's trust approvals.
+
+Changes apply without a restart. A running Wings checks the config file, the
+plugins directory and the trust store (`<plugins directory>/.trust.json`) every
+5 seconds. When one changed it applies the plugins block from the file and
+reconciles external plugins (`external.Reconcile`):
+
+- an enabled, trusted plugin that is not loaded is loaded; its process starts
+  on its first event;
+- a loaded plugin that is disabled, untrusted, removed, or whose files changed
+  without a new approval is unloaded and its process stopped (a disabled
+  plugin gets no events, but a live process could still call the host API);
+- a loaded plugin approved again with a new fingerprint (`wings plugins
+  update`), or whose `grants` changed, is replaced by a new process;
+- anything else keeps running as it is.
+
+Native event listeners and scheduled tasks check the enable state each time
+they run. Native HTTP routes are still mounted once at startup: enabling or
+disabling a plugin with routes needs a restart for its routes.
 
 Per-plugin settings and state live in the plugin's data directory,
 `<plugins directory>/.data/<name>/`, passed to the plugin as `WINGS_PLUGIN_DATA`
@@ -171,6 +190,42 @@ requires: { hostAPI: ["server.logs"] }   # host capabilities it asks for
 
 Discovery reads manifests **without executing them** — every trust decision
 (run it? what may it access?) happens before the process is spawned.
+
+## Panel access
+
+The Panel can manage plugins too, through the same code and locks as the CLI.
+How far it may go is the node operator's decision, set per node:
+
+| level | the Panel may | |
+|-------|---------------|-|
+| `off` | nothing; every plugin request from the Panel is refused | |
+| `view` | list plugins, show one and read its files; enable, disable and change settings of plugins this node already trusts | **default** |
+| `signed` | also install, update and uninstall plugins from the registries in `plugins.registries`, when the archive is signed by a key in `plugins.trusted_keys` | |
+| `full` | also install or update from any URL or an uploaded archive, signed or not | Panel admins can run code on this node |
+
+No level covers changing the level itself, `trusted_keys`, `registries` or
+`grants`: there is no Panel action for them (`PanelAction` in `access.go`).
+
+Ways to set it, for one node or many:
+
+```
+wings plugins panel-access               # show the level in effect and where it comes from
+wings plugins panel-access signed        # write plugins.panel_access to config.yml
+wings configure --plugin-access signed ...   # set it while auto-deploying a node
+WINGS_PLUGIN_PANEL_ACCESS=signed         # in Wings' environment (systemd unit, container)
+```
+
+The environment variable wins over the file. An unknown value in either is
+logged and treated as `off`, so a typo never grants more than intended.
+`wings configure` without the flag keeps the value already in the file (`view`
+on a new node). A running Wings applies a change to the file within a few
+seconds.
+
+Why only the operator: external plugins run on the node as the Wings user,
+usually root, with the host access their manifest asks for. Letting the Panel
+put new code there hands everyone with Panel admin rights a shell on the node.
+Like `allowed_mounts`, it is set where the node is run, and a configuration
+push from the Panel never changes it.
 
 ## HostAPI — what a plugin can ask Wings to do
 
@@ -202,7 +257,11 @@ wings plugins disable X        # persist to config.yml
 wings plugins update X         # check + install a newer version (--check to only check)
 wings plugins trust X          # review and approve an installed external plugin
 wings plugins untrust X        # revoke approval so the plugin will not load
+wings plugins panel-access     # show or set how much the Panel may do
 ```
+
+A running Wings picks these changes up within a few seconds; see
+[Configuration](#configuration).
 
 ## Updating external plugins
 
@@ -225,7 +284,8 @@ downloads the archive, **verifies the sha256 and signature policy**, extracts it
 are refused) into a staging dir next to the plugin, asks the
 operator to approve the staged manifest, then atomically swaps it in. The old
 version waits in a hidden `.wings-backup-*` directory until the approval is
-saved, and is put back if anything fails. Restart Wings to load the new version.
+saved, and is put back if anything fails. A running Wings stops the old
+version and loads the new one within a few seconds.
 
 ## Installing from a registry
 
