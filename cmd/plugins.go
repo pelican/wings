@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"text/tabwriter"
 
@@ -217,55 +216,16 @@ func newPluginsUntrustCommand() *cobra.Command {
 }
 
 // errNotApproved means the operator declined the plugin at the prompt.
-var errNotApproved = errors.New("not approved")
+var errNotApproved = install.ErrNotApproved
 
-// installStaged takes a staged add or update the rest of the way: it shows the
-// staged manifest for approval, moves the plugin into place and records the
-// approval. check, if set, vets the staged manifest first. The staging
-// directory is removed on every return. Once the plugin is in place, a failure
-// to record the approval rolls it back: a plugin left installed without one
-// would never load, and for an update the old version would be gone.
+// installStaged takes a staged add or update the rest of the way with
+// install.Install, asking the operator to approve the staged manifest (or not,
+// with assumeYes). check, if set, vets the staged manifest first. The Panel API
+// uses the same install.Install with an approval token instead of the prompt.
 func installStaged(stage *install.StagedInstall, check func(plugin.Manifest) error, assumeYes bool) (plugin.Manifest, error) {
-	defer stage.Cleanup()
-	m, err := stage.Manifest()
-	if err != nil {
-		return m, fmt.Errorf("could not read the staged manifest: %w", err)
-	}
-	if check != nil {
-		if err := check(m); err != nil {
-			return m, err
-		}
-	}
-	ok, err := reviewPlugin(m, assumeYes)
-	if err != nil {
-		return m, err
-	}
-	if !ok {
-		return m, errNotApproved
-	}
-	if err := stage.Commit(); err != nil {
-		return m, err
-	}
-	m, err = plugin.LoadManifest(filepath.Join(stage.DestDir, plugin.ManifestFile))
-	if err != nil {
-		return m, rollBack(stage, fmt.Errorf("could not read the installed manifest for trust approval: %w", err))
-	}
-	if err := recordPluginTrust(m); err != nil {
-		return m, rollBack(stage, fmt.Errorf("recording trust: %w", err))
-	}
-	if err := stage.Finish(); err != nil {
-		fmt.Fprintf(os.Stderr, "warning: could not remove the previous version's backup: %v\n", err)
-	}
-	return m, nil
-}
-
-// rollBack undoes a committed install after err, and says in the returned
-// error whether that worked, since the plugins directory otherwise needs a look.
-func rollBack(stage *install.StagedInstall, err error) error {
-	if rbErr := stage.Rollback(); rbErr != nil {
-		return fmt.Errorf("%w; could not restore the previous state: %v", err, rbErr)
-	}
-	return fmt.Errorf("%w; the previous state was restored", err)
+	return install.Install(stage, check, func(m plugin.Manifest) (bool, error) {
+		return reviewPlugin(m, assumeYes)
+	})
 }
 
 // reviewPlugin prints the plugin's details + requested host access and asks the
@@ -284,18 +244,7 @@ func approvePlugin(m plugin.Manifest, assumeYes bool) (bool, error) {
 	if err != nil || !ok {
 		return ok, err
 	}
-	return true, recordPluginTrust(m)
-}
-
-func recordPluginTrust(m plugin.Manifest) error {
-	ts, err := plugin.LoadTrustStore()
-	if err != nil {
-		return fmt.Errorf("trust store error: %w", err)
-	}
-	if err := ts.Approve(m); err != nil {
-		return err
-	}
-	return nil
+	return true, install.RecordTrust(m)
 }
 
 func printTrustPrompt(m plugin.Manifest) {
@@ -473,24 +422,10 @@ func newPluginsGetCommand() *cobra.Command {
 	}
 }
 
-// togglePlugin updates plugin policy so name ends up enabled or disabled.
-//
-// Enabling removes it from the blocklist and, when the allowlist is in force
-// (non-empty, or autoload is off so only listed plugins run), adds it there.
-// Disabling only adds it to the blocklist, which always wins; it leaves the
-// allowlist alone, because removing the last entry would empty the allowlist
-// and, with autoload on, turn every other plugin on.
+// togglePlugin updates plugin policy so name ends up enabled or disabled; see
+// install.Toggle, which the Panel API uses too.
 func togglePlugin(p *config.PluginConfiguration, name string, enable bool) {
-	if enable {
-		p.Disabled = removeString(p.Disabled, name)
-		if (!p.Autoload || len(p.Enabled) > 0) && !containsString(p.Enabled, name) {
-			p.Enabled = append(p.Enabled, name)
-		}
-		return
-	}
-	if !containsString(p.Disabled, name) {
-		p.Disabled = append(p.Disabled, name)
-	}
+	install.Toggle(p, name, enable)
 }
 
 // newPluginsToggleCommand builds the shared enable/disable command.
@@ -588,23 +523,4 @@ func listColumn(values []string) string {
 		return "—"
 	}
 	return strings.Join(values, ",")
-}
-
-func containsString(s []string, v string) bool {
-	for _, x := range s {
-		if x == v {
-			return true
-		}
-	}
-	return false
-}
-
-func removeString(s []string, v string) []string {
-	out := s[:0:0]
-	for _, x := range s {
-		if x != v {
-			out = append(out, x)
-		}
-	}
-	return out
 }
