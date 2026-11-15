@@ -441,6 +441,13 @@ type PluginConfiguration struct {
 	// TrustedKeys are the base64 Ed25519 public keys (optionally "id:key")
 	// permitted to sign plugin archives.
 	TrustedKeys []string `json:"trusted_keys" yaml:"trusted_keys"`
+	// PanelAccess is how much the Panel may do with plugins on this node:
+	// "off", "view" (see them, enable, disable and configure plugins the node
+	// already trusts), "signed" (also install and update plugins signed by a
+	// trusted key) or "full" (also install anything, which lets Panel admins
+	// run code on this node). Like the rest of this block, a Panel config push
+	// can't change it. WINGS_PLUGIN_PANEL_ACCESS overrides it.
+	PanelAccess string `default:"view" json:"panel_access" yaml:"panel_access"`
 }
 
 // PluginRegistry describes a plugin registry index and optional auth for private
