@@ -19,7 +19,8 @@ over its **stdio**: it reads requests from `stdin` and writes responses to
 ## Lifecycle
 
 1. Wings spawns the plugin with the working directory set to the plugin's own
-   directory and the environment variable `WINGS_PLUGIN=1`.
+   directory and the environment variables `WINGS_PLUGIN=1` and
+   `WINGS_PLUGIN_DATA` (the plugin's data directory, see Configuration).
 2. Wings sends an `initialize` request. The plugin must respond before it will
    receive any capability calls.
 3. Wings delivers capability traffic (e.g. `event` notifications) as needed.
@@ -34,11 +35,15 @@ the manifest, without executing the plugin.
 
 Config splits by ownership:
 
-- **Per-plugin settings** live **inside the plugin's own directory** (e.g.
-  `config.yaml` next to the manifest). Wings launches the plugin with its
-  working directory set to that directory, so the plugin reads its own config
-  itself. **Wings never parses per-plugin config** — a plugin may use any
-  format it likes. This keeps a dropped-in plugin self-contained.
+- **Per-plugin settings and state** live in the plugin's **data directory**,
+  `<plugins directory>/.data/<name>/`, whose path Wings passes as
+  `WINGS_PLUGIN_DATA` (created with mode 0700 before the first start). Put a
+  `config.yaml`, a cache or a database there. **Wings never parses per-plugin
+  config** — a plugin may use any format it likes.
+- **Don't write to the plugin's own directory.** It holds the code the
+  operator approved: `wings plugins update` replaces it, and the approval
+  covers its contents, so a file changed there is deleted by the next update
+  and makes the plugin unapproved until `wings plugins trust` is run again.
 - **Host policy** (whether a plugin is enabled/disabled and which host
   capabilities it is granted) is **not** in the plugin directory — it lives in
   Wings' `config.yml` under `plugins:` (`autoload`, `disabled`, `grants`). A

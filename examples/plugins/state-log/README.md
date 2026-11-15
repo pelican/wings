@@ -59,7 +59,9 @@ wings plugins trust state-log   # review and approve before Wings can load it
 ```
 
 Wings launches the entrypoint lazily on the first matching event, with
-`WINGS_PLUGIN=1` set and the working directory set to this folder.
+`WINGS_PLUGIN=1` set, the working directory set to this folder, and
+`WINGS_PLUGIN_DATA` pointing at its data directory for any settings or state
+(this example keeps none).
 
 ## Manual smoke test
 

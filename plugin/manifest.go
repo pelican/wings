@@ -61,6 +61,23 @@ type Requires struct {
 // Dir returns the directory the manifest was loaded from.
 func (m Manifest) Dir() string { return m.dir }
 
+// DataDirName is the hidden directory in the plugins directory that holds each
+// plugin's own settings and state, one sub directory per plugin name.
+const DataDirName = ".data"
+
+// DataDir is where this plugin keeps its settings and state:
+// <plugins directory>/.data/<name>. It is outside the plugin's own directory
+// on purpose: updates replace that directory and the trust approval hashes it,
+// so settings kept there would be deleted by an update and would invalidate the
+// approval whenever they were edited. Empty when the manifest was not loaded
+// from disk.
+func (m Manifest) DataDir() string {
+	if m.dir == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(m.dir), DataDirName, m.Name)
+}
+
 // EffectiveEvents returns the event scope an events plugin registers for. An
 // empty list preserves the historical default of receiving all events.
 func EffectiveEvents(m Manifest) []string {

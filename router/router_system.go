@@ -246,8 +246,15 @@ func postUpdateConfiguration(c *gin.Context) {
 	// Plugin policy belongs to the node operator and is only read from the
 	// config file. A push must not change it: the plugins directory also holds
 	// the operator's trust approvals, so pointing it somewhere a server user can
-	// write would let them get a plugin run by Wings.
-	cfg.Plugins = config.Get().Plugins
+	// write would let them get a plugin run by Wings. Take it from the file as
+	// it is now, not from memory: `wings plugins enable/disable/trust` edit the
+	// file from another process, and writing the startup copy back would undo
+	// those changes.
+	plugins, err := config.PluginsOnDisk(config.Get())
+	if err != nil {
+		log.WithField("error", err).Warn("could not re-read the plugins block from the config file; keeping the one in memory")
+	}
+	cfg.Plugins = plugins
 
 	// Keep the SSL certificates the same since the Panel will send through Lets Encrypt
 	// default locations. However, if we picked a different location manually we don't

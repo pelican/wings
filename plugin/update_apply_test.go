@@ -372,3 +372,21 @@ func TestExtractArchiveRefusesARegularFileNamedDot(t *testing.T) {
 		t.Fatalf("a \"./\" root directory entry is normal and must still work: %v", err)
 	}
 }
+
+func TestUpdateLeavesThePluginDataDirectoryAlone(t *testing.T) {
+	dir := t.TempDir()
+	pluginDir(t, filepath.Join(dir, "foo"), "foo v1")
+	pluginDir(t, filepath.Join(dir, DataDirName, "foo"), "operator settings")
+	pluginDir(t, filepath.Join(dir, ".wings-install-1"), "foo v2")
+
+	stage := &StagedInstall{DestDir: filepath.Join(dir, "foo"), StagingDir: filepath.Join(dir, ".wings-install-1")}
+	if err := stage.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := stage.Finish(); err != nil {
+		t.Fatal(err)
+	}
+	if got := readID(t, filepath.Join(dir, DataDirName, "foo")); got != "operator settings" {
+		t.Fatalf("the update touched the data directory: %q", got)
+	}
+}

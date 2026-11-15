@@ -141,8 +141,10 @@ The `plugins:` block is read only from the file: a configuration push from the
 Panel (`POST /api/update`) keeps the node's existing plugin policy, because the
 plugins directory also holds the operator's trust approvals.
 
-Per-plugin settings live **inside the plugin's own directory** (Wings never
-parses them). See `sdk/SPEC.md`.
+Per-plugin settings and state live in the plugin's data directory,
+`<plugins directory>/.data/<name>/`, passed to the plugin as `WINGS_PLUGIN_DATA`
+(Wings never parses them). Updates leave it alone and it is not part of the
+trust approval, unlike the plugin's own directory. See `sdk/SPEC.md`.
 
 External plugins describe themselves in `plugin.yaml`:
 

@@ -578,6 +578,29 @@ func GetJwtAlgorithm() *jwt.HMACSHA {
 // WriteToDisk writes the configuration to the disk. This is a thread safe operation
 // and will only allow one write at a time. Additional calls while writing are
 // queued up.
+// PluginsOnDisk returns the plugins block as it is in c's configuration file
+// now. `wings plugins` commands change that file from another process while
+// the daemon runs, so the daemon's in-memory copy can be stale. Fields the
+// file does not set keep c's values.
+func PluginsOnDisk(c *Configuration) (PluginConfiguration, error) {
+	_writeLock.Lock()
+	defer _writeLock.Unlock()
+	current := struct {
+		Plugins PluginConfiguration `yaml:"plugins"`
+	}{Plugins: c.Plugins}
+	if c.path == "" {
+		return current.Plugins, errors.New("config: no configuration file path to read plugins from")
+	}
+	b, err := os.ReadFile(c.path)
+	if err != nil {
+		return current.Plugins, err
+	}
+	if err := yaml.Unmarshal(b, &current); err != nil {
+		return c.Plugins, err
+	}
+	return current.Plugins, nil
+}
+
 func WriteToDisk(c *Configuration) error {
 	_writeLock.Lock()
 	defer _writeLock.Unlock()

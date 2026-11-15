@@ -76,6 +76,12 @@ func (c *Client) ensureSession(ctx context.Context) (*jsonrpc.Conn, error) {
 	cmd := exec.Command(argv[0], argv[1:]...)
 	cmd.Dir = c.manifest.Dir()
 	cmd.Env = append(os.Environ(), "WINGS_PLUGIN=1")
+	if dir := c.manifest.DataDir(); dir != "" {
+		if err := os.MkdirAll(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("plugin %q: creating data directory: %w", c.manifest.Name, err)
+		}
+		cmd.Env = append(cmd.Env, "WINGS_PLUGIN_DATA="+dir)
+	}
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {
@@ -92,9 +98,13 @@ func (c *Client) ensureSession(ctx context.Context) (*jsonrpc.Conn, error) {
 	if err := cmd.Start(); err != nil {
 		return nil, fmt.Errorf("plugin %q: start: %w", c.manifest.Name, err)
 	}
-	go pipeStderr(c.manifest.Name, stderr)
+	stderrDone := make(chan struct{})
+	go func() {
+		pipeStderr(c.manifest.Name, stderr)
+		close(stderrDone)
+	}()
 
-	conn := jsonrpc.NewConn(stdout, stdin, c.handler, processCloser{cmd})
+	conn := jsonrpc.NewConn(stdout, stdin, c.handler, processCloser{cmd: cmd, stderrDone: stderrDone})
 
 	ictx, cancel := context.WithTimeout(ctx, initTimeout)
 	defer cancel()
@@ -128,11 +138,27 @@ func (s eventListener) Events() []string {
 }
 func (s eventListener) OnEvent(ctx context.Context, e plugin.Event) error { return s.c.emit(ctx, e) }
 
-type processCloser struct{ cmd *exec.Cmd }
+// stderrDrainTimeout bounds how long Close waits for the stderr reader after
+// killing the plugin; a child process the plugin started can keep the pipe open.
+const stderrDrainTimeout = 2 * time.Second
+
+type processCloser struct {
+	cmd        *exec.Cmd
+	stderrDone <-chan struct{}
+}
 
 func (p processCloser) Close() error {
 	if p.cmd.Process != nil {
 		_ = p.cmd.Process.Kill()
+	}
+	// Wait closes the stderr pipe, and os/exec says not to call it before all
+	// reads from the pipe have completed: whatever the plugin wrote last (often
+	// why it crashed) would be lost. Let the reader finish first.
+	if p.stderrDone != nil {
+		select {
+		case <-p.stderrDone:
+		case <-time.After(stderrDrainTimeout):
+		}
 	}
 	return p.cmd.Wait()
 }
