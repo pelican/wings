@@ -45,7 +45,7 @@ func Initialize() error {
 	if tx := db.Exec("PRAGMA journal_mode = MEMORY"); tx.Error != nil {
 		return errors.WithStack(tx.Error)
 	}
-	if err := db.AutoMigrate(&models.Activity{}); err != nil {
+	if err := db.AutoMigrate(&models.Activity{}, &models.PluginStore{}); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil

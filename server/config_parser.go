@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"emperror.dev/errors"
+	"github.com/apex/log"
 	"github.com/gammazero/workerpool"
 
 	"github.com/pelican/wings/server/filesystem"
@@ -62,8 +63,21 @@ func (s *Server) UpdateConfigurationFiles() {
 			}
 			defer file.Close()
 
-			if err := f.Parse(file); err != nil {
-				s.Log().WithField("error", err).WithField("file_name", f.FileName).Error("failed to parse and update server configuration file")
+			// A plugin may provide a parser for this format, including one
+			// that replaces a format Wings handles itself. Hooking here
+			// rather than inside the parser package is what lets the plugin
+			// be told which server the file belongs to.
+			handled, err := s.parseWithPlugin(f, filename, file)
+			if err != nil {
+				s.Log().WithFields(log.Fields{"file_name": filename, "error": err}).
+					Error("a plugin failed to parse a server configuration file")
+				return
+			}
+
+			if !handled {
+				if err := f.Parse(file); err != nil {
+					s.Log().WithField("error", err).WithField("file_name", f.FileName).Error("failed to parse and update server configuration file")
+				}
 			}
 
 			s.Log().WithField("file_name", f.FileName).Debug("finished processing server configuration file")

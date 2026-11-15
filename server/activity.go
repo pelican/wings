@@ -65,3 +65,15 @@ func (s *Server) SaveActivity(a RequestActivity, event models.Event, metadata mo
 		}
 	}()
 }
+
+// IP returns the address the request came from, or an empty string when it
+// could not be determined.
+func (ra RequestActivity) IP() string {
+	return ra.ip
+}
+
+// User returns the UUID of the user who made the request, or an empty string
+// when the request was not made on anyone's behalf.
+func (ra RequestActivity) User() string {
+	return ra.user
+}

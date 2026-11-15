@@ -45,6 +45,9 @@ type BackupInterface interface {
 	// Identifier returns the UUID of this backup as tracked by the panel
 	// instance.
 	Identifier() string
+	// Adapter returns where this backup is stored, which is what tells a
+	// local archive apart from one held by S3 or by a plugin.
+	Adapter() AdapterType
 	// ServerId returns the UUID of the server the backup is associated with
 	ServerId() string
 	// WithLogContext attaches additional context to the log output for this
@@ -96,6 +99,11 @@ func (b *Backup) SetClient(c remote.Client) {
 
 func (b *Backup) Identifier() string {
 	return b.Uuid
+}
+
+// Adapter returns the adapter this backup is stored on.
+func (b *Backup) Adapter() AdapterType {
+	return b.adapter
 }
 
 func (b *Backup) normalizedIdentifier() (string, error) {

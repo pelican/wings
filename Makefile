@@ -7,6 +7,15 @@ build:
 test:
 	go test -race ./...
 
+# Regenerate the symbol table the plugin interpreter resolves imports against.
+# Run this after changing anything in plugins/api, or interpreted plugins will
+# still be compiled against the previous contract. The symbols test fails and
+# names what is missing when this is out of date.
+plugin-symbols:
+	cd plugins && rm -f github_com-pelican-wings-plugins-api.go && \
+		go run github.com/traefik/yaegi/cmd/yaegi extract github.com/pelican/wings/plugins/api
+	gofmt -w plugins/
+
 debug:
 	go build -ldflags="-X github.com/pelican/wings/system.Version=$(GIT_HEAD)"
 	sudo ./wings --debug --ignore-certificate-errors --config config.yml --pprof --pprof-block-rate 1
@@ -26,4 +35,4 @@ cross-build: clean build build-darwin
 clean:
 	rm -rf build/wings_*
 
-.PHONY: build build-darwin cross-build clean test debug rmdebug
+.PHONY: build build-darwin cross-build clean test plugin-symbols debug rmdebug
