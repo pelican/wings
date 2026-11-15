@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 	"testing/iotest"
+	"time"
 )
 
 func writeFiles(t *testing.T, files map[string]string) string {
@@ -118,8 +119,25 @@ func TestIsTextAcrossReads(t *testing.T) {
 }
 
 func TestCachedFormFollowsChanges(t *testing.T) {
+	prev := formRacyWindow
+	formRacyWindow = 50 * time.Millisecond
+	t.Cleanup(func() { formRacyWindow = prev })
 	dir := writeFiles(t, map[string]string{"plugin.yaml": "name: x\n", "main.py": "print(1)\n"})
+
+	// Just written: not remembered yet, since a change in the same clock
+	// tick wouldn't show in the files' times.
 	before := formDetections.Load()
+	for range 2 {
+		if _, err := CachedForm(dir); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := formDetections.Load() - before; n != 2 {
+		t.Fatalf("a directory changed moments ago was read %d times in 2 calls, want 2", n)
+	}
+
+	time.Sleep(2 * formRacyWindow)
+	before = formDetections.Load()
 	for range 3 {
 		got, err := CachedForm(dir)
 		if err != nil || got.Form != FormSource {
@@ -129,6 +147,7 @@ func TestCachedFormFollowsChanges(t *testing.T) {
 	if n := formDetections.Load() - before; n != 1 {
 		t.Fatalf("files were read %d times for an unchanged directory, want once", n)
 	}
+	// Same size, same inode: only the times change.
 	if err := os.WriteFile(filepath.Join(dir, "main.py"), []byte("print(1)\x00"), 0o644); err != nil {
 		t.Fatal(err)
 	}
