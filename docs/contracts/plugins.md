@@ -1,10 +1,10 @@
 # Contract: plugins across Wings and Panel
 
-**Contract v1, 2026-11-15.** Source of truth for plugin interfaces shared by pelican/wings and pelican/panel.
-Owner: Alexandru Vlad (Scai). Sections: R (registry format, settled), L (Panel access levels, settled),
-A (Wings plugin HTTP API for the Panel, added in v2).
+**Contract v2, 2026-11-15.** Source of truth for plugin interfaces shared by pelican/wings and pelican/panel.
+Owner: Alexandru Vlad (Scai). Sections: R (registry format), L (Panel access levels), A (Wings plugin HTTP
+API for the Panel).
 
-Work against this contract, as of v1:
+Work against this contract, as of v2:
 - pelican/wings, stacked on pelican/wings PR 250: branch `scai/plugin-panel-api` (node side and HTTP API).
 - pelican/panel: plugin registries for Panel plugins (section R).
 - pelican/panel: Wings plugin management, building on pelican/panel PR 2701 (sections L and A, from v2).
@@ -67,7 +67,7 @@ a company server) or a site that generates it (the Pelican Hub, planned at
 | `plugins` | array | yes | Entries. An empty array is valid. Never `null`. |
 | `name` | string | yes | Plugin identifier. Must equal the `name` (Wings `plugin.yaml`) or `id` (Panel `plugin.json`) inside the archive; install fails otherwise. Must not be empty, start with `.`, contain `/`, `\` or `..`. |
 | `version` | string | yes | Version of the archive at `download`. Compared numerically per dot-separated part, leading `v` ignored (`1.10.0` > `1.9.2`). |
-| `target` | `"wings"` \| `"panel"` | no | Which side installs this entry. **Missing means `"wings"`** (registries written before v1). Each side ignores entries for the other side, including for bare-name lookups (R3). |
+| `target` | `"wings"` \| `"panel"` | no | Which side installs this entry. **Missing means `"wings"`** (registries written before v1). Each side ignores entries for the other side, and entries with a `target` it doesn't know, including for bare-name lookups (R3). |
 | `capability` | string | no | Wings only (`"events"` today). When present it must match the archive's manifest. |
 | `author`, `description` | string | no | Shown to the admin before install. |
 | `download` | string | yes | https URL of the archive. `.tar.gz` or `.zip`; the format is read from the content, not the name. |
@@ -124,7 +124,7 @@ wins). A Panel config push can never change it. An unknown value means `off`.
 | `off` | nothing; every plugin endpoint answers 403 | |
 | `view` | list and inspect plugins; enable, disable and change settings of plugins the node already trusts | yes |
 | `signed` | also install, update and uninstall from the node's configured registries when the archive's signature verifies against the node's trusted keys (even if the node doesn't otherwise require signatures) | |
-| `full` | also install from any URL or an uploaded archive, signed or not | |
+| `full` | also install from any URL or an uploaded archive, signed or not, unless the node itself has `require_signatures` on | |
 
 At every level the Panel cannot change the node's registries, trusted keys, signature requirement or grants.
 Ways to set it: `wings configure --plugin-access <level>` (the Panel's auto-deploy command can add this flag
@@ -132,9 +132,119 @@ for new nodes), `wings plugins panel-access <level>` on an existing node, or the
 
 ## A. Wings plugin HTTP API for the Panel
 
-Added in v2, from the Wings implementation on `scai/plugin-panel-api`.
+Implemented in Wings by `router/router_plugins.go`; `plugin/API.md` has full examples. If that document and
+this section disagree, this section wins and the document is a bug.
+
+### A1. Transport
+
+- Every endpoint is under the node's API with the node token (`Authorization: Bearer <token>`), like
+  `/api/system`. Request and response bodies are JSON (except the multipart upload in A5).
+- `{id}` is the plugin's name. Both sides must refuse an empty or invalid id (empty, starting with `.`,
+  containing `/`, `\` or `..`) before sending or acting: Wings answers 400, and the Panel must not build a
+  URL such as `/api/plugins//uninstall`.
+- Errors are `{"error": "<message>"}` plus fields named below.
+
+| Status | Meaning |
+|---|---|
+| 400 | bad id, body or query |
+| 403 | the node's access level (L) doesn't allow it; body adds `"panel_access": "<level>"`, `"required": "<level>"` |
+| 404 | no such plugin or file, **or** a Wings without this API (treat as "plugin API unavailable on this node") |
+| 409 | wrong state (enable an untrusted plugin, install an installed one), or an approval token unknown, used, expired or sent to another endpoint |
+| 413 | body or file over its cap |
+| 422 | settings that don't validate (body adds `"fields": {key: message}`); a registry, download, checksum, signature or archive that was refused |
+| 429 | 16 installs already waiting for approval on this node |
+| 501 | load order (A6) |
+
+### A2. Endpoints
+
+| Method and path | Level | Result |
+|---|---|---|
+| `GET /api/plugins` | view | `{"enabled": bool, "directory": string, "panel_access": level, "data": [Plugin], "error"?: string}` |
+| `GET /api/plugins/{id}` | view | Plugin |
+| `GET /api/plugins/{id}/source` | view | `{"files": [string], "truncated": bool}` (at most 5000) |
+| `GET /api/plugins/{id}/source?file=<path>` | view | `{"file", "size", "binary": bool, "content"?}` (at most 1 MiB; no `content` when binary) |
+| `POST /api/plugins/{id}/enable`, `/disable` | view | `{"status": "enabled"\|"disabled", "plugin": Plugin}`; enable of an untrusted or broken plugin is 409 |
+| `PUT /api/plugins/{id}/settings` | view | body = the values object; `{"status": "saved", "values": {...}}` |
+| `POST /api/plugins/{id}/install` | signed | two steps (A4); optional body `{"registry": "<namespace>"}` |
+| `POST /api/plugins/{id}/update` | signed | two steps (A4), from the plugin's own update URL; or `{"status": "up_to_date", "installed", "latest"}` |
+| `POST /api/plugins/{id}/uninstall?delete=true\|false` | signed | disables it and revokes its approval; `delete=true` also removes its directory. Its data (settings, state) is kept. `{"status": "uninstalled", "deleted": bool}` |
+| `POST /api/plugins/import` | full | two steps (A4); body `{"url", "sha256"?, "signature"?}` or multipart field `plugin` (+ optional `signature`), at most 200 MiB |
+| `POST /api/plugins/order` | view | 501 (A6) |
+
+A body of `[]` is treated as `{}`.
+
+### A3. Plugin object
+
+| Field | Type | Notes |
+|---|---|---|
+| `id`, `name` | string | the plugin's name |
+| `kind` | `"native"` \| `"external"` | |
+| `author`, `version`, `description` | string | |
+| `category`, `capability` | string | capability, or `"plugin"` for a native plugin with only routes/tasks |
+| `url`, `update_url`, `wings_version` | string | manifest `source`, `update`, `minWings`; **omitted** when empty |
+| `api_version` | number | |
+| `transport` | string | `"stdio"` for external plugins |
+| `events`, `host_access` | [string] | `host_access` = what the manifest requests; the operator may narrow it |
+| `entrypoint` | [string] | external plugins only; **omitted** for native plugins |
+| `settings` | [Setting] | the schema, A3.1; `[]` when none |
+| `meta.status` | `"enabled"` \| `"disabled"` \| `"errored"` | `errored` adds `meta.error`, `meta.status_message`; an untrusted plugin is `disabled` with a `status_message` |
+| `meta.trust` | `"native"` \| `"trusted"` \| `"untrusted"` \| `"changed"` | `changed` = approved once, files changed since |
+| `meta.values` | object | stored values; secrets as `"********"`; a missing key means its `default` applies |
+| `meta.enabled`, `meta.is_trusted` | bool | |
+| `meta.enable_reason` | string | e.g. `"autoload"`, `"allowlist"`, `"blocklist"` |
+| `meta.can_enable`, `can_disable`, `can_configure`, `can_update`, `can_uninstall` | bool | plugin state combined with the node's access level; the Panel shows actions from these |
+| `meta.load_order` | number | always 0 |
+| `meta.registered` | object | what the plugin registered (e.g. `{"hooks": [...]}`) |
+
+Every list that is present is an array, never `null`.
+
+**A3.1 Setting:** `{"key", "label"?, "description"?, "type": "string"|"number"|"boolean"|"select",
+"options"?: [{"value", "label"}], "default"?, "required": bool, "secret": bool}`. Values are sent as JSON of
+that type (a number is a JSON number, not a string). `PUT .../settings` replaces all values: a key left out or
+`null` is unset; `"********"` for a secret keeps the stored value. There is no multiline `text` type in v2.
+
+### A4. Two-step install, update and import
+
+1. First call: Wings downloads, checks and stages the archive (nothing is installed) and answers **202**:
+   `{"status": "approval_required", "action": "install"|"update"|"import", "plugin": {name, version, author,
+   description, capability, source, entrypoint, events, settings}, "host_access": [string], "replaces":
+   string|null, "signed": bool, "approval_token": string, "expires_at": RFC 3339, "approve_with": {method,
+   path, body}}`.
+2. The Panel shows the admin `plugin`, `host_access`, `replaces` and `signed`, and asks for approval.
+3. Second call to the **same** endpoint with `{"approve": "<approval_token>"}`: Wings installs, records the
+   approval in the node's trust store and loads the plugin; **200** `{"status": "installed"|"updated",
+   "plugin": Plugin}`.
+
+The token is single-use, valid 10 minutes, tied to the staged files (a change after staging refuses the
+approval) and to its endpoint and plugin. A new stage of the same plugin replaces the waiting one. Below
+`full`, the archive must be signed by a trusted key (`"signed": true`); a stage made at `full` without that
+can't be approved after the node drops to `signed` (403).
+
+### A5. Changes take effect without a restart
+
+Enable, disable, install, update and uninstall through this API (and the same changes through the `wings
+plugins` CLI) apply to the running daemon at once (API) or within about 5 seconds (CLI): events, plugin
+routes and tasks follow the enable state, and external plugin processes are started or stopped to match.
+Settings are read by the plugin from `settings.json` in its data directory when the file changes.
+
+### A6. No load order
+
+Each external plugin is its own process and every event goes to every subscribed plugin, so there is no
+order. `POST /api/plugins/order` answers 501; the Panel should not offer reordering for Wings plugins.
+
+### A7. Panel obligations
+
+- Scope by node: a Panel admin may only list or act on plugins of nodes they can access, and the Panel must
+  check the node of every client-supplied `{node}:{id}` key before calling Wings.
+- Treat 403 (level) and 404 (no API) per node as "not available on this node", not as a Panel error; show the
+  level and how to raise it (L).
+- Use the `can_*` flags and the access level to decide which actions to show.
+- New nodes: the auto-deploy `wings configure` command may add `--plugin-access <level>` from a Panel-wide
+  setting (L). The Panel never changes a node's level any other way.
 
 ## Version history
 
 - v1 (2026-11-15): sections R and L. R adds the optional `target` field; Wings must start ignoring entries
   whose `target` is `"panel"`.
+- v2 (2026-11-15): section A from the Wings implementation. R: unknown `target` values are ignored too.
+  L: `full` still respects the node's own `require_signatures`. Wings now ignores `target: "panel"` entries.
