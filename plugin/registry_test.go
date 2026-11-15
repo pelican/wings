@@ -204,3 +204,53 @@ func TestEmitReadsThePolicyOncePerEvent(t *testing.T) {
 		t.Fatalf("Emit with 40 listeners made %.0f allocations, want at most 2 (one policy read)", allocs)
 	}
 }
+
+// countingListener records events; a pointer, so it is comparable.
+type countingListener struct {
+	name string
+	got  chan Event
+}
+
+func (c *countingListener) Name() string     { return c.name }
+func (c *countingListener) Events() []string { return []string{"*"} }
+func (c *countingListener) OnEvent(_ context.Context, e Event) error {
+	c.got <- e
+	return nil
+}
+
+// TestRemoveEventListenerOnlyRemovesThatListener covers how the external
+// loader stops a plugin: it removes the listener it registered, and must not
+// remove one registered under the same name since.
+func TestRemoveEventListenerOnlyRemovesThatListener(t *testing.T) {
+	setConfig(t)
+	r := NewRegistry()
+	first := &countingListener{name: "p", got: make(chan Event, 4)}
+	second := &countingListener{name: "p", got: make(chan Event, 4)}
+
+	r.RegisterEventListener(first)
+	if l, ok := r.EventListener("p"); !ok || l != first {
+		t.Fatalf("EventListener(p) = %v, %v; want the registered listener", l, ok)
+	}
+	r.RegisterEventListener(second)
+	if r.RemoveEventListener(first) {
+		t.Fatal("removed p although the registered listener is a newer one")
+	}
+	if l, _ := r.EventListener("p"); l != second {
+		t.Fatal("the newer listener was removed")
+	}
+	if !r.RemoveEventListener(second) {
+		t.Fatal("did not remove the registered listener")
+	}
+	if _, ok := r.EventListener("p"); ok {
+		t.Fatal("p is still registered")
+	}
+	r.Emit(Event{Type: "server.state"})
+	select {
+	case e := <-second.got:
+		t.Fatalf("a removed listener got %v", e)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if r.RemoveEventListener(second) {
+		t.Fatal("removing twice reported success")
+	}
+}

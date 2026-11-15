@@ -111,3 +111,21 @@ func TestUpdatePluginsOnDiskFromSeveralProcesses(t *testing.T) {
 		t.Fatalf("%d of %d changes survived", len(got.Disabled), processes*changes)
 	}
 }
+
+func TestPluginsOnDiskReadsTheFilesBlock(t *testing.T) {
+	c := newTestConfig(t)
+	if _, err := UpdatePluginsOnDisk(c, func(p *PluginConfiguration) {
+		p.Disabled = []string{"x"}
+		p.PanelAccess = "signed"
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// c in memory still has the defaults; the file is what counts.
+	p, err := PluginsOnDisk(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(p.Disabled, []string{"x"}) || p.PanelAccess != "signed" || !p.Autoload {
+		t.Fatalf("PluginsOnDisk = %+v, want the block in the file with defaults for the rest", p)
+	}
+}

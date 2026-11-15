@@ -33,6 +33,7 @@ import (
 	"github.com/pelican/wings/internal/cron"
 	"github.com/pelican/wings/internal/database"
 	"github.com/pelican/wings/loggers/cli"
+	"github.com/pelican/wings/plugin"
 	"github.com/pelican/wings/plugin/external"
 	"github.com/pelican/wings/remote"
 	"github.com/pelican/wings/router"
@@ -218,6 +219,10 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 			log.WithField("error", err).Debug("failed to write configuration to disk")
 		}
 	}
+
+	// Apply plugin changes made while Wings runs (enable, disable, trust,
+	// install from the CLI or the Panel) without a restart.
+	startPluginPolicyReload(cmd.Context(), configPath, pluginHost{manager}, pluginPolicyPoll)
 
 	// Just for some nice log output.
 	for _, s := range manager.All() {
@@ -457,6 +462,30 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	if err := s.ListenAndServe(); err != nil {
 		log.WithField("error", err).Fatal("failed to configure HTTP server")
 	}
+}
+
+// pluginPolicyPoll is how often the daemon looks for plugin changes made by
+// other processes.
+const pluginPolicyPoll = 5 * time.Second
+
+// startPluginPolicyReload makes plugin policy changes take effect in the
+// running daemon. plugin.ApplyPolicy, called by the watcher for changes other
+// processes write to the config file or the trust store, and by anything in
+// this process that changes the policy, then reconciles the external plugins:
+// newly enabled and trusted ones are registered, disabled or untrusted ones
+// are stopped. Native event listeners, routes and tasks read the enable state
+// when they run.
+func startPluginPolicyReload(ctx context.Context, path string, api plugin.HostAPI, every time.Duration) {
+	plugin.AfterPolicyChange = func() {
+		if err := external.Reconcile(config.Get().Plugins.Directory, api); err != nil {
+			log.WithField("error", err).Warn("plugin discovery was incomplete")
+		}
+	}
+	go func() {
+		if err := external.WatchPolicy(ctx, path, every); err != nil {
+			log.WithField("error", err).Error("not watching for plugin changes; restart Wings to apply them")
+		}
+	}()
 }
 
 // Reads the configuration from the disk and then sets up the global singleton

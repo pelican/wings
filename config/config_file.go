@@ -143,3 +143,17 @@ func UpdatePluginsOnDisk(c *Configuration, change func(*PluginConfiguration)) (P
 	})
 	return out, err
 }
+
+// PluginsOnDisk returns the plugins block as it is in c's configuration file
+// now. It reads under the write locks: writers truncate the file before
+// writing it, and a read in between would see an empty block, which decodes
+// to the defaults (autoload on, nothing disabled).
+func PluginsOnDisk(c *Configuration) (PluginConfiguration, error) {
+	var out PluginConfiguration
+	err := withFileLock(c, func() error {
+		p, err := pluginsFromFile(c.path)
+		out = p
+		return err
+	})
+	return out, err
+}
