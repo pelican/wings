@@ -85,7 +85,7 @@ Errors are JSON, `{"error": "..."}`, with these statuses:
 ```json
 {
   "enabled": true,
-  "directory": "/var/lib/pelican/plugins",
+  "directory": "/var/lib/pelican-plugins",
   "panel_access": "signed",
   "data": [ { "id": "state-log", "...": "one plugin, below" } ],
   "error": "only when the plugins directory could not be read; a bad manifest is listed as its own errored entry"
