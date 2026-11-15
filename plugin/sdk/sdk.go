@@ -4,7 +4,10 @@
 // plugins can equally be written in Node, Rust, Python, or anything else.
 //
 // The package imports only the standard library, plugin/contract and
-// plugin/jsonrpc, so a plugin built with it does not pull in Wings.
+// plugin/jsonrpc, so a plugin built with it does not pull in Wings. It is part
+// of the Wings module, though, so a plugin using it needs at least the Go
+// version in Wings' go.mod: `go mod tidy` raises the plugin's own `go` line to
+// match.
 package sdk
 
 import (

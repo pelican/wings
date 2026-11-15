@@ -17,6 +17,10 @@ wings plugins trust statecount               # review and approve
 
 Restart Wings. The plugin starts on the first state change.
 
+Outside this repo, `go get github.com/pelican/wings/plugin/sdk` is the only dependency. It adds no third-party
+modules, but the SDK lives in the Wings module, so your module needs at least the Go version in Wings' `go.mod`
+(`go mod tidy` raises your `go` line to match).
+
 ## Run it by hand
 
 ```bash
