@@ -9,6 +9,8 @@ over its **stdio**: it reads requests from `stdin` and writes responses to
 
 - Each JSON-RPC message is a single JSON object.
 - Messages are newline-delimited. Write compact JSON followed by `\n`.
+- One message (one line) may be at most 16 MiB. Wings closes the connection, and
+  so stops the plugin, when a message is larger or never ends.
 - Request ids may be numbers or strings, as JSON-RPC 2.0 allows. Wings echoes a
   plugin's id back exactly as sent, and its own ids are numbers.
 - `stderr` is not part of the protocol; Wings captures it and logs each line at

@@ -7,6 +7,7 @@ package jsonrpc
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -48,6 +49,15 @@ var MaxConcurrentRequests = 64
 // ErrCodeBusy is the JSON-RPC error code for a request refused because
 // MaxConcurrentRequests were already being handled.
 const ErrCodeBusy = -32003
+
+// MaxMessageSize bounds one inbound message, i.e. one line. A peer that sends
+// more without a newline has the connection closed instead of making this side
+// buffer it all. Each connection reads it once, when it is created.
+var MaxMessageSize = 16 << 20
+
+// ErrMessageTooLarge is why the connection closed when a message exceeded
+// MaxMessageSize.
+var ErrMessageTooLarge = errors.New("jsonrpc: message exceeds the size limit; connection closed")
 
 // Handler processes an inbound request or notification from the peer. For a
 // notification (no response expected) the returned values are ignored. A nil
@@ -93,7 +103,8 @@ type Conn struct {
 	drained chan struct{} // closed once every queued notification is handled
 	dropped atomic.Uint64
 
-	inflight chan struct{} // one slot per inbound request being handled
+	inflight   chan struct{} // one slot per inbound request being handled
+	maxMessage int
 }
 
 // NewConn starts a connection reading from r and writing to w. handler may be
@@ -112,6 +123,7 @@ func NewConn(r io.Reader, w io.Writer, handler Handler, closer io.Closer) *Conn 
 		notes:        make(chan message, NotificationQueueSize),
 		drained:      make(chan struct{}),
 		inflight:     make(chan struct{}, MaxConcurrentRequests),
+		maxMessage:   MaxMessageSize,
 	}
 	go c.readLoop(r)
 	go c.notificationLoop()
@@ -140,10 +152,21 @@ func (c *Conn) notificationLoop() {
 func (c *Conn) Drained() <-chan struct{} { return c.drained }
 
 func (c *Conn) readLoop(r io.Reader) {
-	dec := json.NewDecoder(bufio.NewReader(r))
+	// Messages are one JSON value per line. Reading a line at a time with a
+	// size cap bounds what a peer can make this side buffer; a json.Decoder
+	// on the raw stream keeps growing its buffer until a value completes.
+	br := bufio.NewReaderSize(r, 64<<10)
 	for {
+		frame, err := readFrame(br, c.maxMessage)
 		var m message
-		if err := dec.Decode(&m); err != nil {
+		if err == nil {
+			frame = bytes.TrimSpace(frame)
+			if len(frame) == 0 {
+				continue
+			}
+			err = json.Unmarshal(frame, &m)
+		}
+		if err != nil {
 			close(c.notes) // the read loop is the only sender
 			c.close()
 			return
@@ -241,18 +264,26 @@ func (c *Conn) write(m message) error {
 	done := make(chan error, 1)
 	go func() {
 		c.wmu.Lock()
-		defer c.wmu.Unlock()
 		select {
 		case <-c.closed:
+			c.wmu.Unlock()
 			done <- ErrClosed
 			return
 		default:
 		}
-		if err := c.enc.Encode(m); err != nil {
-			done <- err
-			return
+		err := c.enc.Encode(m)
+		if err == nil {
+			err = c.w.Flush()
 		}
-		done <- c.w.Flush()
+		c.wmu.Unlock()
+		if err != nil {
+			// A failed write leaves the stream unusable (bufio.Writer keeps
+			// the error). Close, so Done fires, waiting calls return, and an
+			// owner such as the plugin client starts a fresh session instead
+			// of reusing this one.
+			c.close()
+		}
+		done <- err
 	}()
 	timer := time.NewTimer(c.writeTimeout)
 	defer timer.Stop()
@@ -359,4 +390,28 @@ func marshalParams(params any) (json.RawMessage, error) {
 		return raw, nil
 	}
 	return json.Marshal(params)
+}
+
+// readFrame returns the next line from br, newline included, or
+// ErrMessageTooLarge once it passes max bytes. Data after the last newline is
+// returned as a final frame at EOF.
+func readFrame(br *bufio.Reader, max int) ([]byte, error) {
+	var buf []byte
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if len(buf)+len(chunk) > max+1 { // +1 for the newline itself
+			return nil, ErrMessageTooLarge
+		}
+		buf = append(buf, chunk...)
+		switch {
+		case err == nil:
+			return buf, nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		case errors.Is(err, io.EOF) && len(bytes.TrimSpace(buf)) > 0:
+			return buf, nil
+		default:
+			return nil, err
+		}
+	}
 }

@@ -7,6 +7,7 @@ import (
 	"io"
 	"runtime"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 )
@@ -435,5 +436,70 @@ func TestRequestFloodStaysBounded(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatalf("only %d of the 4 accepted requests finished", done)
 		}
+	}
+}
+
+// TestOversizedMessageClosesTheConnection covers a peer that sends a message
+// that never ends: the read side used to keep buffering it without limit.
+func TestOversizedMessageClosesTheConnection(t *testing.T) {
+	prev := MaxMessageSize
+	MaxMessageSize = 1024
+	got := make(chan string, 1)
+	r, w := io.Pipe()
+	c := NewConn(r, io.Discard, func(_ context.Context, method string, params json.RawMessage) (any, error) {
+		got <- string(params)
+		return nil, nil
+	}, nil)
+	MaxMessageSize = prev
+	t.Cleanup(func() { _ = c.Close() })
+
+	// A message under the limit still works.
+	small := `{"jsonrpc":"2.0","method":"event","params":"` + strings.Repeat("a", 900) + `"}` + "\n"
+	if _, err := io.WriteString(w, small); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case p := <-got:
+		if len(p) != 902 {
+			t.Fatalf("params length %d", len(p))
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("a message under the limit was not delivered")
+	}
+
+	// One that never ends closes the connection instead of being buffered.
+	go func() {
+		_, _ = io.WriteString(w, `{"jsonrpc":"2.0","method":"event","params":"`+strings.Repeat("b", 64<<10))
+	}()
+	select {
+	case <-c.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("an oversized message did not close the connection")
+	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) { return 0, errors.New("broken pipe") }
+
+// TestWriteErrorClosesTheConnection covers a peer whose input is gone: the
+// connection used to stay open, so its owner kept reusing it.
+func TestWriteErrorClosesTheConnection(t *testing.T) {
+	r, _ := io.Pipe() // the peer never says anything
+	c := NewConn(r, failingWriter{}, nil, nil)
+	t.Cleanup(func() { _ = c.Close() })
+
+	if err := c.Notify("event", nil); err == nil {
+		t.Fatal("expected the write error")
+	}
+	select {
+	case <-c.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("a write error left the connection open")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := c.Call(ctx, "ping", nil, nil); !errors.Is(err, ErrClosed) {
+		t.Fatalf("a call after the write error = %v, want ErrClosed", err)
 	}
 }
