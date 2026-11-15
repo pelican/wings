@@ -62,6 +62,9 @@ type UpdateManifest struct {
 	Download  string `json:"download"`  // https URL to the plugin archive
 	SHA256    string `json:"sha256"`    // hex digest of the archive
 	Signature string `json:"signature"` // base64 Ed25519 signature over the archive sha256
+
+	// DownloadURL is the Pelican Hub's name for Download.
+	DownloadURL string `json:"download_url,omitempty"`
 }
 
 // UpdateStatus is the result of checking a plugin for updates.
@@ -100,6 +103,33 @@ func CheckUpdate(ctx context.Context, m plugin.Manifest) (UpdateStatus, error) {
 	}, nil
 }
 
+// decodeUpdateManifest reads the plain Wings format, {version, download,
+// sha256, signature}, and the one the Pelican Hub serves at
+// /plugins/{slug}/update.json: the release under a "*" key (the Hub keys
+// releases by Panel version; "*" is the one for any version), with its URL in
+// "download_url", or [] when there is no release.
+func decodeUpdateManifest(raw json.RawMessage) (UpdateManifest, error) {
+	if trimmed := strings.TrimSpace(string(raw)); trimmed == "[]" || trimmed == "{}" {
+		return UpdateManifest{}, errors.New("plugin: update manifest lists no release")
+	}
+	var um UpdateManifest
+	if err := json.Unmarshal(raw, &um); err != nil {
+		return UpdateManifest{}, fmt.Errorf("plugin: decoding update manifest: %w", err)
+	}
+	if um.Version == "" {
+		var byVersion map[string]UpdateManifest
+		if err := json.Unmarshal(raw, &byVersion); err == nil {
+			if release, ok := byVersion["*"]; ok {
+				um = release
+			}
+		}
+	}
+	if um.Download == "" {
+		um.Download = um.DownloadURL
+	}
+	return um, nil
+}
+
 func fetchUpdateManifest(ctx context.Context, rawURL string) (UpdateManifest, error) {
 	body, err := httpsGet(ctx, rawURL, maxUpdateManifestBytes, auth{})
 	if err != nil {
@@ -107,9 +137,13 @@ func fetchUpdateManifest(ctx context.Context, rawURL string) (UpdateManifest, er
 	}
 	defer body.Close()
 
-	var um UpdateManifest
-	if err := json.NewDecoder(body).Decode(&um); err != nil {
+	var raw json.RawMessage
+	if err := json.NewDecoder(body).Decode(&raw); err != nil {
 		return UpdateManifest{}, fmt.Errorf("plugin: decoding update manifest: %w", err)
+	}
+	um, err := decodeUpdateManifest(raw)
+	if err != nil {
+		return UpdateManifest{}, err
 	}
 	if um.Version == "" || um.Download == "" || um.SHA256 == "" {
 		return UpdateManifest{}, fmt.Errorf("plugin: update manifest missing version, download, or sha256")

@@ -2,9 +2,11 @@ package install
 
 import (
 	"archive/tar"
+	"archive/zip"
 	"bytes"
 	"compress/gzip"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -405,5 +407,42 @@ func TestExtractArchiveRefusesOverlongNames(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(dest); len(entries) != 0 {
 		t.Fatalf("nothing should be created for a refused entry, found %d entries", len(entries))
+	}
+}
+
+// TestExtractArchiveAcceptsZip covers registries that serve .zip releases,
+// such as the Pelican Hub. Downloads are saved as "*.archive", so the format
+// must be recognised from the content, not the name.
+func TestExtractArchiveAcceptsZip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wings-plugin-123.archive")
+	f, err := os.Create(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(f)
+	for name, body := range map[string]string{"plugin.yaml": "name: demo\n", "bin/run": "#!/bin/sh\n"} {
+		w, err := zw.Create(name)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := zw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	dest := t.TempDir()
+	if err := extractArchive(context.Background(), path, dest); err != nil {
+		t.Fatalf("extract zip: %v", err)
+	}
+	for _, name := range []string{"plugin.yaml", "bin/run"} {
+		if _, err := os.Stat(filepath.Join(dest, name)); err != nil {
+			t.Errorf("%s missing after extracting a zip: %v", name, err)
+		}
 	}
 }

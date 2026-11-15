@@ -8,6 +8,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/pelican/wings/plugin"
 )
 
 // useTestTransport points the plugin HTTP client at the httptest certificate
@@ -87,5 +89,39 @@ func TestHTTPSGetDropsCredentialsWhenRedirectLeavesHost(t *testing.T) {
 	}
 	if string(got) != "archive" {
 		t.Fatalf("body = %q", got)
+	}
+}
+
+// TestCheckUpdateReadsThePelicanHubFormat covers the update manifest the
+// Pelican Hub already serves at /plugins/{slug}/update.json: the release sits
+// under a "*" key and its URL is "download_url". With no release the Hub
+// answers [].
+func TestCheckUpdateReadsThePelicanHubFormat(t *testing.T) {
+	var body string
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, body)
+	}))
+	defer srv.Close()
+	useTestTransport(t, srv)
+	m := plugin.Manifest{Name: "demo", Version: "1.0.0", Update: srv.URL + "/plugins/demo/update.json"}
+
+	body = `{"*":{"version":"1.1.0","download_url":"https://hub.example/plugins/demo/download/7/demo-1.1.0.zip","channel":"stable","sha256":"abc"}}`
+	st, err := CheckUpdate(context.Background(), m)
+	if err != nil {
+		t.Fatalf("CheckUpdate: %v", err)
+	}
+	if !st.Available || st.Latest != "1.1.0" || st.download != "https://hub.example/plugins/demo/download/7/demo-1.1.0.zip" || st.sha256 != "abc" {
+		t.Fatalf("status = %+v (download %q, sha256 %q)", st, st.download, st.sha256)
+	}
+
+	body = `[]`
+	if _, err := CheckUpdate(context.Background(), m); err == nil || !strings.Contains(err.Error(), "no release") {
+		t.Fatalf("an empty Hub manifest should say there is no release, got %v", err)
+	}
+
+	// The plain Wings format still works.
+	body = `{"version":"1.2.0","download":"https://a.example/demo.tar.gz","sha256":"def"}`
+	if st, err := CheckUpdate(context.Background(), m); err != nil || st.Latest != "1.2.0" || st.download != "https://a.example/demo.tar.gz" {
+		t.Fatalf("plain manifest: %+v, %v", st, err)
 	}
 }
