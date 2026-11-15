@@ -22,21 +22,21 @@ import (
 
 // StageUpdate downloads, verifies, and extracts an update without replacing the
 // live plugin directory. Callers can inspect stage.Manifest before Commit.
-func StageUpdate(ctx context.Context, st UpdateStatus) (*StagedInstall, error) {
+func StageUpdate(ctx context.Context, st UpdateStatus, opts ...StageOption) (*StagedInstall, error) {
 	if st.download == "" || st.sha256 == "" || st.dir == "" {
 		return nil, errors.New("plugin: incomplete update status; run CheckUpdate first")
 	}
-	return stageArchive(ctx, st.download, st.sha256, st.signature, st.dir, auth{})
+	return stageArchive(ctx, st.download, st.sha256, st.signature, st.dir, auth{}, applyStageOptions(opts))
 }
 
-func stageArchive(ctx context.Context, download, wantSHA256, signature, destDir string, a auth) (*StagedInstall, error) {
+func stageArchive(ctx context.Context, download, wantSHA256, signature, destDir string, a auth, o stageOptions) (*StagedInstall, error) {
 	archivePath, digest, err := downloadAndVerify(ctx, download, wantSHA256, a)
 	if err != nil {
 		return nil, err
 	}
 	defer os.Remove(archivePath)
 
-	if err := enforceSignature(digest, signature); err != nil {
+	if err := enforceSignature(digest, signature, o); err != nil {
 		return nil, err
 	}
 

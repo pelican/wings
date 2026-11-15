@@ -172,7 +172,7 @@ func registries() map[string]config.PluginRegistry { return config.Get().Plugins
 
 // StageAdd downloads and extracts a registry plugin without committing it. The
 // staged manifest must match the registry entry name.
-func StageAdd(ctx context.Context, r ResolvedPlugin, pluginsDir string) (*StagedInstall, error) {
+func StageAdd(ctx context.Context, r ResolvedPlugin, pluginsDir string, opts ...StageOption) (*StagedInstall, error) {
 	e := r.Entry
 	if e.Download == "" || e.SHA256 == "" {
 		return nil, fmt.Errorf("plugin %q: registry entry is missing download or sha256", e.Name)
@@ -185,7 +185,7 @@ func StageAdd(ctx context.Context, r ResolvedPlugin, pluginsDir string) (*Staged
 		return nil, fmt.Errorf("plugin: creating plugins directory: %w", err)
 	}
 	dest := filepath.Join(pluginsDir, e.Name)
-	stage, err := stageArchive(ctx, e.Download, e.SHA256, e.Signature, dest, r.downloadAuth())
+	stage, err := stageArchive(ctx, e.Download, e.SHA256, e.Signature, dest, r.downloadAuth(), applyStageOptions(opts))
 	if err != nil {
 		return nil, err
 	}

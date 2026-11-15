@@ -13,21 +13,54 @@ import (
 	"github.com/pelican/wings/config"
 )
 
+// StageOption changes how StageAdd, StageUpdate and the import stagers treat
+// an archive.
+type StageOption func(*stageOptions)
+
+type stageOptions struct {
+	requireTrustedSignature bool
+}
+
+// RequireTrustedSignature refuses an archive that is not signed by a key in
+// plugins.trusted_keys, whatever plugins.require_signatures says. The Panel
+// API stages with it at the "signed" access level, so the Panel can only
+// bring code the operator's keys vouch for.
+func RequireTrustedSignature() StageOption {
+	return func(o *stageOptions) { o.requireTrustedSignature = true }
+}
+
+func applyStageOptions(opts []StageOption) stageOptions {
+	var o stageOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	return o
+}
+
 // enforceSignature applies the signing policy to a downloaded archive's digest:
 //   - no signature + not required  -> allowed
 //   - no signature + required      -> rejected
 //   - a signature present          -> must verify against a trusted key,
 //     regardless of the policy (a signature that does not verify means tampering)
 //
+// A signature is required when plugins.require_signatures is set or the caller
+// staged with RequireTrustedSignature.
+//
 // The archive is signed over its sha256 digest, so a tampered archive (different
 // digest) fails verification even if its sha256 matches a forged manifest.
-func enforceSignature(digest []byte, signature string) error {
+func enforceSignature(digest []byte, signature string, o stageOptions) error {
 	c := config.Get().Plugins
 	if signature == "" {
+		if o.requireTrustedSignature {
+			return errors.New("plugin: the archive must be signed by a key in plugins.trusted_keys, and it is unsigned")
+		}
 		if c.RequireSignatures {
 			return errors.New("plugin: a signature is required but the archive is unsigned")
 		}
 		return nil
+	}
+	if o.requireTrustedSignature && len(c.TrustedKeys) == 0 {
+		return errors.New("plugin: the archive must be signed by a trusted key, and plugins.trusted_keys is empty")
 	}
 	return verifySignature(digest, signature, c.TrustedKeys)
 }
