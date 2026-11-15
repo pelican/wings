@@ -177,6 +177,8 @@ func TestPluginAPIChecksTheAccessLevel(t *testing.T) {
 		{http.MethodGet, "/api/plugins", plugin.PanelAccessView},
 		{http.MethodGet, "/api/plugins/alpha", plugin.PanelAccessView},
 		{http.MethodGet, "/api/plugins/alpha/source", plugin.PanelAccessView},
+		{http.MethodGet, "/api/plugins/alpha/update-check", plugin.PanelAccessView},
+		{http.MethodGet, "/api/plugins/available", plugin.PanelAccessSigned},
 		{http.MethodPost, "/api/plugins/alpha/enable", plugin.PanelAccessView},
 		{http.MethodPost, "/api/plugins/alpha/disable", plugin.PanelAccessView},
 		{http.MethodPut, "/api/plugins/alpha/settings", plugin.PanelAccessView},
@@ -945,4 +947,119 @@ func TestPluginAPIApprovalRefusesAChangedDestination(t *testing.T) {
 			t.Fatalf("approve after the replaced plugin was removed: %d %s; want 409", rec2.Code, rec2.Body)
 		}
 	})
+}
+
+// GET /api/plugins/available lists what the configured registries offer
+// Wings (contract A2, A3.2); a registry that can't be read is reported per
+// namespace.
+func TestPluginAPIListsAvailablePlugins(t *testing.T) {
+	a := newPluginAPI(t, string(plugin.PanelAccessSigned))
+	var gotAuth string
+	hub := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		_, _ = io.WriteString(w, `{"name":"hub","plugins":[
+			{"name":"gamma","version":"1.2.0","capability":"events","author":"Pelican","description":"Log state","download":"https://x.example/g.tgz","sha256":"abc","signature":"c2ln"},
+			{"name":"alpha","version":"1.1.0","download":"https://x.example/a.tgz","sha256":"abc"},
+			{"name":"counter","version":"2.0.1","target":"panel","download":"https://x.example/c.zip","sha256":"abc"}
+		]}`)
+	}))
+	t.Cleanup(hub.Close)
+	down := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "down", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(down.Close)
+	t.Cleanup(install.UseTransport(hub.Client().Transport))
+	c := config.Get()
+	c.Plugins.Registries = map[string]config.PluginRegistry{
+		"hub":  {URL: hub.URL + "/registry.json", Token: "t0ken"},
+		"down": {URL: down.URL + "/registry.json?key=hunter2"},
+	}
+	config.Set(c)
+
+	rec, body := a.json(http.MethodGet, "/api/plugins/available", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status %d: %s", rec.Code, rec.Body)
+	}
+	if gotAuth != "Bearer t0ken" {
+		t.Fatalf("the registry's credentials were not used: %q", gotAuth)
+	}
+	if strings.Contains(rec.Body.String(), "hunter2") {
+		t.Fatalf("a registry URL's query was shown: %s", rec.Body)
+	}
+	errs, _ := body["errors"].(map[string]any)
+	if len(errs) != 1 || errs["down"] == nil || errs["down"] == "" {
+		t.Fatalf("errors = %v; want only down", body["errors"])
+	}
+	var got struct {
+		Data []json.RawMessage `json:"data"`
+	}
+	_ = json.Unmarshal(rec.Body.Bytes(), &got)
+	want := []string{
+		`{"name":"gamma","version":"1.2.0","registry":"hub","author":"Pelican","description":"Log state","capability":"events","has_signature":true,"installed":null}`,
+		`{"name":"alpha","version":"1.1.0","registry":"hub","has_signature":false,"installed":"1.0.0"}`,
+	}
+	if len(got.Data) != len(want) {
+		t.Fatalf("data = %s", rec.Body)
+	}
+	for i, w := range want {
+		if string(got.Data[i]) != w {
+			t.Errorf("data[%d] = %s\nwant      %s", i, got.Data[i], w)
+		}
+	}
+
+	// No registries: an empty list and no errors, never null.
+	c = config.Get()
+	c.Plugins.Registries = nil
+	config.Set(c)
+	if rec := a.do(http.MethodGet, "/api/plugins/available", nil, ""); rec.Code != http.StatusOK || rec.Body.String() != `{"data":[],"errors":{}}` {
+		t.Fatalf("without registries: %d %s", rec.Code, rec.Body)
+	}
+}
+
+// GET /api/plugins/{id}/update-check reads the update URL and stages nothing
+// (contract A2).
+func TestPluginAPIUpdateCheck(t *testing.T) {
+	a := newPluginAPI(t, string(plugin.PanelAccessView))
+	latest, fail := "2.0.0", false
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if fail {
+			http.Error(w, "nope", http.StatusInternalServerError)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(install.UpdateManifest{Version: latest, Download: "https://x.example/d.tgz", SHA256: "abc"})
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(install.UseTransport(srv.Client().Transport))
+	a.writePlugin("delta", "apiVersion: v1\nname: delta\ncapability: events\nversion: 1.0.0\nentrypoint: [\"./run\"]\nupdate: "+srv.URL+"/update.json\n")
+
+	check := func(id string) (int, string) {
+		t.Helper()
+		rec := a.do(http.MethodGet, "/api/plugins/"+id+"/update-check", nil, "")
+		return rec.Code, rec.Body.String()
+	}
+	if code, body := check("alpha"); code != http.StatusOK || body != `{"available":false,"installed":"1.0.0","latest":null}` {
+		t.Fatalf("no update URL: %d %s", code, body)
+	}
+	if code, body := check("delta"); code != http.StatusOK || body != `{"available":true,"installed":"1.0.0","latest":"2.0.0"}` {
+		t.Fatalf("newer version: %d %s", code, body)
+	}
+	latest = "1.0.0"
+	if code, body := check("delta"); code != http.StatusOK || body != `{"available":false,"installed":"1.0.0","latest":"1.0.0"}` {
+		t.Fatalf("same version: %d %s", code, body)
+	}
+	fail = true
+	code, body := check("delta")
+	var out map[string]any
+	_ = json.Unmarshal([]byte(body), &out)
+	if code != http.StatusOK || out["available"] != false || out["latest"] != nil || out["installed"] != "1.0.0" || out["error"] == nil {
+		t.Fatalf("failed fetch: %d %s; want 200 with error", code, body)
+	}
+	if len(a.stagingDirs()) != 0 {
+		t.Fatalf("update-check staged something: %v", a.stagingDirs())
+	}
+	code, body = check("ghost")
+	_ = json.Unmarshal([]byte(body), &out)
+	if code != http.StatusNotFound || out["error"] == nil {
+		t.Fatalf("unknown plugin: %d %s; want a JSON 404", code, body)
+	}
 }

@@ -37,10 +37,12 @@ import (
 // node token.
 func registerPluginAPI(r gin.IRoutes) {
 	r.GET("/api/plugins", getPlugins)
+	r.GET("/api/plugins/available", getPluginsAvailable)
 	r.POST("/api/plugins/import", postPluginImport)
 	r.POST("/api/plugins/order", postPluginOrder)
 	r.GET("/api/plugins/:id", getPlugin)
 	r.GET("/api/plugins/:id/source", getPluginSource)
+	r.GET("/api/plugins/:id/update-check", getPluginUpdateCheck)
 	r.POST("/api/plugins/:id/enable", postPluginToggle(true))
 	r.POST("/api/plugins/:id/disable", postPluginToggle(false))
 	r.PUT("/api/plugins/:id/settings", putPluginSettings)
@@ -333,6 +335,101 @@ func getPlugin(c *gin.Context) {
 	}
 	ts, _ := plugin.LoadTrustStore()
 	c.JSON(http.StatusOK, describePlugin(info, ts, plugin.CurrentPanelAccess()))
+}
+
+// availableJSON is one installable registry entry (contract A3.2).
+type availableJSON struct {
+	Name         string            `json:"name"`
+	Version      string            `json:"version"`
+	Registry     string            `json:"registry"`
+	Author       string            `json:"author,omitempty"`
+	Description  string            `json:"description,omitempty"`
+	Capability   plugin.Capability `json:"capability,omitempty"`
+	HasSignature bool              `json:"has_signature"`
+	// Installed is the installed version, or null when it isn't installed.
+	Installed *string `json:"installed"`
+}
+
+// getPluginsAvailable lists what the node's configured registries offer
+// Wings, at the level that may install it. A registry that can't be read is
+// reported under its namespace in "errors"; the call itself succeeds.
+func getPluginsAvailable(c *gin.Context) {
+	if !allowPlugins(c, plugin.ActionInstallSigned) {
+		return
+	}
+	installed := map[string]string{}
+	inv, _ := plugin.Inventory()
+	for _, info := range inv {
+		if info.Kind == plugin.KindExternal {
+			installed[info.Name] = info.Version
+		}
+	}
+	data := []availableJSON{}
+	errs := map[string]string{}
+	for _, l := range install.ListRegistries(c.Request.Context()) {
+		if l.Err != nil {
+			errs[l.Namespace] = l.Err.Error()
+			continue
+		}
+		for _, e := range l.Entries {
+			a := availableJSON{
+				Name: e.Name, Version: e.Version, Registry: l.Namespace,
+				Author: e.Author, Description: e.Description, Capability: e.Capability,
+				HasSignature: e.Signature != "",
+			}
+			if v, ok := installed[e.Name]; ok {
+				a.Installed = &v
+			}
+			data = append(data, a)
+		}
+	}
+	c.JSON(http.StatusOK, gin.H{"data": data, "errors": errs})
+}
+
+// getPluginUpdateCheck reports whether the plugin's update URL offers a newer
+// version, without downloading or staging anything. A plugin without an
+// update URL has latest null; a fetch that fails is a 200 with "error".
+func getPluginUpdateCheck(c *gin.Context) {
+	if !allowPlugins(c, plugin.ActionList) {
+		return
+	}
+	id, ok := pluginID(c)
+	if !ok {
+		return
+	}
+	info, ok := findPlugin(c, id)
+	if !ok {
+		return
+	}
+	resp := gin.H{"installed": info.Version, "latest": nil, "available": false}
+	if info.Kind != plugin.KindExternal || info.Manifest == "" {
+		c.JSON(http.StatusOK, resp)
+		return
+	}
+	if info.Err != "" {
+		resp["error"] = info.Err
+		c.JSON(http.StatusOK, resp)
+		return
+	}
+	m, err := plugin.LoadManifest(info.Manifest)
+	if err != nil {
+		resp["error"] = err.Error()
+		c.JSON(http.StatusOK, resp)
+		return
+	}
+	resp["installed"] = m.Version
+	if m.Update == "" {
+		c.JSON(http.StatusOK, resp)
+		return
+	}
+	st, err := install.CheckUpdate(c.Request.Context(), m)
+	if err != nil {
+		resp["error"] = err.Error()
+		c.JSON(http.StatusOK, resp)
+		return
+	}
+	resp["latest"], resp["available"] = st.Latest, st.Available
+	c.JSON(http.StatusOK, resp)
 }
 
 // --- source ---------------------------------------------------------------

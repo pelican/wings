@@ -3,6 +3,7 @@ package install
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"os"
@@ -140,7 +141,7 @@ func ListRegistries(ctx context.Context) []RegistryListing {
 			reg := regs[l.Namespace]
 			cat, err := fetchCatalog(ctx, reg.URL, authFor(reg))
 			if err != nil {
-				l.Err = err
+				l.Err = redactURL(err, reg.URL)
 				return
 			}
 			l.Entries = []CatalogEntry{}
@@ -273,6 +274,22 @@ func Resolve(ctx context.Context, ref string) (ResolvedPlugin, error) {
 			return ResolvedPlugin{}, fmt.Errorf("plugin %q is listed in more than one registry; choose one of: %s", ref, strings.Join(where, ", "))
 		}
 	}
+}
+
+// redactURL returns err with rawURL, wherever it appears, cut down to its
+// scheme, host and path: a registry URL's user info or query may carry a
+// credential, and these errors are shown to the Panel.
+func redactURL(err error, rawURL string) error {
+	u, perr := url.Parse(rawURL)
+	if perr != nil || (u.User == nil && u.RawQuery == "" && u.Fragment == "") {
+		return err
+	}
+	safe := url.URL{Scheme: u.Scheme, Host: u.Host, Path: u.Path}
+	msg := strings.ReplaceAll(err.Error(), rawURL, safe.String())
+	if u.RawQuery != "" {
+		msg = strings.ReplaceAll(msg, u.RawQuery, "…")
+	}
+	return errors.New(msg)
 }
 
 func registries() map[string]config.PluginRegistry { return config.Get().Plugins.Registries }
