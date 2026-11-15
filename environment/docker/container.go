@@ -172,6 +172,11 @@ func (e *Environment) Create() error {
 	if err != nil {
 		return errors.WithStackIf(err)
 	}
+	// DockerBindings never drops a port key, so its keys are the exposed ports.
+	exposedPorts := network.PortSet{}
+	for port := range portBindings {
+		exposedPorts[port] = struct{}{}
+	}
 
 	// If port is 0 then we have a server with no allocation and this should stay 127.0.0.1 and not the docker network interface ip.
 	if a.DefaultMapping.Port != 0 {
@@ -202,7 +207,7 @@ func (e *Environment) Create() error {
 		AttachStderr: true,
 		OpenStdin:    true,
 		Tty:          true,
-		ExposedPorts: a.Exposed(),
+		ExposedPorts: exposedPorts,
 		Image:        strings.TrimPrefix(e.meta.Image, "~"),
 		Env:          e.Configuration.EnvironmentVariables(),
 		Labels:       labels,

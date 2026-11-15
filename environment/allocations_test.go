@@ -112,13 +112,6 @@ func TestDockerBindings(t *testing.T) {
 			for port, want := range tc.wantTCP {
 				require.Equal(t, want, got[port])
 			}
-
-			// Exposed must cover exactly the ports that get bindings.
-			exposed := a.Exposed()
-			require.Len(t, exposed, len(got))
-			for port := range got {
-				require.Contains(t, exposed, port)
-			}
 		})
 	}
 }

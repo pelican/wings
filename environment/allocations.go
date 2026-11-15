@@ -125,19 +125,3 @@ func (a *Allocations) DockerBindings() (network.PortMap, error) {
 
 	return out, nil
 }
-
-// Converts the server allocation mappings into a PortSet that can be understood
-// by Docker. This formatting is slightly different than "Bindings" as it should
-// return an empty struct rather than a binding.
-//
-// DockerBindings only rewrites or empties the bindings of a port and never
-// removes the port itself, so the keys of "Bindings" are the same set.
-func (a *Allocations) Exposed() network.PortSet {
-	out := network.PortSet{}
-
-	for port := range a.Bindings() {
-		out[port] = struct{}{}
-	}
-
-	return out
-}
