@@ -6,6 +6,7 @@ import (
 	"net/url"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/apex/log"
 	"github.com/distribution/reference"
@@ -47,6 +48,8 @@ type DockerNetworkConfiguration struct {
 	Interfaces dockerNetworkInterfaces `yaml:"interfaces"`
 }
 
+var warnedDns sync.Map
+
 // DnsAddrs returns the configured DNS servers as addresses for the Docker API.
 // Entries that are not valid IP addresses are logged and skipped.
 func (c DockerNetworkConfiguration) DnsAddrs() []netip.Addr {
@@ -54,7 +57,10 @@ func (c DockerNetworkConfiguration) DnsAddrs() []netip.Addr {
 	for _, v := range c.Dns {
 		addr, err := netip.ParseAddr(strings.TrimSpace(v))
 		if err != nil {
-			log.WithField("dns", v).WithField("error", err).Warn("skipping invalid DNS server in docker network configuration")
+			// This runs on every container create, so only warn once per value.
+			if _, seen := warnedDns.LoadOrStore(v, struct{}{}); !seen {
+				log.WithField("dns", v).WithField("error", err).Warn("skipping invalid DNS server in docker network configuration")
+			}
 			continue
 		}
 		out = append(out, addr)
