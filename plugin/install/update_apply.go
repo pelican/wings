@@ -36,7 +36,8 @@ func stageArchive(ctx context.Context, download, wantSHA256, signature, destDir 
 	}
 	defer os.Remove(archivePath)
 
-	if err := enforceSignature(digest, signature); err != nil {
+	signed, err := enforceSignature(digest, signature)
+	if err != nil {
 		return nil, err
 	}
 
@@ -60,7 +61,7 @@ func stageArchive(ctx context.Context, download, wantSHA256, signature, destDir 
 		_ = root.RemoveAll(staging)
 		return nil, hideStaging(err, filepath.Join(parent, staging))
 	}
-	return &StagedInstall{DestDir: destDir, StagingDir: filepath.Join(parent, staging)}, nil
+	return &StagedInstall{DestDir: destDir, StagingDir: filepath.Join(parent, staging), signed: signed}, nil
 }
 
 // extractPlugin unpacks a plugin archive into dest and moves the plugin's
@@ -119,7 +120,14 @@ type StagedInstall struct {
 	// lock is the plugins directory's install lock, held from Commit until
 	// Finish or Rollback.
 	lock *os.File
+	// signed is whether the archive's signature verified.
+	signed bool
 }
+
+// Signed reports whether the archive's signature verified against a key in
+// plugins.trusted_keys when it was staged. An unsigned archive staged where
+// no signature was required is not signed.
+func (s *StagedInstall) Signed() bool { return s.signed }
 
 // installLockName is the lock file installs take in the plugins directory.
 // A hidden file, so discovery never looks at it.

@@ -227,3 +227,10 @@ func CheckReadOnlyTo(dir string, u ProcessUser) error {
 		return check(path, info, false)
 	})
 }
+
+// ProcessDisclosure is the sentence every approval shows (contract S,
+// "Disclosure at approval"), for a plugin that runs as user.
+func ProcessDisclosure(user string) string {
+	return "This plugin runs on this node as " + user + ", with that user's access to the machine. " +
+		"The host access listed only limits what it can ask Wings."
+}

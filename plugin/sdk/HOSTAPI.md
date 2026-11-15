@@ -20,7 +20,9 @@ backing symbol it wraps.
 - **Grants** = manifest `requires.hostAPI` **∩** operator policy
   (`GrantsFor`/`intersect`). First-party default = grant everything requested
   (the operator approves that request when trusting the plugin), narrowed by
-  `plugins.grants.<name>` when set. Full surface either way.
+  `plugins.grants.<name>` when set. Full surface either way. Grants limit what
+  a plugin can ask Wings, not what its process can do on the machine, which is
+  whatever its OS user can (see "Threat model" in `plugin/README.md`).
 - **Wire.** Request/response via `conn.Call`; **streaming** (console, stats,
   install output, backup progress) via `conn.Notify` — the host pushes
   notifications to the plugin, same channel as `events`.
@@ -66,10 +68,11 @@ tenant/secret/node compromise:
 3. **Never return raw `ContainerInspect`** — `Config.Env` / mounts / host paths
    leak secrets + layout. Curated subset only. Never expose the process-wide
    docker client singleton.
-4. **Per-server scoping is mandatory.** `Manager.All/Keys` and `Registry.Emit`
-   are node-wide today → a single-server plugin must never see other tenants.
-   Every method binds to the plugin's **granted server set**, exactly as
-   `ResolveAddress` constrains via `manager.Get`.
+4. **Per-server scoping is the goal, not implemented yet.** `Manager.All/Keys`
+   and `Registry.Emit` are node-wide today, so a granted method works on every
+   server on the node. Once scoping lands, every method binds to the plugin's
+   **granted server set**, exactly as `ResolveAddress` constrains via
+   `manager.Get`.
 5. **Filesystem = server-relative only.** All paths resolve through the
    server's `Filesystem` (an `os.Root` over its data directory). Never accept
    host-absolute paths or hand a plugin the root itself.

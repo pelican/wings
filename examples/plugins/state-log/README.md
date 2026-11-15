@@ -47,6 +47,10 @@ entrypoint: ["./wings-plugin-state-log"]
 The binary is platform-specific, so build it on (or for) the target OS/arch.
 It is git-ignored; build it as part of packaging.
 
+A plugin shipped this way is a **binary** plugin: Wings shows the operator that
+it contains a compiled program, which they can't read before approving it.
+Prefer running from source unless the node can't have Bun.
+
 ## Install into Wings
 
 Drop this directory under the configured plugins directory (default
@@ -55,11 +59,13 @@ Drop this directory under the configured plugins directory (default
 ```bash
 wings plugins list              # should show: state-log  external  stdio
 wings plugins doctor            # shows the manifest path + enable decision
-wings plugins trust state-log   # review and approve before Wings can load it
+wings plugins trust state-log   # shows what it is and asks to approve it before Wings can load it
 ```
 
-Wings launches the entrypoint lazily on the first matching event, with
-`WINGS_PLUGIN=1` set, the working directory set to this folder, and
+Wings launches the entrypoint lazily on the first matching event, as
+`system.user` when Wings runs as root (so this folder must be readable by that
+user, and it can't write here), with `WINGS_PLUGIN=1` set, the working directory
+set to this folder, and
 `WINGS_PLUGIN_DATA` pointing at its data directory for any settings or state
 (this example keeps none).
 

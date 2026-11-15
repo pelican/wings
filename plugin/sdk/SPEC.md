@@ -37,13 +37,15 @@ Config splits by ownership:
 
 - **Per-plugin settings and state** live in the plugin's **data directory**,
   `<plugins directory>/.data/<name>/`, whose path Wings passes as
-  `WINGS_PLUGIN_DATA` (created with mode 0700 before the first start). Put a
+  `WINGS_PLUGIN_DATA` (created with mode 0700, owned by the user the plugin
+  runs as, before the first start; `HOME` points there too when Wings starts
+  the plugin as `system.user`). Put a
   `config.yaml`, a cache or a database there. **Wings never parses per-plugin
   config** — a plugin may use any format it likes.
 - **Don't write to the plugin's own directory.** It holds the code the
   operator approved: `wings plugins update` replaces it, and the approval
-  covers its contents, so a file changed there is deleted by the next update
-  and makes the plugin unapproved until `wings plugins trust` is run again.
+  covers its contents. When Wings runs as root, the plugin runs as
+  `system.user` and its own directory is read-only to it, so writes there fail.
 - **Host policy** (whether a plugin is enabled/disabled and which host
   capabilities it is granted) is **not** in the plugin directory — it lives in
   Wings' `config.yml` under `plugins:` (`autoload`, `disabled`, `grants`). A

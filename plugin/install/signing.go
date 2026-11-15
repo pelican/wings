@@ -19,17 +19,23 @@ import (
 //   - a signature present          -> must verify against a trusted key,
 //     regardless of the policy (a signature that does not verify means tampering)
 //
+// verified reports that a signature was present and verified against a key
+// in plugins.trusted_keys.
+//
 // The archive is signed over its sha256 digest, so a tampered archive (different
 // digest) fails verification even if its sha256 matches a forged manifest.
-func enforceSignature(digest []byte, signature string) error {
+func enforceSignature(digest []byte, signature string) (verified bool, err error) {
 	c := config.Get().Plugins
 	if signature == "" {
 		if c.RequireSignatures {
-			return errors.New("plugin: a signature is required but the archive is unsigned")
+			return false, errors.New("plugin: a signature is required but the archive is unsigned")
 		}
-		return nil
+		return false, nil
 	}
-	return verifySignature(digest, signature, c.TrustedKeys)
+	if err := verifySignature(digest, signature, c.TrustedKeys); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func verifySignature(digest []byte, signatureB64 string, trustedKeys []string) error {

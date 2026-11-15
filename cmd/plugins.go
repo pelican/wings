@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -235,7 +236,11 @@ func installStaged(stage *install.StagedInstall, check func(plugin.Manifest) err
 			return m, err
 		}
 	}
-	ok, err := reviewPlugin(m, assumeYes)
+	signature := "not signed"
+	if stage.Signed() {
+		signature = "verified against a key in plugins.trusted_keys"
+	}
+	ok, err := reviewPlugin(m, signature, assumeYes)
 	if err != nil {
 		return m, err
 	}
@@ -267,19 +272,21 @@ func rollBack(stage *install.StagedInstall, err error) error {
 	return fmt.Errorf("%w; the previous state was restored", err)
 }
 
-// reviewPlugin prints the plugin's details + requested host access and asks the
-// operator for approval, skipping the prompt if assumeYes.
-func reviewPlugin(m plugin.Manifest, assumeYes bool) (bool, error) {
-	printTrustPrompt(m)
+// reviewPlugin prints what the operator is approving (printTrustPrompt) and
+// asks for approval, skipping the question, not the details, if assumeYes.
+// signature is the archive's signature status.
+func reviewPlugin(m plugin.Manifest, signature string, assumeYes bool) (bool, error) {
+	printTrustPrompt(m, signature)
 	if !assumeYes && !confirm("Approve and trust this plugin?") {
 		return false, nil
 	}
 	return true, nil
 }
 
-// approvePlugin reviews the manifest and records approval when accepted.
+// approvePlugin reviews an installed plugin's manifest and records approval
+// when accepted.
 func approvePlugin(m plugin.Manifest, assumeYes bool) (bool, error) {
-	ok, err := reviewPlugin(m, assumeYes)
+	ok, err := reviewPlugin(m, "not checked: signatures are checked when Wings downloads a plugin, and this one is already on the node", assumeYes)
 	if err != nil || !ok {
 		return ok, err
 	}
@@ -297,29 +304,83 @@ func recordPluginTrust(m plugin.Manifest) error {
 	return nil
 }
 
-func printTrustPrompt(m plugin.Manifest) {
-	fmt.Printf("\nPlugin %q\n", m.Name)
-	fmt.Printf("  version:     %s\n", m.Version)
+// promptOut is where the approval prompt is printed.
+var promptOut io.Writer = os.Stdout
+
+// printTrustPrompt shows what the operator approves (contract S, "Disclosure
+// at approval"): the plugin, whether its code is source or binary, the
+// signature status, the host access it requests, the OS user it will run as,
+// and what that user's access means.
+func printTrustPrompt(m plugin.Manifest, signature string) {
+	w := promptOut
+	fmt.Fprintf(w, "\nPlugin %q\n", m.Name)
+	fmt.Fprintf(w, "  version:     %s\n", m.Version)
 	if m.Author != "" {
-		fmt.Printf("  author:      %s\n", m.Author)
+		fmt.Fprintf(w, "  author:      %s\n", m.Author)
 	}
-	fmt.Printf("  capability:  %s\n", m.Capability)
+	fmt.Fprintf(w, "  capability:  %s\n", m.Capability)
 	if m.Source != "" {
-		fmt.Printf("  source:      %s\n", m.Source)
+		fmt.Fprintf(w, "  source:      %s\n", m.Source)
 	}
-	fmt.Printf("  entrypoint:  %s\n", strings.Join(m.Entrypoint, " "))
+	fmt.Fprintf(w, "  entrypoint:  %s\n", strings.Join(m.Entrypoint, " "))
 	if events := plugin.EffectiveEvents(m); len(events) > 0 {
-		fmt.Printf("  events:      %s\n", strings.Join(events, ","))
+		fmt.Fprintf(w, "  events:      %s\n", strings.Join(events, ","))
 	}
+	printForm(w, m)
+	fmt.Fprintf(w, "  signature:   %s\n", signature)
+	runsAs := printRunsAs(w)
 	if len(m.Requires.HostAPI) > 0 {
-		fmt.Println("  HOST ACCESS REQUESTED:")
+		fmt.Fprintln(w, "  HOST ACCESS REQUESTED:")
 		for _, r := range m.Requires.HostAPI {
-			fmt.Printf("    - %s\n", r)
+			fmt.Fprintf(w, "    - %s\n", r)
 		}
 	} else {
-		fmt.Println("  host access requested: none")
+		fmt.Fprintln(w, "  host access requested: none")
 	}
-	fmt.Println()
+	fmt.Fprintln(w)
+	fmt.Fprintf(w, "%s\n", plugin.ProcessDisclosure(runsAs))
+	fmt.Fprintln(w, "Wings does not review plugin code, and binary files can't be read as source; approve only code you trust.")
+	fmt.Fprintln(w)
+}
+
+// printForm prints whether the plugin is source or binary, and its binary
+// files.
+func printForm(w io.Writer, m plugin.Manifest) {
+	f, err := plugin.DetectForm(m.Dir())
+	switch {
+	case err != nil:
+		fmt.Fprintf(w, "  form:        unknown (%v)\n", err)
+	case f.Form == plugin.FormSource:
+		fmt.Fprintln(w, "  form:        source (every file is text)")
+	default:
+		fmt.Fprintf(w, "  form:        binary (%d %s not text):\n", f.BinaryCount, plural(f.BinaryCount, "file is", "files are"))
+		for _, name := range f.BinaryFiles {
+			fmt.Fprintf(w, "    - %s\n", name)
+		}
+		if more := f.BinaryCount - len(f.BinaryFiles); more > 0 {
+			fmt.Fprintf(w, "    - … and %d more\n", more)
+		}
+	}
+}
+
+// printRunsAs prints the OS user the plugin will run as and returns its name
+// for the disclosure. If plugins can't run (system.user is root without
+// plugins.run_as_root), it says so and returns the configured user name.
+func printRunsAs(w io.Writer) string {
+	u, err := plugin.ExternalProcessUser()
+	if err != nil {
+		fmt.Fprintf(w, "  runs as:     nobody yet; it won't start: %v\n", err)
+		return config.Get().System.Username
+	}
+	fmt.Fprintf(w, "  runs as:     %s\n", u.Name)
+	return u.Name
+}
+
+func plural(n int, one, many string) string {
+	if n == 1 {
+		return one
+	}
+	return many
 }
 
 func confirm(prompt string) bool {
@@ -458,6 +519,22 @@ func newPluginsGetCommand() *cobra.Command {
 			fmt.Fprintf(w, "transport:\t%s\n", info.Transport)
 			if len(info.Events) > 0 {
 				fmt.Fprintf(w, "events:\t%s\n", listColumn(info.Events))
+			}
+			if info.Kind == plugin.KindExternal && info.Manifest != "" {
+				if f, err := plugin.CachedForm(filepath.Dir(info.Manifest)); err == nil {
+					fmt.Fprintf(w, "form:\t%s\n", f.Form)
+					if len(f.BinaryFiles) > 0 {
+						fmt.Fprintf(w, "binary files:\t%s\n", strings.Join(f.BinaryFiles, ", "))
+					}
+				}
+				if u, err := plugin.ExternalProcessUser(); err == nil {
+					fmt.Fprintf(w, "runs as:\t%s\n", u.Name)
+				} else {
+					fmt.Fprintf(w, "runs as:\tit won't start: %v\n", err)
+				}
+			} else if info.Kind != plugin.KindExternal {
+				fmt.Fprintf(w, "form:\t%s\n", plugin.FormNative)
+				fmt.Fprintf(w, "runs as:\t%s (inside Wings)\n", plugin.WingsUser().Name)
 			}
 			fmt.Fprintf(w, "enabled:\t%t (%s)\n", info.Enabled, info.Reason)
 			fmt.Fprintf(w, "trusted:\t%t\n", info.Trusted)
