@@ -157,3 +157,48 @@ func TestPostUpdateConfigurationKeepsCLIPluginEdits(t *testing.T) {
 		t.Fatalf("the push undid the CLI's disable: plugins.disabled on disk = %v", got.Plugins.Disabled)
 	}
 }
+
+// TestPostUpdateConfigurationCannotAddARegistry covers a push carrying a
+// plugins.registries map: decoding it into the shared map used to add the
+// registry to the running configuration, and from there to config.yml.
+func TestPostUpdateConfigurationCannotAddARegistry(t *testing.T) {
+	t.Setenv("WINGS_TOKEN_ID", "")
+	t.Setenv("WINGS_TOKEN", "")
+	path := filepath.Join(t.TempDir(), "config.yml")
+	cfg, err := config.NewAtPath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.AuthenticationTokenId, cfg.AuthenticationToken = "id", "token"
+	if err := cfg.ResolveToken(false); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Plugins.Registries = map[string]config.PluginRegistry{"ours": {URL: "https://plugins.example.com/registry.json"}}
+	config.Set(cfg)
+	if err := config.WriteToDisk(config.Get()); err != nil {
+		t.Fatal(err)
+	}
+
+	client := backupTestRemoteClient{credentials: make(chan [2]string, 1)}
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Set("manager", server.NewEmptyManager(client))
+	c.Request = httptest.NewRequest("POST", "/api/update", strings.NewReader(`{"token_id":"id","token":"token",
+		"plugins":{"registries":{"evil":{"url":"https://evil.example/registry.json"}}}}`))
+	c.Request.Header.Set("Content-Type", "application/json")
+	postUpdateConfiguration(c)
+	if rec.Code != 200 {
+		t.Fatalf("push status %d: %s", rec.Code, rec.Body.String())
+	}
+
+	if _, ok := config.Get().Plugins.Registries["evil"]; ok {
+		t.Fatal("the push added a registry to the running configuration")
+	}
+	b, _ := os.ReadFile(path)
+	if strings.Contains(string(b), "evil.example") {
+		t.Fatal("the push wrote its registry to config.yml")
+	}
+	if _, ok := config.Get().Plugins.Registries["ours"]; !ok {
+		t.Fatal("the operator's own registry was lost")
+	}
+}

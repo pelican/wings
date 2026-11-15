@@ -581,19 +581,26 @@ func GetJwtAlgorithm() *jwt.HMACSHA {
 // PluginsOnDisk returns the plugins block as it is in c's configuration file
 // now. `wings plugins` commands change that file from another process while
 // the daemon runs, so the daemon's in-memory copy can be stale. Fields the
-// file does not set keep c's values.
+// file does not set get their defaults, as at startup. It decodes into a fresh
+// value: yaml.v2 merges into maps it is given, so starting from c.Plugins
+// would keep registries or grants that are no longer in the file.
 func PluginsOnDisk(c *Configuration) (PluginConfiguration, error) {
 	_writeLock.Lock()
 	defer _writeLock.Unlock()
+	var fresh PluginConfiguration
+	if err := defaults.Set(&fresh); err != nil {
+		return c.Plugins, err
+	}
 	current := struct {
 		Plugins PluginConfiguration `yaml:"plugins"`
-	}{Plugins: c.Plugins}
+	}{Plugins: fresh}
+	// If the file can't be read, the caller keeps what is in memory.
 	if c.path == "" {
-		return current.Plugins, errors.New("config: no configuration file path to read plugins from")
+		return c.Plugins, errors.New("config: no configuration file path to read plugins from")
 	}
 	b, err := os.ReadFile(c.path)
 	if err != nil {
-		return current.Plugins, err
+		return c.Plugins, err
 	}
 	if err := yaml.Unmarshal(b, &current); err != nil {
 		return c.Plugins, err

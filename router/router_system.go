@@ -239,6 +239,11 @@ func postUpdateConfiguration(c *gin.Context) {
 		return
 	}
 
+	// config.Get() copies the struct but its maps are shared with the running
+	// configuration, so decoding a pushed "plugins" block into them would
+	// change the live registries and grants. Give the decoder nothing to share;
+	// the block is replaced from the file below anyway.
+	cfg.Plugins = config.PluginConfiguration{}
 	if err := c.BindJSON(&cfg); err != nil {
 		return
 	}
