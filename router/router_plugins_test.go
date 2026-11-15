@@ -1124,3 +1124,30 @@ func TestApprovePathEscapesTheName(t *testing.T) {
 		t.Fatalf("approvePath = %q, want %q", got, want)
 	}
 }
+
+// TestPluginAPIImportRefusesASecondCopy: with gamma installed in gamma-main,
+// importing gamma must not stage it into gamma/, which would leave two copies
+// that discovery then refuses as duplicates.
+func TestPluginAPIImportRefusesASecondCopy(t *testing.T) {
+	a := newPluginAPI(t, string(plugin.PanelAccessFull))
+	a.writePlugin("gamma-main", "apiVersion: v1\nname: gamma\ncapability: events\nversion: 1.0.0\nentrypoint: [\"./run\"]\n")
+
+	var buf bytes.Buffer
+	mw := multipart.NewWriter(&buf)
+	fw, _ := mw.CreateFormFile("plugin", "gamma.tar.gz")
+	_, _ = fw.Write(gammaArchive(t, "2.0.0"))
+	_ = mw.Close()
+	rec := a.do(http.MethodPost, "/api/plugins/import", &buf, mw.FormDataContentType())
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), "gamma-main") {
+		t.Fatalf("import of a plugin installed under another directory: %d %s; want 409 naming gamma-main", rec.Code, rec.Body)
+	}
+	if _, err := os.Stat(filepath.Join(a.dir, "gamma")); !os.IsNotExist(err) {
+		t.Fatalf("a second copy was created: %v", err)
+	}
+	if len(a.stagingDirs()) != 0 {
+		t.Fatalf("staging dirs left: %v", a.stagingDirs())
+	}
+	if m, err := plugin.LoadManifest(filepath.Join(a.dir, "gamma-main", plugin.ManifestFile)); err != nil || m.Version != "1.0.0" {
+		t.Fatalf("the installed copy changed: %+v %v", m, err)
+	}
+}

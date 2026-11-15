@@ -822,6 +822,18 @@ func respondStaged(c *gin.Context, action, path string, stage *install.StagedIns
 	if err == nil {
 		destination, err = destinationState(stage, m.Name)
 	}
+	// A plugin of this name installed under another directory name: putting
+	// this one in <plugins>/<name> would leave two copies, and discovery then
+	// refuses both, so the working one stops loading.
+	if err == nil {
+		if elsewhere, ok := installedElsewhere(destination); ok {
+			_ = stage.Cleanup()
+			c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": fmt.Sprintf(
+				"plugin %q is already installed in %s, not in its own name's directory; uninstall it (or rename that directory to %q) first",
+				m.Name, elsewhere, m.Name)})
+			return
+		}
+	}
 	if err == nil {
 		token, err = newApprovalToken()
 	}
@@ -889,6 +901,17 @@ func destinationState(stage *install.StagedInstall, name string) (string, error)
 		}
 	}
 	return state, nil
+}
+
+// installedElsewhere returns the first directory, other than the stage's own
+// destination, where destinationState found a plugin of the same name.
+func installedElsewhere(state string) (string, bool) {
+	_, rest, ok := strings.Cut(state, "\x00elsewhere:")
+	if !ok {
+		return "", false
+	}
+	dir, _, _ := strings.Cut(rest, "\x00")
+	return dir, true
 }
 
 // Errors from the checks made at approval, under the install lock.

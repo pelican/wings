@@ -315,6 +315,9 @@ trusted plugins.
   waiting for the right call).
 - The token is tied to the staged files: if anything in the staging
   directory changed after the token was issued, the approval is refused.
+- A plugin of the same name installed under a differently named directory
+  (say `notify` in `notify-main`) makes install and import answer 409 at
+  staging: a second copy would make discovery refuse both.
 - A new stage of the same plugin replaces the one waiting. At most 16 stages
   wait at once (429 after that).
 - `signed` is `true` only when the archive's signature verified against a
