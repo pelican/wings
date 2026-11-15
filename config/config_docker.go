@@ -9,9 +9,9 @@ import (
 
 	"github.com/apex/log"
 	"github.com/distribution/reference"
+	"github.com/goccy/go-json"
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/registry"
-	"github.com/goccy/go-json"
 )
 
 type dockerNetworkInterfaces struct {
@@ -193,6 +193,7 @@ func (c DockerConfiguration) ContainerLogConfig() container.LogConfig {
 		Config: c.LogConfig.Config,
 	}
 }
+
 // RegistryCredentialsForImage returns registry credentials for an image only
 // when the configured registry and image reference share the same registry
 // identity.
