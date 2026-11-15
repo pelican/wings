@@ -35,32 +35,38 @@ func stageArchive(ctx context.Context, download, wantSHA256, signature, destDir 
 		return nil, err
 	}
 	defer os.Remove(archivePath)
-
-	if err := enforceSignature(digest, signature, o); err != nil {
+	staging, err := extractToStaging(ctx, archivePath, digest, signature, filepath.Dir(destDir), o)
+	if err != nil {
 		return nil, err
 	}
+	return &StagedInstall{DestDir: destDir, StagingDir: staging}, nil
+}
 
-	// Stage inside destDir's parent so the final swap is an atomic
-	// same-filesystem rename (avoids a cross-device copy).
-	parent := filepath.Dir(destDir)
+// extractToStaging applies the signing policy to a verified archive and
+// unpacks it into a new hidden staging directory in parent, returning its
+// path. Staging inside the plugins directory makes the final swap an atomic
+// same-filesystem rename (no cross-device copy).
+func extractToStaging(ctx context.Context, archivePath string, digest []byte, signature, parent string, o stageOptions) (string, error) {
+	if err := enforceSignature(digest, signature, o); err != nil {
+		return "", err
+	}
 	if err := os.MkdirAll(parent, 0o755); err != nil {
-		return nil, err
+		return "", err
 	}
 	root, err := os.OpenRoot(parent)
 	if err != nil {
-		return nil, err
+		return "", err
 	}
 	defer root.Close()
 	staging, err := mkdirHidden(root, ".wings-install-")
 	if err != nil {
-		return nil, err
+		return "", err
 	}
-
 	if err := extractArchive(ctx, archivePath, filepath.Join(parent, staging)); err != nil {
 		_ = root.RemoveAll(staging)
-		return nil, err
+		return "", err
 	}
-	return &StagedInstall{DestDir: destDir, StagingDir: filepath.Join(parent, staging)}, nil
+	return filepath.Join(parent, staging), nil
 }
 
 // mkdirHidden creates a new, uniquely named directory "<prefix><random>" in
@@ -237,7 +243,9 @@ func (s *StagedInstall) Cleanup() error {
 
 // downloadAndVerify streams the archive to a temp file while hashing it, checks
 // the digest against the expected value, and returns the temp path plus the raw
-// digest (used for signature verification).
+// digest (used for signature verification). An empty wantSHA256 skips the
+// check; only StageURL, which has no registry entry to take one from, passes
+// one, and its callers' policy decides whether that is acceptable.
 func downloadAndVerify(ctx context.Context, rawURL, wantSHA256 string, a auth) (string, []byte, error) {
 	body, err := httpsGet(ctx, rawURL, maxUpdateArchiveBytes, a)
 	if err != nil {
@@ -258,7 +266,7 @@ func downloadAndVerify(ctx context.Context, rawURL, wantSHA256 string, a auth) (
 	tmp.Close()
 
 	digest := h.Sum(nil)
-	if got := hex.EncodeToString(digest); !strings.EqualFold(got, wantSHA256) {
+	if got := hex.EncodeToString(digest); wantSHA256 != "" && !strings.EqualFold(got, wantSHA256) {
 		os.Remove(tmp.Name())
 		return "", nil, fmt.Errorf("plugin: checksum mismatch (want %s, got %s)", wantSHA256, got)
 	}
