@@ -118,8 +118,19 @@ func Emit(e Event) { defaultRegistry.Emit(e) }
 func (r *Registry) Emit(e Event) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	// Check what each listener wants first, and read the policy at most once
+	// per event: config.Get copies the whole Wings configuration, and this
+	// runs for every server on every stats tick.
+	var policy *config.PluginConfiguration
 	for _, w := range r.listeners {
-		if !providerEnabled(w.listener.Name()) || !wants(e, w.listener.Events()) {
+		if !wants(e, w.listener.Events()) {
+			continue
+		}
+		if policy == nil {
+			p := config.Get().Plugins
+			policy = &p
+		}
+		if ok, _ := decide(*policy, w.listener.Name()); !ok {
 			continue
 		}
 		w.offer(e)
@@ -141,7 +152,11 @@ func Enabled(name string) bool { return providerEnabled(name) }
 // human-readable reason. Precedence: an explicit Disabled blocklist wins; then a
 // non-empty Enabled allowlist; otherwise the Autoload default.
 func enableState(name string) (bool, string) {
-	c := config.Get().Plugins
+	return decide(config.Get().Plugins, name)
+}
+
+// decide applies the enable policy c to a provider name.
+func decide(c config.PluginConfiguration, name string) (bool, string) {
 	for _, n := range c.Disabled {
 		if n == name {
 			return false, "blocklist"

@@ -2,6 +2,7 @@ package plugin
 
 import (
 	"context"
+	"fmt"
 	"runtime"
 	"testing"
 	"time"
@@ -165,5 +166,41 @@ func TestInventoryListsRouteAndTaskOnlyPlugins(t *testing.T) {
 	}
 	if seen["inv-routes"] != 1 || seen["inv-tasks"] != 1 {
 		t.Fatalf("route-only and task-only plugins should each be listed once, got %v", seen)
+	}
+}
+
+// parkedListener wants every event type in events and blocks in its first
+// OnEvent until release closes, so its worker allocates nothing meanwhile.
+type parkedListener struct {
+	name    string
+	events  []string
+	release chan struct{}
+}
+
+func (p parkedListener) Name() string     { return p.name }
+func (p parkedListener) Events() []string { return p.events }
+func (p parkedListener) OnEvent(context.Context, Event) error {
+	<-p.release
+	return nil
+}
+
+// TestEmitReadsThePolicyOncePerEvent covers the stats tick: Emit used to copy
+// the whole Wings configuration once per registered listener, including
+// listeners that don't want the event. It must cost the same with 40
+// listeners as with one.
+func TestEmitReadsThePolicyOncePerEvent(t *testing.T) {
+	setConfig(t)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	r := NewRegistry()
+	for i := 0; i < 20; i++ {
+		r.RegisterEventListener(parkedListener{name: fmt.Sprintf("wants-%d", i), events: []string{"server.stats"}, release: release})
+		r.RegisterEventListener(parkedListener{name: fmt.Sprintf("other-%d", i), events: []string{"server.state"}, release: release})
+	}
+	e := Event{Type: "server.stats", Server: "x"}
+	r.Emit(e) // each wanting worker takes this one and parks
+
+	if allocs := testing.AllocsPerRun(50, func() { r.Emit(e) }); allocs > 2 {
+		t.Fatalf("Emit with 40 listeners made %.0f allocations, want at most 2 (one policy read)", allocs)
 	}
 }
