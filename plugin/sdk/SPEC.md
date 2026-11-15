@@ -66,8 +66,10 @@ Config splits by ownership:
 ```
 
 The Go SDK (`sdk.ServeEventListener`) answers `initialize` and dispatches `event`
-notifications for you; any other language implements the two messages directly
-(see `examples/plugins/state-log`).
+notifications for you (see `examples/plugins/go-external-statecount`); any
+other language implements the two messages directly (see
+`examples/plugins/state-log` for Bun and `examples/plugins/python-install-log`
+for Python).
 
 ## Host callbacks (plugin → host, request)
 

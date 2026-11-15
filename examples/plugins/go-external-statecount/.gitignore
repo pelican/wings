@@ -1,0 +1,2 @@
+# Built by `go build -o wings-plugin-statecount .`
+wings-plugin-statecount

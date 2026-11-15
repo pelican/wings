@@ -1,0 +1,14 @@
+apiVersion: v1
+name: statecount
+capability: events
+version: 1.0.0
+author: example
+description: Count how often each server changes state, kept in the plugin's data directory.
+license: MIT
+# A compiled Go binary next to this file. Build it with `go build -o wings-plugin-statecount .`
+entrypoint: ["./wings-plugin-statecount"]
+provides:
+  events: ["server.state"]
+requires:
+  # No host callbacks needed.
+  hostAPI: []

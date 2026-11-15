@@ -1,0 +1,13 @@
+apiVersion: v1
+name: install-log
+capability: events
+version: 1.0.0
+author: example
+description: Log server installs to stderr and to installs.log in the plugin's data directory.
+license: MIT
+# Python 3 from the node; no packages needed.
+entrypoint: ["python3", "plugin.py"]
+provides:
+  events: ["server.install"]
+requires:
+  hostAPI: []

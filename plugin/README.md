@@ -54,11 +54,12 @@ every capability.
 
 - **Native** — Go code compiled into Wings, registered from an `init()` and
   linked by one blank import in `plugin/builtin`. Fastest; trusted because it is
-  part of the binary.
+  part of the binary. (e.g. `examples/plugins/go-native-auditlog`.)
 - **External** — a separate executable in any language that ships a
   `plugin.yaml` manifest and speaks JSON-RPC over stdio. Discovered from the
   plugins directory, approved by the operator, spawned lazily on first use.
-  (e.g. `examples/plugins/state-log`, Bun + TypeScript.)
+  (e.g. `examples/plugins/state-log` in Bun + TypeScript,
+  `go-external-statecount` in Go, `python-install-log` in Python.)
 
 Both satisfy the *same* contract; the rest of Wings can't tell them apart.
 
@@ -296,4 +297,16 @@ digest, so a tampered archive fails even if its sha256 matches a forged manifest
 
 - `sdk/SPEC.md` — the external wire protocol (write a plugin in any language).
 - `sdk/HOSTAPI.md` — the full host surface a plugin can call.
-- `examples/plugins/state-log/` — a real external plugin (Bun + TypeScript).
+- `examples/plugins/` — four small working plugins, each with a README:
+  - `go-native-auditlog/` — native (Go, compiled in): an event listener, a
+    node route and a scheduled task.
+  - `go-external-statecount/` — external, Go with the SDK: counts state changes
+    and keeps them in the plugin's data directory.
+  - `state-log/` — external, Bun + TypeScript, no SDK: calls back into Wings
+    with `host.server.logs`.
+  - `python-install-log/` — external, Python standard library only: appends
+    installs to a log file.
+
+  `plugin/external/examples_test.go` starts the three external ones the way
+  Wings does and checks each one reacts to an event (skipped if its runtime is
+  not installed).
