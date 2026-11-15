@@ -39,10 +39,12 @@ var updateHTTPClient = &http.Client{Timeout: updateHTTPTimeout, CheckRedirect: c
 const maxPluginRedirects = 10
 
 // checkPluginRedirect keeps every hop of a plugin fetch on https, so the scheme
-// check in httpsGet cannot be bypassed by a redirect. When a redirect leaves the
-// host the request was first sent to, every request header is dropped: net/http
-// forwards custom headers to any host and Authorization to a same-domain host,
-// and both carry private registry credentials.
+// check in httpsGet cannot be bypassed by a redirect. Once a redirect chain
+// leaves the origin the request was first sent to (scheme, host and port),
+// every request header is dropped for that hop and every later one, even one
+// back at the origin: net/http copies the first request's headers onto each
+// hop, forwarding custom headers to any host and Authorization to a
+// same-domain host, and both carry private registry credentials.
 func checkPluginRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= maxPluginRedirects {
 		return fmt.Errorf("plugin: stopped after %d redirects", maxPluginRedirects)
@@ -50,10 +52,17 @@ func checkPluginRedirect(req *http.Request, via []*http.Request) error {
 	if req.URL.Scheme != "https" {
 		return errors.New("plugin: refusing redirect to a non-https url")
 	}
-	if req.URL.Host != via[0].URL.Host {
-		req.Header = make(http.Header)
+	for _, r := range append(via[1:len(via):len(via)], req) {
+		if !sameOrigin(r.URL, via[0].URL) {
+			req.Header = make(http.Header)
+			break
+		}
 	}
 	return nil
+}
+
+func sameOrigin(a, b *url.URL) bool {
+	return a.Scheme == b.Scheme && a.Host == b.Host
 }
 
 // UpdateManifest is the JSON a plugin publisher hosts at Manifest.Update.

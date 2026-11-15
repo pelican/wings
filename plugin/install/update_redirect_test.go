@@ -125,3 +125,35 @@ func TestCheckUpdateReadsThePelicanHubFormat(t *testing.T) {
 		t.Fatalf("plain manifest: %+v, %v", st, err)
 	}
 }
+
+// Once a redirect chain has left the registry's origin, credentials stay
+// dropped even if it comes back.
+func TestHTTPSGetKeepsCredentialsDroppedAfterTheChainLeft(t *testing.T) {
+	type seen struct{ authz, key string }
+	var back seen
+	var registry *httptest.Server
+	mirror := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, registry.URL+"/back", http.StatusFound)
+	}))
+	defer mirror.Close()
+	registry = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/start":
+			http.Redirect(w, r, mirror.URL+"/bounce", http.StatusFound)
+		case "/back":
+			back = seen{r.Header.Get("Authorization"), r.Header.Get("X-Api-Key")}
+			_, _ = io.WriteString(w, "archive")
+		}
+	}))
+	defer registry.Close()
+	useTestTransport(t, registry)
+
+	body, err := httpsGet(context.Background(), registry.URL+"/start", 1<<20, auth{token: "secret", headers: map[string]string{"X-Api-Key": "key"}})
+	if err != nil {
+		t.Fatalf("httpsGet: %v", err)
+	}
+	body.Close()
+	if back != (seen{}) {
+		t.Fatalf("credentials were sent again after the chain left the origin: %+v", back)
+	}
+}

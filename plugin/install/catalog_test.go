@@ -138,3 +138,75 @@ func TestCatalogFindSkipsPanelEntries(t *testing.T) {
 		t.Fatalf("an entry without target must count as wings, got %+v, %v", e, ok)
 	}
 }
+
+// A signature field that is present but not a non-empty string makes the
+// entry invalid; it never means "unsigned". The rest of the registry is
+// still read.
+func TestRegistryEntryWithAMalformedSignatureIsInvalid(t *testing.T) {
+	body := `{"plugins":[
+		{"name":"empty","version":"1","download":"https://example.com/a.tgz","sha256":"abc","signature":""},
+		{"name":"null","version":"1","download":"https://example.com/a.tgz","sha256":"abc","signature":null},
+		{"name":"number","version":"1","download":"https://example.com/a.tgz","sha256":"abc","signature":7},
+		{"name":"unsigned","version":"1","download":"https://example.com/a.tgz","sha256":"abc"}
+	]}`
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	useTestTransport(t, srv)
+	for _, name := range []string{"empty", "null", "number"} {
+		if _, err := Resolve(context.Background(), srv.URL+"/registry.json#"+name); err == nil || !strings.Contains(err.Error(), "signature") {
+			t.Errorf("%s: Resolve = %v, want the entry refused for its signature", name, err)
+		}
+	}
+	if r, err := Resolve(context.Background(), srv.URL+"/registry.json#unsigned"); err != nil || r.Entry.Signature != "" {
+		t.Fatalf("an entry without a signature field: %+v %v", r, err)
+	}
+}
+
+// ListRegistries reads every configured registry with its credentials and
+// keeps only what Wings installs; one that can't be read is reported, not
+// fatal.
+func TestListRegistries(t *testing.T) {
+	var gotAuth string
+	good := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte(`{"plugins":[
+			{"name":"state-log","version":"1.2.0","download":"https://example.com/a.tgz","sha256":"abc","signature":"c2ln"},
+			{"name":"counter","version":"2.0.1","target":"panel","download":"https://example.com/b.zip","sha256":"abc"},
+			{"name":"future","version":"1","target":"toaster","download":"https://example.com/c.zip","sha256":"abc"},
+			{"name":"bad-sig","version":"1","download":"https://example.com/d.tgz","sha256":"abc","signature":""},
+			{"name":"../evil","version":"1","download":"https://example.com/e.tgz","sha256":"abc"}
+		]}`))
+	}))
+	t.Cleanup(good.Close)
+	down := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "nope", http.StatusBadGateway)
+	}))
+	t.Cleanup(down.Close)
+	useTestTransport(t, good)
+	c, err := config.NewAtPath("test.yml")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.AuthenticationToken = "test-token"
+	c.Plugins.Registries = map[string]config.PluginRegistry{
+		"acme": {URL: good.URL + "/registry.json", Token: "t0ken"},
+		"down": {URL: down.URL + "/registry.json"},
+	}
+	config.Set(c)
+
+	got := ListRegistries(context.Background())
+	if len(got) != 2 || got[0].Namespace != "acme" || got[1].Namespace != "down" {
+		t.Fatalf("listings = %+v", got)
+	}
+	if got[0].Err != nil || len(got[0].Entries) != 1 || got[0].Entries[0].Name != "state-log" || got[0].Entries[0].Signature != "c2ln" {
+		t.Fatalf("acme = %+v", got[0])
+	}
+	if gotAuth != "Bearer t0ken" {
+		t.Fatalf("the registry's token was not sent: %q", gotAuth)
+	}
+	if got[1].Err == nil || len(got[1].Entries) != 0 {
+		t.Fatalf("down = %+v; want an error and no entries", got[1])
+	}
+}

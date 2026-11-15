@@ -9,6 +9,9 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
+
+	"github.com/apex/log"
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/plugin"
@@ -32,12 +35,54 @@ type CatalogEntry struct {
 	Author      string            `json:"author"`
 	Description string            `json:"description"`
 	MinWings    string            `json:"minWings"`
-	Download    string            `json:"download"`  // https URL to the plugin archive
-	SHA256      string            `json:"sha256"`    // hex digest of the archive
-	Signature   string            `json:"signature"` // base64 Ed25519 signature over the archive sha256
+	Download    string            `json:"download"`            // https URL to the plugin archive
+	SHA256      string            `json:"sha256"`              // hex digest of the archive
+	Signature   string            `json:"signature,omitempty"` // base64 Ed25519 signature over the archive sha256
 	// Target is which side installs the entry: "wings", or "panel" for a Panel
 	// plugin listed in the same registry. Missing means "wings".
 	Target string `json:"target,omitempty"`
+
+	// badSignature is set when the entry has a "signature" field that is not
+	// a non-empty string. Such an entry is invalid, never unsigned.
+	badSignature bool
+}
+
+// UnmarshalJSON reads an entry, noting a "signature" that is present but not
+// a non-empty string ("", null, a number) instead of failing the whole
+// registry or reading it as unsigned.
+func (e *CatalogEntry) UnmarshalJSON(b []byte) error {
+	type plain CatalogEntry
+	var raw struct {
+		plain
+		Signature json.RawMessage `json:"signature"`
+	}
+	if err := json.Unmarshal(b, &raw); err != nil {
+		return err
+	}
+	*e = CatalogEntry(raw.plain)
+	e.Signature, e.badSignature = "", false
+	if raw.Signature != nil {
+		if err := json.Unmarshal(raw.Signature, &e.Signature); err != nil || e.Signature == "" {
+			e.Signature, e.badSignature = "", true
+		}
+	}
+	return nil
+}
+
+// forWings reports whether Wings installs e: its target is missing or
+// "wings". Entries for the Panel, or a target this Wings doesn't know, are
+// someone else's.
+func (e CatalogEntry) forWings() bool { return e.Target == "" || e.Target == "wings" }
+
+// problem says why e can't be installed even though Wings is its target.
+func (e CatalogEntry) problem() error {
+	switch {
+	case plugin.InvalidName(e.Name):
+		return fmt.Errorf("plugin: registry entry has an invalid plugin name %q", e.Name)
+	case e.badSignature:
+		return fmt.Errorf("plugin: registry entry %q has a signature field that is not a non-empty string; the entry is invalid", e.Name)
+	}
+	return nil
 }
 
 // fetchCatalog downloads and parses a registry index from an https URL, sending
@@ -58,7 +103,7 @@ func fetchCatalog(ctx context.Context, url string, a auth) (Catalog, error) {
 
 func (c Catalog) find(name string) (CatalogEntry, bool) {
 	for _, e := range c.Plugins {
-		if e.Target != "" && e.Target != "wings" {
+		if !e.forWings() {
 			continue // a Panel plugin, or a target this Wings doesn't know
 		}
 		if e.Name == name {
@@ -66,6 +111,53 @@ func (c Catalog) find(name string) (CatalogEntry, bool) {
 		}
 	}
 	return CatalogEntry{}, false
+}
+
+// RegistryListing is what one configured registry lists for Wings.
+type RegistryListing struct {
+	Namespace string
+	// Entries are the registry's entries Wings can install: target "wings"
+	// (or none), a valid name and a well-formed signature field.
+	Entries []CatalogEntry
+	// Err is set, and Entries empty, when the registry could not be read.
+	Err error
+}
+
+// ListRegistries reads every registry in plugins.registries, each with its
+// own credentials, at the same time, and returns them sorted by namespace.
+func ListRegistries(ctx context.Context) []RegistryListing {
+	regs := registries()
+	out := make([]RegistryListing, 0, len(regs))
+	for ns := range regs {
+		out = append(out, RegistryListing{Namespace: ns})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Namespace < out[j].Namespace })
+	var wg sync.WaitGroup
+	for i := range out {
+		wg.Add(1)
+		go func(l *RegistryListing) {
+			defer wg.Done()
+			reg := regs[l.Namespace]
+			cat, err := fetchCatalog(ctx, reg.URL, authFor(reg))
+			if err != nil {
+				l.Err = err
+				return
+			}
+			l.Entries = []CatalogEntry{}
+			for _, e := range cat.Plugins {
+				if !e.forWings() {
+					continue
+				}
+				if err := e.problem(); err != nil {
+					log.WithField("registry", l.Namespace).WithField("error", err).Warn("skipping an invalid registry entry")
+					continue
+				}
+				l.Entries = append(l.Entries, e)
+			}
+		}(&out[i])
+	}
+	wg.Wait()
+	return out
 }
 
 // ResolvedPlugin is a registry entry together with the (opaque) credentials
@@ -113,6 +205,9 @@ func Resolve(ctx context.Context, ref string) (ResolvedPlugin, error) {
 			return ResolvedPlugin{}, err
 		}
 		if e, ok := cat.find(name); ok {
+			if err := e.problem(); err != nil {
+				return ResolvedPlugin{}, err
+			}
 			return ResolvedPlugin{Entry: e}, nil
 		}
 		return ResolvedPlugin{}, fmt.Errorf("plugin %q not found in %s", name, url)
@@ -132,6 +227,9 @@ func Resolve(ctx context.Context, ref string) (ResolvedPlugin, error) {
 			return ResolvedPlugin{}, err
 		}
 		if e, ok := cat.find(name); ok {
+			if err := e.problem(); err != nil {
+				return ResolvedPlugin{}, err
+			}
 			return ResolvedPlugin{Entry: e, auth: a, registryHost: hostOf(reg.URL)}, nil
 		}
 		return ResolvedPlugin{}, fmt.Errorf("plugin %q not found in registry %q", name, ns)
@@ -167,6 +265,9 @@ func Resolve(ctx context.Context, ref string) (ResolvedPlugin, error) {
 		case 0:
 			return ResolvedPlugin{}, fmt.Errorf("plugin %q not found in any configured registry", ref)
 		case 1:
+			if err := found[0].Entry.problem(); err != nil {
+				return ResolvedPlugin{}, err
+			}
 			return found[0], nil
 		default:
 			return ResolvedPlugin{}, fmt.Errorf("plugin %q is listed in more than one registry; choose one of: %s", ref, strings.Join(where, ", "))
