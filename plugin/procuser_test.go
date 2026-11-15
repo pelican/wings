@@ -123,3 +123,41 @@ func TestPrepareDataDirSkipsHardLinks(t *testing.T) {
 		t.Fatal("the data directory and its own files should belong to the plugin's user")
 	}
 }
+
+// TestCheckReadOnlyToFollowsSymlinkedAncestors: a plugins directory reached
+// through a symlink must have the ancestors of its real location checked, or a
+// directory the plugin's user can write (here world-writable) slips through.
+func TestCheckReadOnlyToFollowsSymlinkedAncestors(t *testing.T) {
+	other := ProcessUser{Name: "other", Uid: 2147483000, Gid: 2147483000}
+	base := t.TempDir()
+	open := filepath.Join(base, "open")
+	real := filepath.Join(open, "plugins", "demo")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(real, "run"), []byte("x"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(open, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(filepath.Join(open, "plugins"), filepath.Join(base, "plugins")); err != nil {
+		t.Fatal(err)
+	}
+
+	err := CheckReadOnlyTo(filepath.Join(base, "plugins", "demo"), other)
+	if err == nil || !strings.Contains(err.Error(), "writable by other") || !strings.Contains(err.Error(), open) {
+		t.Fatalf("a writable directory on the plugin's real path must be refused, got %v", err)
+	}
+}
+
+func TestProcessUserIDsRefusesOutOfRange(t *testing.T) {
+	if uid, gid, err := (ProcessUser{Name: "pelican", Uid: 988, Gid: 988}).IDs(); err != nil || uid != 988 || gid != 988 {
+		t.Fatalf("IDs = %d %d %v", uid, gid, err)
+	}
+	for _, u := range []ProcessUser{{Name: "neg", Uid: -1, Gid: 0}, {Name: "big", Uid: 0, Gid: 1 << 33}} {
+		if _, _, err := u.IDs(); err == nil {
+			t.Errorf("%s: an out-of-range id must be refused", u.Name)
+		}
+	}
+}
