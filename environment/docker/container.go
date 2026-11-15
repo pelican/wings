@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/netip"
 	"runtime"
 	"strconv"
 	"strings"
@@ -13,12 +14,13 @@ import (
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/containerd/errdefs"
-	"github.com/docker/docker/api/types/container"
-	dockerImage "github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
 	"github.com/dustin/go-humanize"
 	"github.com/goccy/go-json"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
@@ -52,7 +54,7 @@ func (e *Environment) Attach(ctx context.Context) error {
 		return nil
 	}
 
-	opts := container.AttachOptions{
+	opts := client.ContainerAttachOptions{
 		Stdin:  true,
 		Stdout: true,
 		Stderr: true,
@@ -63,7 +65,7 @@ func (e *Environment) Attach(ctx context.Context) error {
 	if st, err := e.client.ContainerAttach(ctx, e.Id, opts); err != nil {
 		return errors.WrapIf(err, "environment/docker: error while attaching to container")
 	} else {
-		e.SetStream(&st)
+		e.SetStream(&st.HijackedResponse)
 	}
 
 	go func() {
@@ -133,8 +135,8 @@ func (e *Environment) InSituUpdate() error {
 	// for removing memory limits, a container must be re-created.
 	//
 	// @see https://github.com/moby/moby/issues/41946
-	if _, err := e.client.ContainerUpdate(ctx, e.Id, container.UpdateConfig{
-		Resources: e.Configuration.Limits().AsContainerResources(),
+	if _, err := e.client.ContainerUpdate(ctx, e.Id, client.ContainerUpdateOptions{
+		Resources: new(e.Configuration.Limits().AsContainerResources()),
 	}); err != nil {
 		return errors.Wrap(err, "environment/docker: could not update container")
 	}
@@ -217,12 +219,12 @@ func (e *Environment) Create() error {
 			networkName := "ip-" + strings.ReplaceAll(strings.ReplaceAll(a.DefaultMapping.Ip, ".", "-"), ":", "-")
 			networkMode = container.NetworkMode(networkName)
 
-			if _, err := e.client.NetworkInspect(ctx, networkName, network.InspectOptions{}); err != nil {
+			if _, err := e.client.NetworkInspect(ctx, networkName, client.NetworkInspectOptions{}); err != nil {
 				if !errdefs.IsNotFound(err) {
 					return err
 				}
 
-				if _, err := e.client.NetworkCreate(ctx, networkName, network.CreateOptions{
+				if _, err := e.client.NetworkCreate(ctx, networkName, client.NetworkCreateOptions{
 					Driver:     "bridge",
 					EnableIPv6: &enableIPv6,
 					Internal:   false,
@@ -260,7 +262,7 @@ func (e *Environment) Create() error {
 		// from the Panel.
 		Resources: e.Configuration.Limits().AsContainerResources(),
 
-		DNS: cfg.Docker.Network.Dns,
+		DNS: cfg.Docker.Network.DnsAddrs(),
 
 		// Configure logging for the container to make it easier on the Daemon to grab
 		// the server output. Ensure that we don't use too much space on the host machine
@@ -279,25 +281,23 @@ func (e *Environment) Create() error {
 		UsernsMode:  container.UsernsMode(cfg.Docker.UsernsMode),
 	}
 
-	var netConf *network.NetworkingConfig = nil //In case when no networking config is needed set nil
-	var serverNetConfig = config.Get().Docker.Network
-	if "macvlan" == serverNetConfig.Driver { //Generate networking config for macvlan driver
-		var defaultMapping = e.Config().Allocations().DefaultMapping
+	var netConf *network.NetworkingConfig // nil when no networking config is needed
+	if serverNetConfig := config.Get().Docker.Network; serverNetConfig.Driver == "macvlan" {
+		defaultMapping := e.Config().Allocations().DefaultMapping
 		e.log().Debug("Set macvlan " + serverNetConfig.Name + " IP to " + defaultMapping.Ip)
-		netConf = &network.NetworkingConfig{
-			EndpointsConfig: map[string]*network.EndpointSettings{
-				serverNetConfig.Name: { //Get network name from wings config
-					IPAMConfig: &network.EndpointIPAMConfig{
-						IPv4Address: defaultMapping.Ip,
-					},
-					IPAddress: defaultMapping.Ip, //Use default mapping ip address (wings support only one network per server)
-					Gateway:   serverNetConfig.Interfaces.V4.Gateway,
-				},
-			},
+		nc, err := MacvlanNetworkingConfig(serverNetConfig.Name, defaultMapping.Ip, serverNetConfig.Interfaces.V4.Gateway)
+		if err != nil {
+			return err
 		}
+		netConf = nc
 	}
 	// Pass the networkings configuration or nil if none required
-	if _, err := e.client.ContainerCreate(ctx, conf, hostConf, netConf, nil, e.Id); err != nil {
+	if _, err := e.client.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:           conf,
+		HostConfig:       hostConf,
+		NetworkingConfig: netConf,
+		Name:             e.Id,
+	}); err != nil {
 		return errors.Wrap(err, "environment/docker: failed to create container")
 	}
 
@@ -310,7 +310,7 @@ func (e *Environment) Destroy() error {
 	// We set it to stopping than offline to prevent crash detection from being triggered.
 	e.SetState(environment.ProcessStoppingState)
 
-	err := e.client.ContainerRemove(context.Background(), e.Id, container.RemoveOptions{
+	_, err := e.client.ContainerRemove(context.Background(), e.Id, client.ContainerRemoveOptions{
 		RemoveVolumes: true,
 		RemoveLinks:   false,
 		Force:         true,
@@ -356,7 +356,7 @@ func (e *Environment) SendCommand(c string) error {
 // is running or not, it will simply try to read the last X bytes of the file
 // and return them.
 func (e *Environment) Readlog(lines int) ([]string, error) {
-	r, err := e.client.ContainerLogs(context.Background(), e.Id, container.LogsOptions{
+	r, err := e.client.ContainerLogs(context.Background(), e.Id, client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Tail:       strconv.Itoa(lines),
@@ -404,9 +404,9 @@ func (e *Environment) ensureImageExists(image string) error {
 		log.WithField("registry", registry).Debug("using authentication for registry")
 	}
 
-	imagePullOptions := dockerImage.PullOptions{
-		All:      false,
-		Platform: runtime.GOOS + "/" + runtime.GOARCH,
+	imagePullOptions := client.ImagePullOptions{
+		All:       false,
+		Platforms: []ocispec.Platform{{OS: runtime.GOOS, Architecture: runtime.GOARCH}},
 	}
 	if registryAuth != nil {
 		b64, err := registryAuth.Base64()
@@ -419,12 +419,12 @@ func (e *Environment) ensureImageExists(image string) error {
 	}
 
 	fallbackToLocal := func(pullErr error) error {
-		images, err := e.client.ImageList(ctx, dockerImage.ListOptions{})
+		images, err := e.client.ImageList(ctx, client.ImageListOptions{})
 		if err != nil {
 			return errors.Wrap(err, "environment/docker: failed to list images")
 		}
 
-		for _, img := range images {
+		for _, img := range images.Items {
 			for _, tag := range img.RepoTags {
 				if tag != image {
 					continue
@@ -552,4 +552,30 @@ func formatDockerProgress(current, total int64, units string) string {
 		humanize.IBytes(uint64(current)),
 		humanize.IBytes(uint64(total)),
 	)
+}
+
+// MacvlanNetworkingConfig returns the endpoint configuration that pins a
+// container to ip on the named macvlan network. Wings only supports a single
+// network per server, so the server's default allocation IP is used.
+func MacvlanNetworkingConfig(networkName, ip, gateway string) (*network.NetworkingConfig, error) {
+	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if err != nil {
+		return nil, errors.Wrapf(err, "environment/docker: invalid macvlan IP address %q", ip)
+	}
+
+	settings := &network.EndpointSettings{
+		IPAMConfig: &network.EndpointIPAMConfig{IPv4Address: addr},
+		IPAddress:  addr,
+	}
+	if gateway = strings.TrimSpace(gateway); gateway != "" {
+		gw, err := netip.ParseAddr(gateway)
+		if err != nil {
+			return nil, errors.Wrapf(err, "environment/docker: invalid macvlan gateway %q", gateway)
+		}
+		settings.Gateway = gw
+	}
+
+	return &network.NetworkingConfig{
+		EndpointsConfig: map[string]*network.EndpointSettings{networkName: settings},
+	}, nil
 }

@@ -10,10 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/docker/docker/api/types"
-	dockerSystem "github.com/docker/docker/api/types/system" // Alias the correct system package
-	"github.com/docker/docker/pkg/parsers/kernel"
-	"github.com/docker/docker/pkg/parsers/operatingsystem"
+	dockerSystem "github.com/moby/moby/api/types/system" // Alias the correct system package
+	"github.com/moby/moby/client"
+
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
 	"github.com/pelican/wings/system"
@@ -30,10 +29,10 @@ func GenerateDiagnosticsReport(includeEndpoints bool, includeLogs bool, logLines
 	if dockerErr == nil {
 		fmt.Fprintln(output, "              Docker:", dockerVersion.Version)
 	}
-	if v, err := kernel.GetKernelVersion(); err == nil {
+	if v, err := system.KernelVersion(); err == nil {
 		fmt.Fprintln(output, "              Kernel:", v)
 	}
-	if os, err := operatingsystem.GetOperatingSystem(); err == nil {
+	if os, err := system.OperatingSystem(); err == nil {
 		fmt.Fprintln(output, "                  OS:", os)
 	}
 
@@ -109,20 +108,20 @@ func GenerateDiagnosticsReport(includeEndpoints bool, includeLogs bool, logLines
 	return output.String(), nil
 }
 
-func getDockerInfo() (types.Version, dockerSystem.Info, error) {
-	client, err := environment.Docker()
+func getDockerInfo() (client.ServerVersionResult, dockerSystem.Info, error) {
+	cli, err := environment.Docker()
 	if err != nil {
-		return types.Version{}, dockerSystem.Info{}, err
+		return client.ServerVersionResult{}, dockerSystem.Info{}, err
 	}
-	dockerVersion, err := client.ServerVersion(context.Background())
+	dockerVersion, err := cli.ServerVersion(context.Background(), client.ServerVersionOptions{})
 	if err != nil {
-		return types.Version{}, dockerSystem.Info{}, err
+		return client.ServerVersionResult{}, dockerSystem.Info{}, err
 	}
-	dockerInfo, err := client.Info(context.Background())
+	dockerInfo, err := cli.Info(context.Background(), client.InfoOptions{})
 	if err != nil {
-		return types.Version{}, dockerSystem.Info{}, err
+		return client.ServerVersionResult{}, dockerSystem.Info{}, err
 	}
-	return dockerVersion, dockerInfo, nil
+	return dockerVersion, dockerInfo.Info, nil
 }
 
 func redactField(s string, include bool) string {

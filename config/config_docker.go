@@ -2,13 +2,15 @@ package config
 
 import (
 	"encoding/base64"
+	"net/netip"
 	"net/url"
 	"sort"
-	"strings"		
+	"strings"
 
+	"github.com/apex/log"
 	"github.com/distribution/reference"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/registry"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/registry"
 	"github.com/goccy/go-json"
 )
 
@@ -43,6 +45,21 @@ type DockerNetworkConfiguration struct {
 	EnableICC  bool                    `default:"true" yaml:"enable_icc"`
 	NetworkMTU int64                   `default:"1500" yaml:"network_mtu"`
 	Interfaces dockerNetworkInterfaces `yaml:"interfaces"`
+}
+
+// DnsAddrs returns the configured DNS servers as addresses for the Docker API.
+// Entries that are not valid IP addresses are logged and skipped.
+func (c DockerNetworkConfiguration) DnsAddrs() []netip.Addr {
+	out := make([]netip.Addr, 0, len(c.Dns))
+	for _, v := range c.Dns {
+		addr, err := netip.ParseAddr(strings.TrimSpace(v))
+		if err != nil {
+			log.WithField("dns", v).WithField("error", err).Warn("skipping invalid DNS server in docker network configuration")
+			continue
+		}
+		out = append(out, addr)
+	}
+	return out
 }
 
 // DockerConfiguration defines the docker configuration used by the daemon when
