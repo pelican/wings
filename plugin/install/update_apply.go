@@ -443,10 +443,18 @@ func (x *extractor) createLinks() error {
 	return nil
 }
 
+// maxEntryNameBytes caps an archive entry's name, PATH_MAX on Linux.
+const maxEntryNameBytes = 4096
+
 // entryName turns an archive path into a clean, slash-separated name relative
 // to the extraction root, refusing absolute paths and ".." (zip-slip). The
 // os.Root writes would refuse those anyway; this gives a clearer error.
 func entryName(nameInArchive string) (string, error) {
+	// Longer names can't be created on Linux anyway (PATH_MAX), and refusing
+	// them here bounds how deep mkdirs recurses for one entry.
+	if len(nameInArchive) > maxEntryNameBytes {
+		return "", fmt.Errorf("plugin: archive entry name is longer than %d bytes", maxEntryNameBytes)
+	}
 	n := filepath.ToSlash(nameInArchive)
 	if path.IsAbs(n) {
 		return "", fmt.Errorf("plugin: archive entry escapes destination: %q", nameInArchive)

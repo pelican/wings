@@ -392,3 +392,18 @@ func TestUpdateLeavesThePluginDataDirectoryAlone(t *testing.T) {
 		t.Fatalf("the update touched the data directory: %q", got)
 	}
 }
+
+// TestExtractArchiveRefusesOverlongNames covers an entry whose name nests
+// thousands of directories: creating them recursed once per level, rescanning
+// the rest of the path each time, before any limit applied.
+func TestExtractArchiveRefusesOverlongNames(t *testing.T) {
+	deep := strings.Repeat("a/", 100_000) + "file"
+	dest := t.TempDir()
+	err := extractArchive(context.Background(), writeTar(t, []tarEntry{{name: deep, typ: tar.TypeReg, body: "x"}}), dest)
+	if err == nil || !strings.Contains(err.Error(), "name is longer than") {
+		t.Fatalf("an entry name of %d bytes must be refused up front, got %v", len(deep), err)
+	}
+	if entries, _ := os.ReadDir(dest); len(entries) != 0 {
+		t.Fatalf("nothing should be created for a refused entry, found %d entries", len(entries))
+	}
+}
