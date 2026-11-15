@@ -75,22 +75,33 @@ func (a *Allocations) DockerBindings() nat.PortMap {
 	// Loop over all the bindings for this container, and convert any that reference 127.0.0.1
 	// to use the pelican0 network interface IP, as that is the true local for what people are
 	// trying to do when creating servers.
+	ispn := config.Get().Docker.Network.ISPN
 	for p, binds := range out {
-		for i, alloc := range binds {
+		// Filter into a fresh slice: deleting from binds while ranging over it
+		// skips the element that slides into the deleted slot.
+		kept := make([]nat.PortBinding, 0, len(binds))
+		for _, alloc := range binds {
 			if alloc.HostIP != "127.0.0.1" {
+				kept = append(kept, alloc)
 				continue
 			}
 
 			// If using ISPN just delete the local allocation from the server.
-			if config.Get().Docker.Network.ISPN {
-				out[p] = append(out[p][:i], out[p][i+1:]...)
-			} else {
-				out[p][i] = nat.PortBinding{
-					HostIP:   iface,
-					HostPort: alloc.HostPort,
-				}
+			if ispn {
+				continue
 			}
+			kept = append(kept, nat.PortBinding{
+				HostIP:   iface,
+				HostPort: alloc.HostPort,
+			})
 		}
+		// Docker treats a port with an empty binding list as "publish on a random
+		// host port", which would expose an ISPN loopback allocation publicly.
+		if len(kept) == 0 {
+			delete(out, p)
+			continue
+		}
+		out[p] = kept
 	}
 
 	return out
