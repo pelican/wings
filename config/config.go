@@ -441,6 +441,11 @@ type PluginConfiguration struct {
 	// TrustedKeys are the base64 Ed25519 public keys (optionally "id:key")
 	// permitted to sign plugin archives.
 	TrustedKeys []string `json:"trusted_keys" yaml:"trusted_keys"`
+	// RunAsRoot starts external plugin processes as root when Wings runs as
+	// root. By default they run as system.user, with that user's access to
+	// the machine, never as root. Like the rest of this block, only the node
+	// operator sets it (in this file); a Panel config push can't.
+	RunAsRoot bool `json:"run_as_root" yaml:"run_as_root"`
 }
 
 // PluginRegistry describes a plugin registry index and optional auth for private

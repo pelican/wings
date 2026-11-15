@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/apex/log"
@@ -72,15 +73,9 @@ func (c *Client) ensureSession(ctx context.Context) (*jsonrpc.Conn, error) {
 	}
 	c.lastSpawn = time.Now()
 
-	argv := c.manifest.Entrypoint
-	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Dir = c.manifest.Dir()
-	cmd.Env = append(os.Environ(), "WINGS_PLUGIN=1")
-	if dir := c.manifest.DataDir(); dir != "" {
-		if err := os.MkdirAll(dir, 0o700); err != nil {
-			return nil, fmt.Errorf("plugin %q: creating data directory: %w", c.manifest.Name, err)
-		}
-		cmd.Env = append(cmd.Env, "WINGS_PLUGIN_DATA="+dir)
+	cmd, err := c.command()
+	if err != nil {
+		return nil, err
 	}
 
 	stdin, err := cmd.StdinPipe()
@@ -116,6 +111,59 @@ func (c *Client) ensureSession(ctx context.Context) (*jsonrpc.Conn, error) {
 	c.conn = conn
 	log.WithField("plugin", c.manifest.Name).Info("external plugin initialized")
 	return conn, nil
+}
+
+// command builds the plugin's process: in its own directory, with its data
+// directory ready, and as the user plugins run as (plugin.ExternalProcessUser).
+// When Wings is root that is system.user, and the plugin's own files must be
+// read-only to it.
+func (c *Client) command() (*exec.Cmd, error) {
+	u, err := plugin.ExternalProcessUser()
+	if err != nil {
+		return nil, fmt.Errorf("plugin %q: %w", c.manifest.Name, err)
+	}
+	argv := c.manifest.Entrypoint
+	cmd := exec.Command(argv[0], argv[1:]...)
+	cmd.Dir = c.manifest.Dir()
+	cmd.Env = append(os.Environ(), "WINGS_PLUGIN=1")
+	dir := c.manifest.DataDir()
+	if dir != "" {
+		if err := plugin.PrepareDataDir(dir, u); err != nil {
+			return nil, fmt.Errorf("plugin %q: preparing data directory: %w", c.manifest.Name, err)
+		}
+		cmd.Env = append(cmd.Env, "WINGS_PLUGIN_DATA="+dir)
+	}
+	if !u.Switch {
+		return cmd, nil
+	}
+	if err := plugin.CheckReadOnlyTo(c.manifest.Dir(), u); err != nil {
+		return nil, fmt.Errorf("plugin %q: %w", c.manifest.Name, err)
+	}
+	// No supplementary groups: root's would otherwise carry over.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{
+		Uid: uint32(u.Uid), Gid: uint32(u.Gid), Groups: []uint32{},
+	}}
+	// Root's HOME isn't the plugin's; its data directory is the one place it
+	// can write.
+	home := dir
+	if home == "" {
+		home = "/"
+	}
+	cmd.Env = setEnv(cmd.Env, "HOME", home)
+	cmd.Env = setEnv(cmd.Env, "USER", u.Name)
+	cmd.Env = setEnv(cmd.Env, "LOGNAME", u.Name)
+	return cmd, nil
+}
+
+// setEnv sets key=value in env, replacing any earlier value.
+func setEnv(env []string, key, value string) []string {
+	out := env[:0:0]
+	for _, kv := range env {
+		if !strings.HasPrefix(kv, key+"=") {
+			out = append(out, kv)
+		}
+	}
+	return append(out, key+"="+value)
 }
 
 // EventListener returns a plugin.EventListener backed by this client. Events are

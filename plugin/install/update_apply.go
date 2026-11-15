@@ -88,6 +88,11 @@ func mkdirHidden(root *os.Root, prefix string) (string, error) {
 		name := prefix + hex.EncodeToString(b)
 		err := root.Mkdir(name, 0o755)
 		if err == nil {
+			// It becomes the plugin's directory (see pluginMode).
+			if err := root.Chmod(name, pluginMode); err != nil {
+				_ = root.Remove(name)
+				return "", err
+			}
 			return name, nil
 		}
 		if !errors.Is(err, fs.ErrExist) {
@@ -313,6 +318,12 @@ func extractArchive(ctx context.Context, archivePath, dest string) error {
 	return x.createLinks()
 }
 
+// pluginMode is the mode of every file and directory extracted from a plugin
+// archive, set explicitly so the umask can't change it. Wings extracts as
+// root and the plugin runs as system.user (plugin.ExternalProcessUser), which
+// must be able to read and run the plugin's files but not change them.
+const pluginMode = 0o755
+
 // extractor writes one archive into root, enforcing the extraction limits.
 type extractor struct {
 	root *os.Root
@@ -380,11 +391,14 @@ func (x *extractor) writeFile(name string, af archives.FileInfo) error {
 		return err
 	}
 	defer r.Close()
-	out, err := x.root.OpenFile(name, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0o755)
+	out, err := x.root.OpenFile(name, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, pluginMode)
 	if err != nil {
 		return err
 	}
 	defer out.Close()
+	if err := out.Chmod(pluginMode); err != nil {
+		return err
+	}
 	limit := min(int64(maxUpdateFileBytes), x.remaining)
 	n, err := copyLimited(out, r, limit)
 	x.remaining -= n
@@ -417,7 +431,10 @@ func (x *extractor) mkdirs(dir string) error {
 		if err := x.create(); err != nil {
 			return err
 		}
-		if err := x.root.Mkdir(dir, 0o755); err != nil {
+		if err := x.root.Mkdir(dir, pluginMode); err != nil {
+			return err
+		}
+		if err := x.root.Chmod(dir, pluginMode); err != nil {
 			return err
 		}
 	default:
