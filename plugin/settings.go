@@ -1,6 +1,7 @@
 package plugin
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
 	"encoding/json"
@@ -204,6 +205,10 @@ func checkSettingValue(s Setting, v any) error {
 	return nil
 }
 
+// ErrSettingsTooLarge means the values, encoded, are larger than a settings
+// file may be. Nothing was written.
+var ErrSettingsTooLarge = errors.New("plugin: the settings are too large to store")
+
 // SettingsError lists what is wrong with a set of values, by setting key.
 type SettingsError map[string]string
 
@@ -386,9 +391,18 @@ func saveSettingsLocked(m Manifest, values map[string]any) error {
 	if err := ValidateSettings(m, values); err != nil {
 		return err
 	}
-	b, err := json.MarshalIndent(values, "", "  ")
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false) // "<" stays one byte, not six
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(values); err != nil {
 		return err
+	}
+	b := buf.Bytes()
+	// Each value is within its own cap, but together they can exceed what
+	// LoadSettings reads; such a file could never be read or repaired.
+	if len(b) > maxSettingsFileBytes {
+		return fmt.Errorf("%w: %d bytes encoded, at most %d", ErrSettingsTooLarge, len(b), maxSettingsFileBytes)
 	}
 	root, dataDir, file, err := settingsLocation(m)
 	if err != nil {

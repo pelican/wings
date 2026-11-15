@@ -2,8 +2,11 @@ package plugin
 
 import (
 	"encoding/json"
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -226,4 +229,32 @@ func mustLoad(t *testing.T, m Manifest) map[string]any {
 		t.Fatal(err)
 	}
 	return v
+}
+
+// Values that each pass validation can still add up, once encoded, to more
+// than LoadSettings reads. Saving them must fail and keep the stored values,
+// or the plugin's settings could never be read or repaired again.
+func TestSaveSettingsRefusesAFileOverTheCap(t *testing.T) {
+	var body strings.Builder
+	body.WriteString("apiVersion: v1\nname: notify\ncapability: events\nentrypoint: [\"./notify\"]\nsettings:\n")
+	values := map[string]any{}
+	for i := 0; i < 20; i++ {
+		key := fmt.Sprintf("s%d", i)
+		fmt.Fprintf(&body, "  - key: %s\n    type: string\n", key)
+		values[key] = strings.Repeat("x", maxSettingValueBytes)
+	}
+	m := writeSettingsManifest(t, body.String())
+	if err := SaveSettings(m, map[string]any{"s0": "kept"}); err != nil {
+		t.Fatal(err)
+	}
+	err := SaveSettings(m, values)
+	if !errors.Is(err, ErrSettingsTooLarge) {
+		t.Fatalf("SaveSettings = %v, want ErrSettingsTooLarge", err)
+	}
+	if got := mustLoad(t, m); got["s0"] != "kept" {
+		t.Fatalf("stored values = %v, want the previous ones kept", got)
+	}
+	if _, err := UpdateSettings(m, values); !errors.Is(err, ErrSettingsTooLarge) {
+		t.Fatalf("UpdateSettings = %v, want ErrSettingsTooLarge", err)
+	}
 }

@@ -553,6 +553,9 @@ func putPluginSettings(c *gin.Context) {
 	case errors.As(err, &bad):
 		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{"error": bad.Error(), "fields": bad})
 		return
+	case errors.Is(err, plugin.ErrSettingsTooLarge):
+		c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{"error": err.Error()})
+		return
 	case err != nil:
 		abortInternal(c, err)
 		return
