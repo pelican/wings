@@ -140,7 +140,7 @@ Central policy lives in `config.yml` (operator-owned, tiny):
 
 ```yaml
 plugins:
-  directory: /var/lib/pelican/plugins   # where external plugins live
+  directory: /var/lib/pelican-plugins   # where external plugins live
   autoload: true                        # discovered plugins run unless disabled
   disabled: []                          # exceptions
   grants: {}                            # per-plugin host-capability overrides
@@ -241,9 +241,12 @@ Wings."
 groups and `HOME` set to their data directory. The plugin's own directory is
 read-only to that user: Wings installs plugin files as root with mode 0755, and
 refuses to start a plugin when that user owns, or can write, any of its files or
-any directory above them. The data directory is owned by that user; Wings gives
-it (and files an earlier version left owned by root) to that user before each
-start, skipping symlinks and hard-linked files. The operator can opt out with
+any directory above them, or can't enter one of those directories. The default
+`plugins.directory`, `/var/lib/pelican-plugins`, sits outside
+`system.root_directory` (`/var/lib/pelican`), which Wings creates with mode
+0700. The data directory is owned by that user; Wings gives it (and files an
+earlier version left owned by root) to that user before each start, skipping
+symlinks and hard-linked files. The operator can opt out with
 `plugins.run_as_root: true` in `config.yml` (a Panel config push can't set it).
 When Wings itself is not root (rootless, or a developer machine), plugins run as
 that same user. Native plugins run inside Wings, as Wings' user.

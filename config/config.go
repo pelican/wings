@@ -415,7 +415,9 @@ type Configuration struct {
 // (plugin.yaml) in Directory; native providers register themselves in code.
 type PluginConfiguration struct {
 	// Directory is scanned for external plugin manifests during discovery.
-	Directory string `default:"/var/lib/pelican/plugins" json:"directory" yaml:"directory"`
+	// It's outside RootDirectory, which is created 0700: external plugins run
+	// as system.user and must be able to reach their own directory.
+	Directory string `default:"/var/lib/pelican-plugins" json:"directory" yaml:"directory"`
 	// Autoload activates every registered/discovered provider when Enabled is
 	// empty. Set it to false alongside an explicit Enabled allowlist to lock the
 	// system down.

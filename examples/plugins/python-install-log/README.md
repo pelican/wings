@@ -10,7 +10,7 @@ it under the plugin's name) and to `installs.log` in its data directory (`$WINGS
 ## Install
 
 ```bash
-cp -r . /var/lib/pelican/plugins/install-log
+cp -r . /var/lib/pelican-plugins/install-log
 wings plugins trust install-log   # shows what it is (source, runs as system.user) and asks to approve
 ```
 

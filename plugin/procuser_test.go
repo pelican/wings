@@ -7,6 +7,8 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+
+	"github.com/pelican/wings/config"
 )
 
 func TestExternalProcessUserIsWingsOwnUserWhenNotRoot(t *testing.T) {
@@ -159,5 +161,66 @@ func TestProcessUserIDsRefusesOutOfRange(t *testing.T) {
 		if _, _, err := u.IDs(); err == nil {
 			t.Errorf("%s: an out-of-range id must be refused", u.Name)
 		}
+	}
+}
+
+// TestCheckReachableByRefusesADirectoryTheUserCannotEnter covers a fresh
+// install, where Wings creates its root directory with mode 0700: the plugin's
+// user can't enter it, so a plugins directory inside it is out of reach and
+// exec fails with a bare "permission denied".
+func TestCheckReachableByRefusesADirectoryTheUserCannotEnter(t *testing.T) {
+	other := ProcessUser{Name: "other", Uid: 2147483000, Gid: 2147483000}
+	base := t.TempDir()
+	dir := filepath.Join(base, "plugins", "demo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(base, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	err := CheckReachableBy(dir, other)
+	if err == nil || !strings.Contains(err.Error(), "can't be entered by other") {
+		t.Fatalf("a 0700 directory above the plugin must be refused, got %v", err)
+	}
+
+	// t.TempDir's directories are 0700.
+	for _, d := range []string{filepath.Dir(base), base} {
+		if err := os.Chmod(d, 0o711); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if CheckReachableBy(filepath.Dir(base), other) != nil {
+		t.Skip("a directory above the test's temporary directory can't be entered by other users here")
+	}
+	if err := CheckReachableBy(dir, other); err != nil {
+		t.Fatalf("search permission alone is enough to reach the plugin: %v", err)
+	}
+	// The owner's bits count for the owner, the group's for the group.
+	me := ProcessUser{Name: "me", Uid: os.Getuid(), Gid: os.Getgid()}
+	if err := os.Chmod(base, 0o701); err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckReachableBy(dir, me); err != nil {
+		t.Fatalf("the owner's own search bit lets it in: %v", err)
+	}
+	// On BSD and macOS a new directory takes its parent's group, not ours.
+	if err := os.Chown(base, -1, os.Getgid()); err != nil {
+		t.Fatal(err)
+	}
+	group := ProcessUser{Name: "grouped", Uid: 2147483000, Gid: os.Getgid()}
+	if err := CheckReachableBy(dir, group); err == nil {
+		t.Fatal("the group's bits apply to a group member, not the other bits")
+	}
+}
+
+func TestDefaultPluginsDirectoryIsOutsideTheRootDirectory(t *testing.T) {
+	c, err := config.NewAtPath(filepath.Join(t.TempDir(), "config.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel, err := filepath.Rel(c.System.RootDirectory, c.Plugins.Directory)
+	if err != nil || !strings.HasPrefix(rel, "..") {
+		t.Fatalf("plugins.directory %s is inside system.root_directory %s, which Wings creates 0700, so plugins running as system.user can't reach it",
+			c.Plugins.Directory, c.System.RootDirectory)
 	}
 }

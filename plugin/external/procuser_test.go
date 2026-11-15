@@ -194,3 +194,23 @@ func statT(t *testing.T, path string) *syscall.Stat_t {
 	}
 	return info.Sys().(*syscall.Stat_t)
 }
+
+// TestPluginInAnUnreachableDirectoryIsRefusedClearly: Wings creates its root
+// directory 0700, so a plugins directory inside it can't be entered by
+// system.user. The plugin must be refused with a message that says so, not
+// fail in exec with "permission denied".
+func TestPluginInAnUnreachableDirectoryIsRefusedClearly(t *testing.T) {
+	requireRoot(t)
+	setTestConfig(func(c *config.Configuration) { c.System.User.Uid, c.System.User.Gid = nobody, nobody })
+	t.Cleanup(func() { setTestConfig(func(c *config.Configuration) { c.Plugins.RunAsRoot = true }) })
+	m := reportingPlugin(t)
+	private := filepath.Dir(filepath.Dir(m.Dir()))
+	if err := os.Chmod(private, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	err := runOnce(m)
+	if err == nil || !strings.Contains(err.Error(), "can't be entered") || !strings.Contains(err.Error(), private) {
+		t.Fatalf("expected a refusal naming %s, got %v", private, err)
+	}
+}

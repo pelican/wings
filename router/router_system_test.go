@@ -73,7 +73,7 @@ func TestPostUpdateConfigurationKeepsPluginPolicy(t *testing.T) {
 	if err := cfg.ResolveToken(false); err != nil {
 		t.Fatal(err)
 	}
-	cfg.Plugins.Directory = "/var/lib/pelican/plugins"
+	cfg.Plugins.Directory = "/var/lib/pelican-plugins"
 	cfg.Plugins.Disabled = []string{"blocked"}
 	cfg.Plugins.RequireSignatures = true
 	config.Set(cfg)
@@ -98,7 +98,7 @@ func TestPostUpdateConfigurationKeepsPluginPolicy(t *testing.T) {
 		t.Fatalf("expected the update to be applied, got status %d: %s", recorder.Code, recorder.Body.String())
 	}
 	got := config.Get().Plugins
-	if got.Directory != "/var/lib/pelican/plugins" || len(got.Disabled) != 1 || !got.RequireSignatures {
+	if got.Directory != "/var/lib/pelican-plugins" || len(got.Disabled) != 1 || !got.RequireSignatures {
 		t.Fatalf("a configuration push changed plugin policy: %+v", got)
 	}
 }
