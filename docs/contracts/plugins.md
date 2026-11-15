@@ -1,10 +1,10 @@
 # Contract: plugins across Wings and Panel
 
-**Contract v3, 2026-11-15.** Source of truth for plugin interfaces shared by pelican/wings and pelican/panel.
+**Contract v3.1, 2026-11-15.** Source of truth for plugin interfaces shared by pelican/wings and pelican/panel.
 Owner: Alexandru Vlad (Scai). Sections: R (registry format), L (Panel access levels), A (Wings plugin HTTP
 API for the Panel).
 
-Work against this contract, as of v3:
+Work against this contract, as of v3.1:
 - pelican/wings PR 251 (stacked on PR 250), branch `scai/plugin-panel-api`: sections R (Wings side), L, A.
 - pelican/panel PR 2785, branch `scai/plugin-registries`: section R for Panel plugins.
 - pelican/panel PR 2786, branch `scai/wings-plugins-contract` (builds on pelican/panel PR 2701): sections L, A.
@@ -65,7 +65,7 @@ a company server) or a site that generates it (the Pelican Hub, planned at
 |---|---|---|---|
 | `name` (document) | string | no | Display name of the registry. |
 | `plugins` | array | yes | Entries. An empty array is valid. Never `null`. |
-| `name` | string | yes | Plugin identifier. Must equal the `name` (Wings `plugin.yaml`) or `id` (Panel `plugin.json`) inside the archive; install fails otherwise. Must not be empty, start with `.`, contain `/`, `\` or `..`. |
+| `name` | string | yes | Plugin identifier. Must equal the `name` (Wings `plugin.yaml`) or `id` (Panel `plugin.json`) inside the archive; install fails otherwise. Must not be empty, start with `.`, contain `/`, `\` or `..`. For Wings plugins, `available` is reserved (the path of `GET /api/plugins/available`) and refused. |
 | `version` | string | yes | Version of the archive at `download`. Compared numerically per dot-separated part, leading `v` ignored (`1.10.0` > `1.9.2`). |
 | `target` | `"wings"` \| `"panel"` | no | Which side installs this entry. **Missing means `"wings"`** (registries written before v1). Each side ignores entries for the other side, and entries with a `target` it doesn't know, including for bare-name lookups (R3). |
 | `capability` | string | no | Wings only (`"events"` today). When present it must match the archive's manifest. |
@@ -95,6 +95,10 @@ Unknown fields are ignored by both sides (forward compatible). Maximum document 
    on that side: registries, update manifests, the Pelican Hub, URL imports and uploaded archives. Wherever a
    source offers a signature (registry entry, update manifest, Hub release), it is carried through to the
    check.
+6. Default trusted keys: none today. **Once the Pelican Hub signs its releases, its public key ships as a
+   default trusted key on both sides** (owner decision, 2026-11-15), so Hub releases verify without per-node
+   setup. Operators can remove it. Until then a Hub `signature` would fail on every node, so the Hub must not
+   start signing before Wings and the Panel ship the key.
 
 ### R3. Choosing a registry
 
@@ -154,7 +158,7 @@ this section disagree, this section wins and the document is a bug.
 | 400 | bad id, body or query |
 | 403 | the node's access level (L) doesn't allow it; body adds `"panel_access": "<level>"`, `"required": "<level>"` |
 | 404 | on `GET /api/plugins`: this node's Wings has no plugin API. On any `/api/plugins/{id}...`: no such plugin or file (JSON `{"error"}`). Clients decide "API missing" from the list call only. |
-| 409 | wrong state (enable an untrusted plugin, install an installed one), or an approval token unknown, used, expired or sent to another endpoint |
+| 409 | wrong state (enable an untrusted plugin, install an installed one, check updates of an untrusted plugin), or an approval token unknown, used, expired or sent to another endpoint. Body may add `"reason"`: `"token"` (approval token problem), `"destination_changed"` (A4), `"untrusted"` |
 | 413 | body or file over its cap |
 | 422 | settings that don't validate (body adds `"fields": {key: message}`); a registry, download, checksum, signature or archive that was refused |
 | 429 | 16 installs already waiting for approval on this node |
@@ -166,7 +170,7 @@ this section disagree, this section wins and the document is a bug.
 |---|---|---|
 | `GET /api/plugins` | view | `{"enabled": true, "directory": string, "panel_access": level, "data": [Plugin], "error"?: string}`. `panel_access` is always present; `enabled` is always `true` (reserved) |
 | `GET /api/plugins/available` | signed | `{"data": [Available], "errors": {"<namespace>": "<message>"}}`: the `target: "wings"` entries of every configured registry (A3.2); a registry that couldn't be read is in `errors`, not a failure of the call |
-| `GET /api/plugins/{id}/update-check` | view | `{"installed": string, "latest": string\|null, "available": bool, "error"?: string}`: reads the plugin's update URL without staging anything. No update URL: `latest: null`, `available: false`. A failed fetch: 200 with `error` set and `available: false` |
+| `GET /api/plugins/{id}/update-check` | view | `{"installed": string, "latest": string\|null, "available": bool, "error"?: string}`: reads the plugin's update URL without staging anything. No update URL (or native): `latest: null`, `available: false`. A failed fetch: 200 with `error` set and `available: false`. An untrusted external plugin: 409 `reason: "untrusted"`, and nothing is fetched |
 | `GET /api/plugins/{id}` | view | Plugin |
 | `GET /api/plugins/{id}/source` | view | `{"files": [string], "truncated": bool}` (at most 5000) |
 | `GET /api/plugins/{id}/source?file=<path>` | view | `{"file", "size", "binary": bool, "content"?}` (at most 1 MiB; no `content` when binary) |
@@ -242,7 +246,9 @@ At approval Wings re-checks, under the install lock, against the node's **curren
 - the signature policy: the staged archive's signature against the current `trusted_keys` and
   `require_signatures`; if it no longer passes, 422;
 - the destination: if the installed plugin changed since staging (installed, removed or another version),
-  409. Stage again.
+  409 with `reason: "destination_changed"`. Stage again.
+
+An unknown, used or expired token is 409 with `reason: "token"`.
 
 ### A5. Changes take effect without a restart
 
@@ -279,3 +285,7 @@ order. `POST /api/plugins/order` answers 501; the Panel should not offer reorder
   without dots, and unsupported types/keys shown read-only; new `GET /api/plugins/available` and
   `GET /api/plugins/{id}/update-check`; `signed` means actually verified; approval re-checks the current
   signature policy and the destination (403/422/409).
+- v3.1 (2026-11-15, owner approved): the Wings plugin name `available` is reserved; `update-check` refuses
+  untrusted external plugins (409 `reason: "untrusted"`) and never fetches their URL; 409s may carry
+  `reason` (`token`, `destination_changed`, `untrusted`); R2.6 records that the Hub's signing key ships as a
+  default trusted key once the Hub signs releases.

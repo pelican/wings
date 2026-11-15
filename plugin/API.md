@@ -57,11 +57,11 @@ HTTP/1.1 403 Forbidden
 | `POST /api/plugins/import` | full | install from a URL or an upload, in two steps |
 
 `{id}` is the plugin's name. A name that can't be a plugin directory (empty,
-starting with `.`, holding `/`, `\` or `..`) is a 400; so
-`/api/plugins//uninstall` never reaches the plugins directory itself. An
-unknown name is a 404 with a JSON `{"error"}` body. A plugin named
-`available` can't be read with `GET /api/plugins/{id}`, which that route
-takes; it is still in the list.
+starting with `.`, holding `/`, `\` or `..`) or is reserved (`available`, the
+path of the available-plugins endpoint) is a 400; so `/api/plugins//uninstall`
+never reaches the plugins directory itself. An unknown name is a 404 with a
+JSON `{"error"}` body. Wings refuses to install or discover a plugin named
+`available`.
 
 Every change is logged with the action, the plugin and the remote address.
 
@@ -72,7 +72,7 @@ Errors are JSON, `{"error": "..."}`, with these statuses:
 | 400 | a bad id, body or query |
 | 403 | the access level does not allow it |
 | 404 | on `GET /api/plugins`: this Wings has no plugin API. On `/api/plugins/{id}...`: no such plugin, or no such file in `/source`. Decide "API missing" from the list call only. |
-| 409 | the plugin is in the wrong state (enable an untrusted plugin, install one that is already installed), an approval token is unknown, used, expired or sent to another endpoint, or the plugin's directory changed between staging and approval |
+| 409 | the plugin is in the wrong state (enable an untrusted plugin, install one that is already installed, check updates for an untrusted plugin), an approval token is unknown, used, expired or sent to another endpoint, or the plugin's directory changed between staging and approval. Some 409s add `"reason"`: `"token"`, `"destination_changed"` or `"untrusted"` |
 | 413 | a body, source file or settings file over its cap |
 | 422 | settings that don't validate; a registry, download, checksum, signature or archive that was refused |
 | 429 | 16 installs are already waiting for approval |
@@ -195,7 +195,8 @@ and compares versions, without downloading or staging anything:
 
 A plugin without an update URL (or a native one) gives `"latest": null,
 "available": false`. A fetch that fails is still a 200, with `error` set and
-`"available": false`.
+`"available": false`. An external plugin the node doesn't trust is a 409 with
+`"reason": "untrusted"`, and its update URL is never fetched.
 
 ### Source
 
