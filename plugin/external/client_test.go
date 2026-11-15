@@ -141,3 +141,44 @@ func TestDataDirWorksWithARelativePluginsDirectory(t *testing.T) {
 		t.Fatalf("the plugin did not write into <plugins>/.data/foo: %q %v", b, err)
 	}
 }
+
+// TestPluginGetsAMinimalEnvironment: the node token and anything else in
+// Wings' environment must not reach a plugin; a plugin with no host grants
+// could otherwise call the node's HTTP API with WINGS_TOKEN.
+func TestPluginGetsAMinimalEnvironment(t *testing.T) {
+	t.Setenv("WINGS_TOKEN", "node-secret")
+	t.Setenv("REGISTRY_TOKEN", "registry-secret")
+	t.Setenv("LANG", "C.UTF-8")
+	t.Setenv("HTTPS_PROXY", "http://proxy.example:3128")
+	dir := filepath.Join(t.TempDir(), "demo")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	manifest := "apiVersion: v1\nname: demo\ncapability: events\nentrypoint: [\"true\"]\n"
+	if err := os.WriteFile(filepath.Join(dir, plugin.ManifestFile), []byte(manifest), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	m, err := plugin.LoadManifest(filepath.Join(dir, plugin.ManifestFile))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd, err := NewClient(m, nil).command()
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := map[string]string{}
+	for _, kv := range cmd.Env {
+		k, v, _ := strings.Cut(kv, "=")
+		env[k] = v
+	}
+	for _, k := range []string{"WINGS_TOKEN", "REGISTRY_TOKEN"} {
+		if _, ok := env[k]; ok {
+			t.Errorf("%s reached the plugin", k)
+		}
+	}
+	for k, want := range map[string]string{"WINGS_PLUGIN": "1", "WINGS_PLUGIN_DATA": m.DataDir(), "LANG": "C.UTF-8", "HTTPS_PROXY": "http://proxy.example:3128", "PATH": os.Getenv("PATH")} {
+		if env[k] != want {
+			t.Errorf("%s = %q, want %q", k, env[k], want)
+		}
+	}
+}

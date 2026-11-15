@@ -54,7 +54,7 @@ Prefer running from source unless the node can't have Bun.
 ## Install into Wings
 
 Drop this directory under the configured plugins directory (default
-`/var/lib/pelican/plugins/`), then:
+`/var/lib/pelican-plugins/`), then:
 
 ```bash
 wings plugins list              # should show: state-log  external  stdio
@@ -64,8 +64,8 @@ wings plugins trust state-log   # shows what it is and asks to approve it before
 
 Wings launches the entrypoint lazily on the first matching event, as
 `system.user` when Wings runs as root (so this folder must be readable by that
-user, and it can't write here), with `WINGS_PLUGIN=1` set, the working directory
-set to this folder, and
+user, and it can't write here), with `WINGS_PLUGIN=1` set, a minimal environment
+(no `WINGS_TOKEN`), the working directory set to this folder, and
 `WINGS_PLUGIN_DATA` pointing at its data directory for any settings or state
 (this example keeps none).
 

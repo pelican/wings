@@ -19,7 +19,7 @@ publish its source (`source:` in `plugin.yaml`) and sign your releases (`wings p
 
 ```bash
 go build -o wings-plugin-statecount .        # inside this repo; elsewhere, a module that requires github.com/pelican/wings
-cp -r . /var/lib/pelican/plugins/statecount  # or package it and publish it to a registry
+cp -r . /var/lib/pelican-plugins/statecount  # or package it and publish it to a registry
 wings plugins trust statecount               # shows what it is (binary, runs as system.user) and asks to approve
 ```
 

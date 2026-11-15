@@ -57,8 +57,13 @@ func ExternalProcessUser() (ProcessUser, error) {
 		// The daemon fills these in at startup (config.EnsurePelicanUser);
 		// `wings plugins` commands don't, so look the user up by name.
 		if u, err := user.Lookup(c.System.Username); err == nil {
-			uid, _ = strconv.Atoi(u.Uid)
-			gid, _ = strconv.Atoi(u.Gid)
+			// 32 bits, the size of a Linux uid/gid.
+			if n, err := strconv.ParseUint(u.Uid, 10, 32); err == nil {
+				uid = int(n)
+			}
+			if n, err := strconv.ParseUint(u.Gid, 10, 32); err == nil {
+				gid = int(n)
+			}
 		}
 	}
 	if uid == 0 || gid == 0 {
@@ -254,6 +259,55 @@ func CheckReadOnlyTo(dir string, u ProcessUser) error {
 		}
 		return check(path, info, false)
 	})
+}
+
+// CheckReachableBy checks that u can enter dir and every directory above it,
+// on both the path as given and the real path. Wings creates its own root
+// directory (system.root_directory) with mode 0700, so a plugin directory
+// inside it can't be reached by system.user, and exec would fail with a bare
+// "permission denied". The owner's, group's or everyone's search bit applies,
+// as the kernel picks them; ACLs are not read.
+func CheckReachableBy(dir string, u ProcessUser) error {
+	dir, err := filepath.Abs(dir)
+	if err != nil {
+		return err
+	}
+	real, err := filepath.EvalSymlinks(dir)
+	if err != nil {
+		return err
+	}
+	check := func(from string) error {
+		for p := from; ; p = filepath.Dir(p) {
+			info, err := os.Stat(p)
+			if err != nil {
+				return err
+			}
+			if st, ok := info.Sys().(*syscall.Stat_t); ok {
+				perm := info.Mode().Perm()
+				var bit fs.FileMode = 0o001
+				switch {
+				case int(st.Uid) == u.Uid:
+					bit = 0o100
+				case int(st.Gid) == u.Gid:
+					bit = 0o010
+				}
+				if perm&bit == 0 {
+					return fmt.Errorf("plugin: %s (mode %04o) can't be entered by %s, the user the plugin runs as, so the plugin can't start; give that directory search permission (chmod o+x) or set plugins.directory outside it",
+						p, perm, u.Name)
+				}
+			}
+			if p == filepath.Dir(p) {
+				return nil
+			}
+		}
+	}
+	if err := check(dir); err != nil {
+		return err
+	}
+	if real != dir {
+		return check(real)
+	}
+	return nil
 }
 
 // ProcessDisclosure is the sentence every approval shows (contract S,
