@@ -78,13 +78,14 @@ func (a PanelAccess) Allows(act PanelAction) bool {
 
 // CurrentPanelAccess returns the level in effect: WINGS_PLUGIN_PANEL_ACCESS
 // if set, else plugins.panel_access. An unknown value is logged and treated
-// as "off", so a typo never grants more than intended.
+// as "off", so a typo never grants more than intended. Only a missing
+// plugins.panel_access means the default "view": the environment variable set
+// to "" is an unknown value, so it can't lift a node's "off" back to "view".
 func CurrentPanelAccess() PanelAccess {
 	raw, source := config.Get().Plugins.PanelAccess, "plugins.panel_access"
 	if env, ok := os.LookupEnv(PanelAccessEnv); ok {
 		raw, source = env, PanelAccessEnv
-	}
-	if raw == "" {
+	} else if raw == "" {
 		return PanelAccessView
 	}
 	a, err := ParsePanelAccess(raw)

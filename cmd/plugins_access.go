@@ -55,7 +55,7 @@ func runPanelAccess(out, errOut io.Writer, path string, args []string) error {
 		if envSet {
 			raw, source = env, plugin.PanelAccessEnv+" in this environment"
 		}
-		if raw == "" {
+		if raw == "" && !envSet {
 			source += ", not set: the default"
 		} else if _, err := plugin.ParsePanelAccess(raw); err != nil {
 			source += fmt.Sprintf(", which has the invalid value %q: refusing every Panel plugin request", raw)

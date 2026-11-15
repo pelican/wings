@@ -46,3 +46,21 @@ func TestCurrentPanelAccess(t *testing.T) {
 		t.Fatalf("an unknown level must mean off, got %q", got)
 	}
 }
+
+// WINGS_PLUGIN_PANEL_ACCESS set to "" is an override like any other value: it
+// must not fall back to the default "view" when config.yml says "off".
+func TestEmptyPanelAccessEnvFailsClosed(t *testing.T) {
+	c := setConfig(t)
+	p := c.Plugins
+	p.PanelAccess = "off"
+	ApplyPolicy(p)
+	t.Setenv(PanelAccessEnv, "")
+	if got := CurrentPanelAccess(); got != PanelAccessOff {
+		t.Fatalf("empty %s over panel_access: off = %q, want off", PanelAccessEnv, got)
+	}
+	p.PanelAccess = ""
+	ApplyPolicy(p)
+	if got := CurrentPanelAccess(); got != PanelAccessOff {
+		t.Fatalf("empty %s with no panel_access = %q, want off", PanelAccessEnv, got)
+	}
+}
