@@ -906,7 +906,8 @@ func postPluginUpdate(c *gin.Context) {
 }
 
 // postPluginUninstall disables a plugin, revokes its approval and, with
-// ?delete=true, removes its directory. Its data directory is kept.
+// ?delete=true, removes the directory its manifest is in. Its data directory
+// is kept.
 func postPluginUninstall(c *gin.Context) {
 	if !allowPlugins(c, plugin.ActionInstallSigned) {
 		return
@@ -932,6 +933,14 @@ func postPluginUninstall(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "native plugins ship with Wings and can't be uninstalled; disable it instead"})
 		return
 	}
+	var dirName string
+	if deleteFiles {
+		var err error
+		if dirName, err = pluginDirName(info); err != nil {
+			c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": err.Error()})
+			return
+		}
+	}
 	if _, err := config.UpdatePluginsOnDisk(config.Get(), func(p *config.PluginConfiguration) {
 		install.Toggle(p, id, false)
 	}); err != nil {
@@ -948,13 +957,38 @@ func postPluginUninstall(c *gin.Context) {
 		return
 	}
 	if deleteFiles {
-		if err := install.Remove(config.Get().Plugins.Directory, id); err != nil {
+		if err := install.Remove(config.Get().Plugins.Directory, dirName); err != nil {
 			abortInternal(c, fmt.Errorf("deleting files (the plugin is disabled and untrusted): %w", err))
 			return
 		}
 	}
 	logPluginChange(c, "uninstall", id).WithField("deleted", deleteFiles).Info("plugin changed through the Panel API")
 	c.JSON(http.StatusOK, gin.H{"status": "uninstalled", "deleted": deleteFiles})
+}
+
+// pluginDirName returns the name, inside the plugins directory, of the
+// directory holding info's manifest. Discovery accepts a plugin in a directory
+// of any name ("notify" in notify-main), so it is not always the plugin's
+// name, and removing <plugins>/<name> could miss the plugin or hit something
+// else. A manifest that isn't directly in a sub directory of the plugins
+// directory is refused.
+func pluginDirName(info plugin.ProviderInfo) (string, error) {
+	if info.Manifest == "" {
+		return "", fmt.Errorf("plugin %q has no directory to delete", info.Name)
+	}
+	pluginsDir, err := filepath.Abs(config.Get().Plugins.Directory)
+	if err != nil {
+		return "", err
+	}
+	dir, err := filepath.Abs(filepath.Dir(info.Manifest))
+	if err != nil {
+		return "", err
+	}
+	name := filepath.Base(dir)
+	if filepath.Dir(dir) != pluginsDir || plugin.InvalidName(name) {
+		return "", fmt.Errorf("plugin %q is not in its own directory under %s; not deleting %s", info.Name, pluginsDir, dir)
+	}
+	return name, nil
 }
 
 // postPluginImport installs from any https URL ({"url": ...}) or an uploaded

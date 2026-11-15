@@ -814,3 +814,27 @@ func TestPluginAPIUpdateNeedsApproval(t *testing.T) {
 		t.Fatalf("update when current: %d %s", rec.Code, rec.Body)
 	}
 }
+
+// A plugin's directory need not be named after it. delete=true removes the
+// directory its manifest is in, and nothing that merely has its name.
+func TestPluginAPIUninstallDeletesTheDirectoryHoldingTheManifest(t *testing.T) {
+	a := newPluginAPI(t, string(plugin.PanelAccessSigned))
+	a.writePlugin("notify-main", strings.ReplaceAll(strings.Split(alphaManifest, "settings:")[0], "alpha", "notify"))
+	unrelated := filepath.Join(a.dir, "notify")
+	if err := os.MkdirAll(unrelated, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(unrelated, "keep.txt"), []byte("not a plugin"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rec, body := a.json(http.MethodPost, "/api/plugins/notify/uninstall?delete=true", "")
+	if rec.Code != http.StatusOK || body["deleted"] != true {
+		t.Fatalf("uninstall: %d %s", rec.Code, rec.Body)
+	}
+	if _, err := os.Stat(filepath.Join(a.dir, "notify-main")); !os.IsNotExist(err) {
+		t.Fatalf("the plugin's own directory was kept: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(unrelated, "keep.txt")); err != nil {
+		t.Fatalf("a directory that only has the plugin's name was removed: %v", err)
+	}
+}
