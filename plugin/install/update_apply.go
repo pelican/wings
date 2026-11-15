@@ -1,4 +1,4 @@
-package plugin
+package install
 
 import (
 	"context"
@@ -16,6 +16,8 @@ import (
 
 	"github.com/mholt/archives"
 	"golang.org/x/sys/unix"
+
+	"github.com/pelican/wings/plugin"
 )
 
 // ApplyUpdate downloads the archive named in a prior CheckUpdate, verifies its
@@ -160,8 +162,8 @@ func (s *StagedInstall) unlock() {
 }
 
 // Manifest loads the staged plugin manifest without executing plugin code.
-func (s *StagedInstall) Manifest() (Manifest, error) {
-	return LoadManifest(filepath.Join(s.StagingDir, ManifestFile))
+func (s *StagedInstall) Manifest() (plugin.Manifest, error) {
+	return plugin.LoadManifest(filepath.Join(s.StagingDir, plugin.ManifestFile))
 }
 
 // Commit moves StagingDir into place as DestDir. The previous version is kept

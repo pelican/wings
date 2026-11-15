@@ -1,4 +1,4 @@
-package plugin
+package install
 
 import (
 	"context"
@@ -11,6 +11,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/pelican/wings/plugin"
 )
 
 // Size and time limits for update fetches. The archive cap is deliberately
@@ -78,7 +80,7 @@ type UpdateStatus struct {
 
 // CheckUpdate fetches the plugin's update manifest and reports whether a newer
 // version is published. It performs no writes.
-func CheckUpdate(ctx context.Context, m Manifest) (UpdateStatus, error) {
+func CheckUpdate(ctx context.Context, m plugin.Manifest) (UpdateStatus, error) {
 	if m.Update == "" {
 		return UpdateStatus{}, fmt.Errorf("plugin %q declares no update URL", m.Name)
 	}

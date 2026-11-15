@@ -1,4 +1,4 @@
-package plugin
+package install
 
 import (
 	"archive/tar"
@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/pelican/wings/plugin"
 )
 
 func TestCopyLimitedRejectsOversizedInput(t *testing.T) {
@@ -376,7 +378,7 @@ func TestExtractArchiveRefusesARegularFileNamedDot(t *testing.T) {
 func TestUpdateLeavesThePluginDataDirectoryAlone(t *testing.T) {
 	dir := t.TempDir()
 	pluginDir(t, filepath.Join(dir, "foo"), "foo v1")
-	pluginDir(t, filepath.Join(dir, DataDirName, "foo"), "operator settings")
+	pluginDir(t, filepath.Join(dir, plugin.DataDirName, "foo"), "operator settings")
 	pluginDir(t, filepath.Join(dir, ".wings-install-1"), "foo v2")
 
 	stage := &StagedInstall{DestDir: filepath.Join(dir, "foo"), StagingDir: filepath.Join(dir, ".wings-install-1")}
@@ -386,7 +388,7 @@ func TestUpdateLeavesThePluginDataDirectoryAlone(t *testing.T) {
 	if err := stage.Finish(); err != nil {
 		t.Fatal(err)
 	}
-	if got := readID(t, filepath.Join(dir, DataDirName, "foo")); got != "operator settings" {
+	if got := readID(t, filepath.Join(dir, plugin.DataDirName, "foo")); got != "operator settings" {
 		t.Fatalf("the update touched the data directory: %q", got)
 	}
 }

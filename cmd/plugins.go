@@ -13,8 +13,10 @@ import (
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/plugin"
+
 	// Link the native plugins so they register and appear in the inventory.
 	_ "github.com/pelican/wings/plugin/builtin"
+	"github.com/pelican/wings/plugin/install"
 )
 
 func newPluginsCommand() *cobra.Command {
@@ -60,7 +62,7 @@ func newPluginsKeygenCommand() *cobra.Command {
 		Use:   "keygen",
 		Short: "Generate an Ed25519 signing keypair for publishing plugins.",
 		Run: func(cmd *cobra.Command, _ []string) {
-			pub, priv, err := plugin.GenerateKeypair()
+			pub, priv, err := install.GenerateKeypair()
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
 				os.Exit(1)
@@ -111,7 +113,7 @@ func newPluginsSignCommand() *cobra.Command {
 				os.Exit(1)
 			}
 			defer f.Close()
-			sig, err := plugin.SignArchive(strings.TrimSpace(string(key)), f)
+			sig, err := install.SignArchive(strings.TrimSpace(string(key)), f)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "signing: %v\n", err)
 				os.Exit(1)
@@ -131,13 +133,13 @@ func newPluginsAddCommand() *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			ctx := context.Background()
-			resolved, err := plugin.Resolve(ctx, args[0])
+			resolved, err := install.Resolve(ctx, args[0])
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
 				os.Exit(1)
 			}
 			dir := config.Get().Plugins.Directory
-			stage, err := plugin.StageAdd(ctx, resolved, dir)
+			stage, err := install.StageAdd(ctx, resolved, dir)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "install failed: %v\n", err)
 				os.Exit(1)
@@ -248,7 +250,7 @@ func newPluginsUntrustCommand() *cobra.Command {
 
 // rollbackOrWarn undoes a committed install after a later step failed, and
 // says so if even that fails, since the plugins directory then needs a look.
-func rollbackOrWarn(stage *plugin.StagedInstall) {
+func rollbackOrWarn(stage *install.StagedInstall) {
 	if err := stage.Rollback(); err != nil {
 		fmt.Fprintf(os.Stderr, "could not restore the previous state: %v\n", err)
 		return
@@ -347,7 +349,7 @@ func newPluginsUpdateCommand() *cobra.Command {
 			}
 
 			ctx := context.Background()
-			st, err := plugin.CheckUpdate(ctx, m)
+			st, err := install.CheckUpdate(ctx, m)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
 				os.Exit(1)
@@ -360,7 +362,7 @@ func newPluginsUpdateCommand() *cobra.Command {
 			if checkOnly {
 				return
 			}
-			stage, err := plugin.StageUpdate(ctx, st)
+			stage, err := install.StageUpdate(ctx, st)
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "update failed: %v\n", err)
 				os.Exit(1)

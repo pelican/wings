@@ -119,7 +119,7 @@ func (r *Registry) Emit(e Event) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	for _, w := range r.listeners {
-		if !providerEnabled(w.listener.Name()) || !e.matches(w.listener.Events()) {
+		if !providerEnabled(w.listener.Name()) || !wants(e, w.listener.Events()) {
 			continue
 		}
 		w.offer(e)

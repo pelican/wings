@@ -111,7 +111,7 @@ func (m Manifest) validate() error {
 		return fmt.Errorf("plugin: manifest in %s missing apiVersion", m.dir)
 	case m.Name == "":
 		return fmt.Errorf("plugin: manifest in %s missing name", m.dir)
-	case invalidPluginName(m.Name):
+	case InvalidName(m.Name):
 		return fmt.Errorf("plugin: manifest in %s has invalid name %q", m.dir, m.Name)
 	case m.Capability == "":
 		return fmt.Errorf("plugin: manifest for %q missing capability", m.Name)
@@ -121,13 +121,13 @@ func (m Manifest) validate() error {
 	return nil
 }
 
-// invalidPluginName reports whether name cannot be used as a plugin's own
+// InvalidName reports whether name cannot be used as a plugin's own
 // directory under the plugins directory. Separators and ".." are refused, and
 // so is a leading ".": filepath.Join(dir, ".") is dir itself, so installing a
 // plugin named "." would replace every plugin and the trust store, and hidden
 // directories are where installs keep their staging and backup copies, which
 // discovery skips.
-func invalidPluginName(name string) bool {
+func InvalidName(name string) bool {
 	return name == "" || strings.HasPrefix(name, ".") || strings.ContainsAny(name, `/\`) || strings.Contains(name, "..")
 }
 

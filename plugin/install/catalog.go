@@ -1,4 +1,4 @@
-package plugin
+package install
 
 import (
 	"context"
@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/pelican/wings/config"
+	"github.com/pelican/wings/plugin"
 )
 
 const maxCatalogBytes = 1 << 20 // 1 MiB registry index
@@ -25,15 +26,15 @@ type Catalog struct {
 
 // CatalogEntry describes one installable plugin in a registry.
 type CatalogEntry struct {
-	Name        string     `json:"name"`
-	Version     string     `json:"version"`
-	Capability  Capability `json:"capability"`
-	Author      string     `json:"author"`
-	Description string     `json:"description"`
-	MinWings    string     `json:"minWings"`
-	Download    string     `json:"download"`  // https URL to the plugin archive
-	SHA256      string     `json:"sha256"`    // hex digest of the archive
-	Signature   string     `json:"signature"` // base64 Ed25519 signature over the archive sha256
+	Name        string            `json:"name"`
+	Version     string            `json:"version"`
+	Capability  plugin.Capability `json:"capability"`
+	Author      string            `json:"author"`
+	Description string            `json:"description"`
+	MinWings    string            `json:"minWings"`
+	Download    string            `json:"download"`  // https URL to the plugin archive
+	SHA256      string            `json:"sha256"`    // hex digest of the archive
+	Signature   string            `json:"signature"` // base64 Ed25519 signature over the archive sha256
 }
 
 // FetchCatalog downloads and parses a registry index from an https URL, sending
@@ -192,7 +193,7 @@ func StageAdd(ctx context.Context, r ResolvedPlugin, pluginsDir string) (*Staged
 		return nil, fmt.Errorf("plugin %q: registry entry is missing download or sha256", e.Name)
 	}
 	// Guard the name so it cannot escape the plugins directory.
-	if invalidPluginName(e.Name) {
+	if plugin.InvalidName(e.Name) {
 		return nil, fmt.Errorf("plugin: invalid plugin name %q", e.Name)
 	}
 	if err := os.MkdirAll(pluginsDir, 0o755); err != nil {

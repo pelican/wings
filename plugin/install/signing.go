@@ -1,4 +1,4 @@
-package plugin
+package install
 
 import (
 	"crypto/ed25519"
