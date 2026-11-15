@@ -14,6 +14,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -1072,5 +1074,53 @@ func TestPluginAPIUpdateCheck(t *testing.T) {
 	_ = json.Unmarshal([]byte(body), &out)
 	if code != http.StatusNotFound || out["error"] == nil {
 		t.Fatalf("unknown plugin: %d %s; want a JSON 404", code, body)
+	}
+}
+
+// TestPluginAPIUpdateRefusesUntrustedPlugins: like update-check, update must
+// not fetch an unapproved manifest's update URL (contract v3.1).
+func TestPluginAPIUpdateRefusesUntrustedPlugins(t *testing.T) {
+	a := newPluginAPI(t, string(plugin.PanelAccessSigned))
+	var hits atomic.Int32
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		_ = json.NewEncoder(w).Encode(install.UpdateManifest{Version: "2.0.0", Download: "https://x.example/d.tgz", SHA256: "abc"})
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(install.UseTransport(srv.Client().Transport))
+	a.writePlugin("delta", "apiVersion: v1\nname: delta\ncapability: events\nversion: 1.0.0\nentrypoint: [\"./run\"]\nupdate: "+srv.URL+"/update.json\n")
+
+	rec, _ := a.json(http.MethodPost, "/api/plugins/delta/update", "")
+	if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"reason":"untrusted"`) {
+		t.Fatalf("update of an untrusted plugin: %d %s; want 409 with reason untrusted", rec.Code, rec.Body)
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("the untrusted plugin's update URL was fetched %d times", n)
+	}
+}
+
+// TestPluginAPISourceDoesNotBlockOnAFIFO: a FIFO in a plugin's directory must
+// be refused, not hold the request open waiting for a writer.
+func TestPluginAPISourceDoesNotBlockOnAFIFO(t *testing.T) {
+	a := newPluginAPI(t, string(plugin.PanelAccessView))
+	if err := syscall.Mkfifo(filepath.Join(a.dir, "alpha", "pipe"), 0o600); err != nil {
+		t.Skipf("can't make a FIFO here: %v", err)
+	}
+	done := make(chan *httptest.ResponseRecorder, 1)
+	go func() { done <- a.do(http.MethodGet, "/api/plugins/alpha/source?file=pipe", nil, "") }()
+	select {
+	case rec := <-done:
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("FIFO: %d %s; want 400", rec.Code, rec.Body)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("reading a FIFO through /source blocked")
+	}
+}
+
+// TestApprovePathEscapesTheName: a name holding "?" must stay in the path.
+func TestApprovePathEscapesTheName(t *testing.T) {
+	if got, want := approvePath("install", "q?x"), "/api/plugins/q%3Fx/install"; got != want {
+		t.Fatalf("approvePath = %q, want %q", got, want)
 	}
 }

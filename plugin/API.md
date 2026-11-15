@@ -196,7 +196,8 @@ and compares versions, without downloading or staging anything:
 A plugin without an update URL (or a native one) gives `"latest": null,
 "available": false`. A fetch that fails is still a 200, with `error` set and
 `"available": false`. An external plugin the node doesn't trust is a 409 with
-`"reason": "untrusted"`, and its update URL is never fetched.
+`"reason": "untrusted"`, and its update URL is never fetched; the same goes for
+`POST /api/plugins/{id}/update`.
 
 ### Source
 

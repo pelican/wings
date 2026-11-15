@@ -177,7 +177,7 @@ this section disagree, this section wins and the document is a bug.
 | `POST /api/plugins/{id}/enable`, `/disable` | view | `{"status": "enabled"\|"disabled", "plugin": Plugin}`; enable of an untrusted or broken plugin is 409 |
 | `PUT /api/plugins/{id}/settings` | view | body = the values object; `{"status": "saved", "values": {...}}` |
 | `POST /api/plugins/{id}/install` | signed | two steps (A4); optional body `{"registry": "<namespace>"}` |
-| `POST /api/plugins/{id}/update` | signed | two steps (A4), from the plugin's own update URL; or `{"status": "up_to_date", "installed", "latest"}` |
+| `POST /api/plugins/{id}/update` | signed | two steps (A4), from the plugin's own update URL; or `{"status": "up_to_date", "installed", "latest"}`. An untrusted external plugin: 409 `reason: "untrusted"`, and nothing is fetched |
 | `POST /api/plugins/{id}/uninstall?delete=true\|false` | signed | disables it and revokes its approval; `delete=true` also removes its directory. Its data (settings, state) is kept. `{"status": "uninstalled", "deleted": bool}` |
 | `POST /api/plugins/import` | full | two steps (A4); body `{"url", "sha256"?, "signature"?}` or multipart field `plugin` (+ optional `signature`), at most 200 MiB |
 | `POST /api/plugins/order` | view | 501 (A6) |
@@ -285,7 +285,7 @@ order. `POST /api/plugins/order` answers 501; the Panel should not offer reorder
   without dots, and unsupported types/keys shown read-only; new `GET /api/plugins/available` and
   `GET /api/plugins/{id}/update-check`; `signed` means actually verified; approval re-checks the current
   signature policy and the destination (403/422/409).
-- v3.1 (2026-11-15, owner approved): the Wings plugin name `available` is reserved; `update-check` refuses
-  untrusted external plugins (409 `reason: "untrusted"`) and never fetches their URL; 409s may carry
+- v3.1 (2026-11-15, owner approved): the Wings plugin name `available` is reserved; `update-check` and
+  `update` refuse untrusted external plugins (409 `reason: "untrusted"`) and never fetch their URL; 409s may carry
   `reason` (`token`, `destination_changed`, `untrusted`); R2.6 records that the Hub's signing key ships as a
   default trusted key once the Hub signs releases.

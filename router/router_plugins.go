@@ -11,11 +11,13 @@ import (
 	"io"
 	"io/fs"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 	"unicode/utf8"
 
@@ -103,6 +105,27 @@ func pluginID(c *gin.Context) (string, bool) {
 		return "", false
 	}
 	return id, true
+}
+
+// requireTrusted answers 409 (reason "untrusted") unless the node trusts m as
+// it is on disk. Anything that fetches a manifest's update URL goes through
+// it: an unapproved or edited manifest could point the node at any URL,
+// including internal services (contract v3.1).
+func requireTrusted(c *gin.Context, id string, m plugin.Manifest) bool {
+	if ts, err := plugin.LoadTrustStore(); err == nil && ts.IsTrusted(m) {
+		return true
+	}
+	c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+		"error":  fmt.Sprintf("plugin %q is not trusted on this node; the node operator must run `wings plugins trust %s` first", id, id),
+		"reason": "untrusted",
+	})
+	return false
+}
+
+// approvePath is where the approval for a staged install or update of name
+// goes. The name is path-escaped: names may hold characters such as "?".
+func approvePath(action, name string) string {
+	return "/api/plugins/" + url.PathEscape(name) + "/" + action
 }
 
 func logPluginChange(c *gin.Context, action, name string) *log.Entry {
@@ -418,13 +441,7 @@ func getPluginUpdateCheck(c *gin.Context) {
 		return
 	}
 	resp["installed"] = m.Version
-	// Only trusted plugins: otherwise the Panel could make the node fetch any
-	// URL an unapproved manifest names (contract v3.1).
-	if ts, err := plugin.LoadTrustStore(); err != nil || !ts.IsTrusted(m) {
-		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
-			"error":  fmt.Sprintf("plugin %q is not trusted on this node; the node operator must run `wings plugins trust %s` first", id, id),
-			"reason": "untrusted",
-		})
+	if !requireTrusted(c, id, m) {
 		return
 	}
 	if m.Update == "" {
@@ -495,7 +512,10 @@ func getPluginSource(c *gin.Context) {
 		return
 	}
 
-	f, err := root.Open(filepath.FromSlash(file))
+	// Non-blocking, so a FIFO (or another special file) can't hold the request
+	// open: the regular-file check below then refuses it. Reads of a regular
+	// file are unaffected.
+	f, err := root.OpenFile(filepath.FromSlash(file), os.O_RDONLY|syscall.O_NONBLOCK, 0)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("no file %q in plugin %q", file, id)})
 		return
@@ -824,7 +844,7 @@ func respondStaged(c *gin.Context, action, path string, stage *install.StagedIns
 	}
 	logPluginChange(c, action+"-staged", m.Name).Info("plugin staged through the Panel API; waiting for approval")
 	if path == "" {
-		path = "/api/plugins/" + m.Name + "/" + action
+		path = approvePath(action, m.Name)
 	}
 	c.JSON(http.StatusAccepted, gin.H{
 		"status":         "approval_required",
@@ -1071,6 +1091,9 @@ func postPluginUpdate(c *gin.Context) {
 	m, err := plugin.LoadManifest(info.Manifest)
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": err.Error()})
+		return
+	}
+	if !requireTrusted(c, id, m) {
 		return
 	}
 	st, err := install.CheckUpdate(c.Request.Context(), m)
