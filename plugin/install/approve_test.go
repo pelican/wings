@@ -90,3 +90,32 @@ func TestToggle(t *testing.T) {
 		t.Fatalf("enabling with autoload off should allowlist it: %+v", p)
 	}
 }
+
+func TestRemoveDeletesThePluginButNotItsData(t *testing.T) {
+	dir, stage := stageDemo(t, "1.0.0", "1.0.0")
+	_ = stage.Cleanup()
+	data := filepath.Join(dir, plugin.DataDirName, "demo")
+	if err := os.MkdirAll(data, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"", ".", "..", "a/b"} {
+		if err := Remove(dir, bad); err == nil {
+			t.Fatalf("Remove(%q) was accepted", bad)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(dir, "demo")); err != nil {
+		t.Fatalf("a refused Remove touched the plugin: %v", err)
+	}
+	if err := Remove(dir, "demo"); err != nil {
+		t.Fatalf("Remove: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "demo")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("the plugin directory is still there: %v", err)
+	}
+	if _, err := os.Stat(data); err != nil {
+		t.Fatalf("the data directory was removed: %v", err)
+	}
+	if err := Remove(dir, "demo"); err != nil {
+		t.Fatalf("removing a missing plugin: %v", err)
+	}
+}
