@@ -210,3 +210,29 @@ func TestListRegistries(t *testing.T) {
 		t.Fatalf("down = %+v; want an error and no entries", got[1])
 	}
 }
+
+// TestResolveKeepsRegistryURLCredentialsOutOfErrors covers a registry URL
+// that carries a key in its query string: a failed lookup's error reaches the
+// Panel (POST /api/plugins/{id}/install), so it must not include the key.
+func TestResolveKeepsRegistryURLCredentialsOutOfErrors(t *testing.T) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	useTestTransport(t, srv)
+	c := setConfig(t)
+	c.Plugins.Registries = map[string]config.PluginRegistry{
+		"acme": {URL: srv.URL + "/registry.json?key=supersecret"},
+	}
+	config.Set(c)
+
+	for _, ref := range []string{"@acme/billing", "billing"} {
+		_, err := Resolve(context.Background(), ref)
+		if err == nil {
+			t.Fatalf("Resolve(%q) succeeded against a failing registry", ref)
+		}
+		if strings.Contains(err.Error(), "supersecret") {
+			t.Errorf("Resolve(%q) error shows the registry URL's key: %v", ref, err)
+		}
+	}
+}

@@ -225,7 +225,8 @@ func Resolve(ctx context.Context, ref string) (ResolvedPlugin, error) {
 		a := authFor(reg)
 		cat, err := fetchCatalog(ctx, reg.URL, a)
 		if err != nil {
-			return ResolvedPlugin{}, err
+			// The Panel sees this error (install through the plugin API).
+			return ResolvedPlugin{}, redactURL(err, reg.URL)
 		}
 		if e, ok := cat.find(name); ok {
 			if err := e.problem(); err != nil {
@@ -255,7 +256,7 @@ func Resolve(ctx context.Context, ref string) (ResolvedPlugin, error) {
 			a := authFor(regs[ns])
 			cat, err := fetchCatalog(ctx, regs[ns].URL, a)
 			if err != nil {
-				return ResolvedPlugin{}, fmt.Errorf("plugin: could not read registry %q (%v); install with @namespace/name to use a specific registry", ns, err)
+				return ResolvedPlugin{}, fmt.Errorf("plugin: could not read registry %q (%v); install with @namespace/name to use a specific registry", ns, redactURL(err, regs[ns].URL))
 			}
 			if e, ok := cat.find(ref); ok {
 				found = append(found, ResolvedPlugin{Entry: e, auth: a, registryHost: hostOf(regs[ns].URL)})
