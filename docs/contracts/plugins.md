@@ -1,13 +1,13 @@
 # Contract: plugins across Wings and Panel
 
-**Contract v2, 2026-11-15.** Source of truth for plugin interfaces shared by pelican/wings and pelican/panel.
+**Contract v3, 2026-11-15.** Source of truth for plugin interfaces shared by pelican/wings and pelican/panel.
 Owner: Alexandru Vlad (Scai). Sections: R (registry format), L (Panel access levels), A (Wings plugin HTTP
 API for the Panel).
 
-Work against this contract, as of v2:
-- pelican/wings, stacked on pelican/wings PR 250: branch `scai/plugin-panel-api` (node side and HTTP API).
-- pelican/panel: plugin registries for Panel plugins (section R).
-- pelican/panel: Wings plugin management, building on pelican/panel PR 2701 (sections L and A, from v2).
+Work against this contract, as of v3:
+- pelican/wings PR 251 (stacked on PR 250), branch `scai/plugin-panel-api`: sections R (Wings side), L, A.
+- pelican/panel PR 2785, branch `scai/plugin-registries`: section R for Panel plugins.
+- pelican/panel PR 2786, branch `scai/wings-plugins-contract` (builds on pelican/panel PR 2701): sections L, A.
 
 ## Change rule
 
@@ -70,9 +70,9 @@ a company server) or a site that generates it (the Pelican Hub, planned at
 | `target` | `"wings"` \| `"panel"` | no | Which side installs this entry. **Missing means `"wings"`** (registries written before v1). Each side ignores entries for the other side, and entries with a `target` it doesn't know, including for bare-name lookups (R3). |
 | `capability` | string | no | Wings only (`"events"` today). When present it must match the archive's manifest. |
 | `author`, `description` | string | no | Shown to the admin before install. |
-| `download` | string | yes | https URL of the archive. `.tar.gz` or `.zip`; the format is read from the content, not the name. |
+| `download` | string | yes | https URL of the archive; the format is read from the content, not the name. Wings accepts `.tar.gz` and `.zip`. **The Panel accepts `.zip` only**, so `target: "panel"` entries must be zips. |
 | `sha256` | string | yes | Lowercase hex SHA-256 of the archive bytes. Install fails on mismatch. |
-| `signature` | string | no | Base64 Ed25519 signature over the **32 raw bytes** of the archive's SHA-256 digest. |
+| `signature` | string | no | Base64 Ed25519 signature over the **32 raw bytes** of the archive's SHA-256 digest. Present but not a non-empty string (e.g. `""`, `null`, a number) is an invalid entry, never "unsigned". |
 | `minWings` | string | no | Wings only. Minimum Wings version. |
 | `panel_version` | string | no | Panel only. Same meaning as `panel_version` in the Panel's `plugin.json`. |
 
@@ -82,14 +82,19 @@ Unknown fields are ignored by both sides (forward compatible). Maximum document 
 
 1. https only, on every hop. A redirect to a non-https URL is refused. At most 10 redirects.
 2. Credentials: a registry may carry a bearer token (sent as `Authorization: Bearer <token>`) and extra
-   headers. They are sent **only** to the registry's own host: to fetch the document, and to download an
-   archive whose host is that same host. They are dropped on any request or redirect to another host.
+   headers. They are sent **only** to the registry's own origin (same scheme, host and port): to fetch the
+   document, and to download an archive at that same origin. They are dropped on any request or redirect to
+   another origin, and for the rest of a redirect chain once it has left the origin.
 3. Credential values may reference environment variables (`${NAME}`) so secrets stay out of config files.
 4. The archive is verified against `sha256` before anything is extracted; extraction refuses absolute paths,
-   `..`, links leaving the plugin directory and hard links, and caps total size and entry count.
+   `..`, links leaving the plugin directory and hard links, and caps total size and entry count. Size caps
+   are enforced while bytes arrive (a response without `Content-Length` must not be read whole first).
 5. Signatures: if `signature` is present it must verify against one of the admin's trusted keys (base64
    Ed25519 public keys, optionally `id:key`); a signature that fails is always an error. If it is absent, the
-   install proceeds unless the admin requires signatures.
+   install proceeds unless the admin requires signatures. "Require signatures" covers **every** install path
+   on that side: registries, update manifests, the Pelican Hub, URL imports and uploaded archives. Wherever a
+   source offers a signature (registry entry, update manifest, Hub release), it is carried through to the
+   check.
 
 ### R3. Choosing a registry
 
@@ -148,7 +153,7 @@ this section disagree, this section wins and the document is a bug.
 |---|---|
 | 400 | bad id, body or query |
 | 403 | the node's access level (L) doesn't allow it; body adds `"panel_access": "<level>"`, `"required": "<level>"` |
-| 404 | no such plugin or file, **or** a Wings without this API (treat as "plugin API unavailable on this node") |
+| 404 | on `GET /api/plugins`: this node's Wings has no plugin API. On any `/api/plugins/{id}...`: no such plugin or file (JSON `{"error"}`). Clients decide "API missing" from the list call only. |
 | 409 | wrong state (enable an untrusted plugin, install an installed one), or an approval token unknown, used, expired or sent to another endpoint |
 | 413 | body or file over its cap |
 | 422 | settings that don't validate (body adds `"fields": {key: message}`); a registry, download, checksum, signature or archive that was refused |
@@ -159,7 +164,9 @@ this section disagree, this section wins and the document is a bug.
 
 | Method and path | Level | Result |
 |---|---|---|
-| `GET /api/plugins` | view | `{"enabled": bool, "directory": string, "panel_access": level, "data": [Plugin], "error"?: string}` |
+| `GET /api/plugins` | view | `{"enabled": true, "directory": string, "panel_access": level, "data": [Plugin], "error"?: string}`. `panel_access` is always present; `enabled` is always `true` (reserved) |
+| `GET /api/plugins/available` | signed | `{"data": [Available], "errors": {"<namespace>": "<message>"}}`: the `target: "wings"` entries of every configured registry (A3.2); a registry that couldn't be read is in `errors`, not a failure of the call |
+| `GET /api/plugins/{id}/update-check` | view | `{"installed": string, "latest": string\|null, "available": bool, "error"?: string}`: reads the plugin's update URL without staging anything. No update URL: `latest: null`, `available: false`. A failed fetch: 200 with `error` set and `available: false` |
 | `GET /api/plugins/{id}` | view | Plugin |
 | `GET /api/plugins/{id}/source` | view | `{"files": [string], "truncated": bool}` (at most 5000) |
 | `GET /api/plugins/{id}/source?file=<path>` | view | `{"file", "size", "binary": bool, "content"?}` (at most 1 MiB; no `content` when binary) |
@@ -199,9 +206,19 @@ A body of `[]` is treated as `{}`.
 Every list that is present is an array, never `null`.
 
 **A3.1 Setting:** `{"key", "label"?, "description"?, "type": "string"|"number"|"boolean"|"select",
-"options"?: [{"value", "label"}], "default"?, "required": bool, "secret": bool}`. Values are sent as JSON of
-that type (a number is a JSON number, not a string). `PUT .../settings` replaces all values: a key left out or
-`null` is unset; `"********"` for a secret keeps the stored value. There is no multiline `text` type in v2.
+"options"?: [{"value", "label"}], "default"?, "required": bool, "secret": bool}`. `key` matches
+`^[A-Za-z0-9_][A-Za-z0-9_-]*$` (no dots: form libraries read dots as nesting); Wings refuses a manifest whose
+schema has other keys. Values are sent as JSON of that type (a number is a JSON number, not a string). `PUT
+.../settings` replaces all values: a key left out or `null` is unset; `"********"` for a secret keeps the
+stored value. There is no multiline `text` type. A client that meets a type or key it doesn't support shows
+that setting read-only and sends its stored value back unchanged.
+
+`can_update` means the plugin has an update URL and the node's level allows updates; whether a newer version
+exists comes from `update-check`.
+
+**A3.2 Available:** `{"name", "version", "registry": "<namespace>", "author"?, "description"?,
+"capability"?, "has_signature": bool, "installed": string|null}`. `installed` is the installed version, or
+`null`. `has_signature` says the entry carries a signature; it is verified only when staging.
 
 ### A4. Two-step install, update and import
 
@@ -216,9 +233,16 @@ that type (a number is a JSON number, not a string). `PUT .../settings` replaces
    "plugin": Plugin}`.
 
 The token is single-use, valid 10 minutes, tied to the staged files (a change after staging refuses the
-approval) and to its endpoint and plugin. A new stage of the same plugin replaces the waiting one. Below
-`full`, the archive must be signed by a trusted key (`"signed": true`); a stage made at `full` without that
-can't be approved after the node drops to `signed` (403).
+approval) and to its endpoint and plugin. A new stage of the same plugin replaces the waiting one. `signed`
+is `true` only when the archive's signature actually verified against a trusted key, at any level. Below
+`full`, that is required.
+
+At approval Wings re-checks, under the install lock, against the node's **current** state:
+- the access level: a stage that needs a level the node no longer has is refused (403);
+- the signature policy: the staged archive's signature against the current `trusted_keys` and
+  `require_signatures`; if it no longer passes, 422;
+- the destination: if the installed plugin changed since staging (installed, removed or another version),
+  409. Stage again.
 
 ### A5. Changes take effect without a restart
 
@@ -248,3 +272,10 @@ order. `POST /api/plugins/order` answers 501; the Panel should not offer reorder
   whose `target` is `"panel"`.
 - v2 (2026-11-15): section A from the Wings implementation. R: unknown `target` values are ignored too.
   L: `full` still respects the node's own `require_signatures`. Wings now ignores `target: "panel"` entries.
+- v3 (2026-11-15, owner approved): R: Panel archives are zip only; credentials go to the same origin
+  (scheme, host, port); require-signatures covers every install path, offered signatures are carried
+  through, and a malformed `signature` is invalid; size caps apply while streaming. A: `panel_access` always
+  present and `enabled` always `true`; 404 meaning split between the list and per-plugin calls; setting keys
+  without dots, and unsupported types/keys shown read-only; new `GET /api/plugins/available` and
+  `GET /api/plugins/{id}/update-check`; `signed` means actually verified; approval re-checks the current
+  signature policy and the destination (403/422/409).
