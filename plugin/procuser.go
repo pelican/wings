@@ -28,11 +28,11 @@ type ProcessUser struct {
 	Switch bool
 }
 
-// IDs returns the uid and gid for syscall credentials, refusing values that
-// don't fit a uint32 (a negative or oversized id in config.yml would otherwise
-// wrap to some other user).
+// IDs returns the uid and gid for syscall credentials, refusing negative ids
+// and ids over math.MaxInt32 (a bad id in config.yml would otherwise wrap to
+// some other user). Ids are read as signed 32-bit values everywhere else too.
 func (u ProcessUser) IDs() (uid, gid uint32, err error) {
-	if u.Uid < 0 || int64(u.Uid) > math.MaxUint32 || u.Gid < 0 || int64(u.Gid) > math.MaxUint32 {
+	if u.Uid < 0 || u.Uid > math.MaxInt32 || u.Gid < 0 || u.Gid > math.MaxInt32 {
 		return 0, 0, fmt.Errorf("plugin: user %s has an out-of-range uid %d or gid %d", u.Name, u.Uid, u.Gid)
 	}
 	return uint32(u.Uid), uint32(u.Gid), nil
