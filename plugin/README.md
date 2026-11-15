@@ -15,12 +15,13 @@ If you read one thing, read the two-layer model below.
 ## The mental model: two layers
 
 ```
-PLUGIN SYSTEM  — the machinery (this package)
+PLUGIN SYSTEM  — the machinery
   ├─ registry          providers by capability + enable policy  registry.go
   ├─ transports        native (in-proc) | external subprocess   external/, jsonrpc/
-  ├─ config/manifests  which plugins are on, what they may do    config policy + manifest.go
+  ├─ config/manifests  which plugins are on, what they may do    config policy + manifest.go, trust.go
   ├─ HostAPI           what a plugin may ask Wings to do          host.go + cmd/pluginhost*.go
-  └─ hooks             Register{EventListener,Routes,Task}            events.go, route.go, task.go
+  ├─ hooks             Register{EventListener,Routes,Task}       registry.go, route.go, task.go
+  └─ distribution      registries, download, verify, install     install/
 
 CAPABILITIES  — what plugins actually DO (ride on the machinery)
   ├─ EventListener      subscribe to server lifecycle events (state, stats, install)
@@ -34,21 +35,26 @@ every capability.
 
 ## Where things live
 
-| path | what |
-|------|------|
-| `plugin/capability.go` | the `Capability` type |
-| `plugin/registry.go` | the registry: `RegisterEventListener`, `Emit`, enable policy |
-| `plugin/events.go` | `EventListener` contract + `Event` (the event/stream bus) |
-| `plugin/host.go` | `HostAPI` + `HostHandler` (deny-by-default host callbacks) + grants |
-| `plugin/manifest.go` | external plugin `plugin.yaml` discovery (read, never executed) |
-| `plugin/route.go` | `RegisterRoutes` — add HTTP endpoints |
-| `plugin/task.go` | `RegisterTask` — add scheduled jobs |
-| `plugin/jsonrpc/` | bidirectional JSON-RPC 2.0 over stdio (the external wire) |
-| `plugin/external/` | spawns + supervises external plugin processes |
-| `plugin/sdk/` | Go SDK for plugin authors + `SPEC.md` (wire), `HOSTAPI.md` (host surface) |
-| `plugin/builtin/` | blank-imports native plugins so they register |
-| `cmd/pluginhost*.go` | the concrete `HostAPI` implementation (server/fs/events methods) |
-| `cmd/plugins.go` | the `wings plugins list/get/enable/disable/doctor/add/update/trust` CLI |
+The plugin system is a set of small modules inside the one Wings binary (a
+modular monolith). Each has one job and a short list of what it may import.
+
+| module | what | may import (from Wings) |
+|--------|------|-------------------------|
+| `plugin/contract` | what a plugin implements: `Event`, `EventListener`, `Capability` | nothing; standard library only |
+| `plugin/jsonrpc` | bidirectional JSON-RPC 2.0 over stdio (the external wire) | nothing; standard library only |
+| `plugin/sdk` | Go SDK for external plugins + `SPEC.md` (wire), `HOSTAPI.md` (host surface) | `contract`, `jsonrpc` |
+| `plugin` | the runtime: registry and `Emit` (`registry.go`), enable policy, `RegisterRoutes` (`route.go`), `RegisterTask` (`task.go`), grant check on host calls (`host.go`), manifests (`manifest.go`), trust store (`trust.go`), inventory for the CLI; re-exports the `contract` types | `config`, `contract`, `jsonrpc` |
+| `plugin/install` | registries, download, sha256 and signature checks, extraction, staged install with rollback | `config`, `plugin` |
+| `plugin/external` | spawns and supervises external plugin processes | `config`, `plugin`, `jsonrpc` |
+| `plugin/builtin` | blank-imports native plugins so they register | the native plugins |
+| `cmd/pluginhost*.go` | the concrete `HostAPI` (server/fs/events methods); the only place plugin code meets `server` | |
+| `cmd/plugins.go` | the `wings plugins list/get/enable/disable/doctor/add/update/trust` CLI | |
+
+`plugin/boundaries_test.go` enforces the last column (with `config`'s own
+dependency, `system`): it fails if, say, `plugin/sdk` starts importing
+`plugin`, which would put Wings, gin and the Docker client into every Go
+plugin binary. A Go plugin built with the SDK depends on about 70 packages and
+builds to about 3 MB.
 
 ## Native vs external
 
@@ -74,6 +80,7 @@ func init() {
     plugin.RegisterEventListener(auditLog{})
 }
 // auditLog implements: Name() string; Events() []string; OnEvent(ctx, plugin.Event) error
+// (plugin.Event is contract.Event; native plugins can use either name)
 ```
 
 ### 2. HTTP routes
