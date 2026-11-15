@@ -121,11 +121,17 @@ func (w *policyWatch) poll() {
 	// The block is read on every poll, not when the file's time or size
 	// changes: the file is rewritten in place, Linux keeps file times to a
 	// clock tick, and two writes within one tick can leave the same size.
+	// The running block is compared too: if something in this process changed
+	// it without the file, the daemon goes back to the file.
+	running := config.Get().Plugins
 	if p, err := config.ReloadPluginsFromDisk(w.c); err != nil {
 		log.WithField("error", err).Warn("could not read the plugins block from the config file; will retry")
 	} else {
-		if !w.haveBlock || !samePolicy(p, w.block) {
+		switch {
+		case !w.haveBlock || !samePolicy(p, w.block):
 			reasons = append(reasons, "config file")
+		case !samePolicy(p, running):
+			reasons = append(reasons, "running plugins block differs from the file")
 		}
 		w.block, w.haveBlock = p, true
 	}

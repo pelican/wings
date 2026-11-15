@@ -244,3 +244,30 @@ func TestWatchPolicySeesAnEditWithTheSameSizeAndTime(t *testing.T) {
 		t.Fatal("an edit with the same size and time was missed")
 	}
 }
+
+// TestWatchPolicyRestoresTheFileWhenTheRunningBlockDiffers: the running
+// plugins block was changed in this process without the file (here as a
+// test standing in for another process does), and a plugin was loaded from
+// it. The file still says disabled, the same as the watcher's last read; the
+// next poll must still bring the daemon back to the file.
+func TestWatchPolicyRestoresTheFileWhenTheRunningBlockDiffers(t *testing.T) {
+	_, path := usePluginsDir(t, func(p *config.PluginConfiguration) { p.Disabled = []string{"watch-mem"} })
+	approve(t, writePlugin(t, config.Get().Plugins.Directory, "watch-mem", "1.0.0"))
+	plugin.AfterPolicyChange = func() { _ = Reconcile(config.Get().Plugins.Directory, nil) }
+	t.Cleanup(func() { plugin.AfterPolicyChange = nil })
+	c, err := config.NewAtPath(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	w := policyWatch{path: path, c: c}
+	w.start()
+	config.Update(func(c *config.Configuration) { c.Plugins.Disabled = nil })
+	plugin.PolicyChanged()
+	if listener("watch-mem") == nil {
+		t.Fatal("the plugin enabled in memory was not loaded")
+	}
+	w.poll()
+	if listener("watch-mem") != nil {
+		t.Fatal("the plugin the file disables is still loaded")
+	}
+}
