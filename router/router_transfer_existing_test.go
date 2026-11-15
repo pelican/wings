@@ -106,8 +106,9 @@ func newExistingTransferRouter(t *testing.T, state string, opts ...wserver.Manag
 }
 
 // transferBody returns a multipart transfer body with an archive holding name,
-// and the checksum the source sends for it.
-func transferBody(t *testing.T, name, content, checksum string) (*bytes.Buffer, string) {
+// the checksum the source sends for it, and the given backups with their
+// checksums.
+func transferBody(t *testing.T, name, content, checksum string, backups map[string]string) (*bytes.Buffer, string) {
 	t.Helper()
 	var archive bytes.Buffer
 	gz := gzip.NewWriter(&archive)
@@ -141,6 +142,19 @@ func transferBody(t *testing.T, name, content, checksum string) (*bytes.Buffer, 
 	if err := mp.WriteField("checksum_archive", checksum); err != nil {
 		t.Fatal(err)
 	}
+	for backup, data := range backups {
+		part, err := mp.CreateFormFile("backup_"+backup, backup)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := part.Write([]byte(data)); err != nil {
+			t.Fatal(err)
+		}
+		sum := sha256.Sum256([]byte(data))
+		if err := mp.WriteField("checksum_backup_"+backup, hex.EncodeToString(sum[:])); err != nil {
+			t.Fatal(err)
+		}
+	}
 	if err := mp.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +185,7 @@ func postTransferBody(t *testing.T, r *gin.Engine, body *bytes.Buffer, contentTy
 func TestPostTransfers_IntoExistingServer(t *testing.T) {
 	r, m, s, env, client := newExistingTransferRouter(t, environment.ProcessOfflineState, wserver.WithTransfersIntoExistingServers())
 
-	body, contentType := transferBody(t, "world/level.dat", "transferred", "")
+	body, contentType := transferBody(t, "world/level.dat", "transferred", "", nil)
 	if w := postTransferBody(t, r, body, contentType); w.Code != http.StatusOK {
 		t.Fatalf("expected the transfer into the existing server to succeed, got %d: %s", w.Code, w.Body.String())
 	}
@@ -197,24 +211,35 @@ func TestPostTransfers_IntoExistingServer(t *testing.T) {
 func TestPostTransfers_IntoExistingServerFailureKeepsServer(t *testing.T) {
 	r, m, s, env, client := newExistingTransferRouter(t, environment.ProcessOfflineState, wserver.WithTransfersIntoExistingServers())
 	dataDir := filepath.Join(config.Get().System.Data, transferTestServer)
-	kept := filepath.Join(dataDir, "keep.txt")
-	if err := os.WriteFile(kept, []byte("x"), 0o600); err != nil {
+	backupDir := filepath.Join(config.Get().System.BackupDirectory, transferTestServer)
+	if err := os.MkdirAll(backupDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	earlier := filepath.Join(backupDir, "earlier.tar.gz")
+	if err := os.WriteFile(earlier, []byte("earlier"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	body, contentType := transferBody(t, "world/level.dat", "transferred", "not-the-checksum")
+	// The archive is extracted, the backup received, and then the archive checksum fails.
+	body, contentType := transferBody(t, "world/level.dat", "transferred", "not-the-checksum", map[string]string{"received.tar.gz": "received"})
 	if w := postTransferBody(t, r, body, contentType); w.Code < 400 {
 		t.Fatalf("expected a checksum mismatch to fail the transfer, got %d", w.Code)
 	}
 
-	if !exists(kept) {
-		t.Error("files of the existing server must be kept when the transfer fails")
-	}
 	if got, ok := m.Get(transferTestServer); !ok || got != s {
 		t.Error("the existing server must stay registered when the transfer fails")
 	}
-	if s.IsTransferring() {
-		t.Error("expected the server to leave the transferring state")
+	if entries, err := os.ReadDir(dataDir); err != nil || len(entries) != 0 {
+		t.Errorf("expected the data directory to be kept and emptied again, got %v (%v)", entries, err)
+	}
+	if got := readFile(t, earlier); got != "earlier" {
+		t.Errorf("a backup that was on the node before the transfer must be kept, got %q", got)
+	}
+	if left := stagedFiles(t, backupDir); len(left) != 0 || exists(filepath.Join(backupDir, "received.tar.gz")) {
+		t.Errorf("the backup received by the failed transfer must be removed, found %v", left)
+	}
+	if s.IsTransferring() || s.ExecutingPowerAction() {
+		t.Error("expected the server to leave the transferring state and its power lock to be released")
 	}
 	if env.created != 0 {
 		t.Errorf("a failed transfer must not configure the environment, got %d calls", env.created)
@@ -225,10 +250,33 @@ func TestPostTransfers_IntoExistingServerFailureKeepsServer(t *testing.T) {
 	assertUnclaimed(t)
 }
 
+func TestPostTransfers_IntoExistingServerRefusesExistingFiles(t *testing.T) {
+	r, _, s, _, client := newExistingTransferRouter(t, environment.ProcessOfflineState, wserver.WithTransfersIntoExistingServers())
+	kept := filepath.Join(config.Get().System.Data, transferTestServer, "world.dat")
+	if err := os.WriteFile(kept, []byte("live"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	body, contentType := transferBody(t, "world.dat", "transferred", "", nil)
+	if w := postTransferBody(t, r, body, contentType); w.Code != http.StatusConflict {
+		t.Fatalf("expected 409 when the server already has files, got %d: %s", w.Code, w.Body.String())
+	}
+	if got := readFile(t, kept); got != "live" {
+		t.Errorf("files of the existing server must be untouched, got %q", got)
+	}
+	if s.IsTransferring() || s.ExecutingPowerAction() {
+		t.Error("a refused transfer must leave the server as it was")
+	}
+	if got := client.reported(); len(got) != 0 {
+		t.Errorf("a refused transfer must not report a result, got %v", got)
+	}
+	assertUnclaimed(t)
+}
+
 func TestPostTransfers_IntoExistingServerRefusesRunningServer(t *testing.T) {
 	r, _, s, _, client := newExistingTransferRouter(t, environment.ProcessRunningState, wserver.WithTransfersIntoExistingServers())
 
-	body, contentType := transferBody(t, "world/level.dat", "transferred", "")
+	body, contentType := transferBody(t, "world/level.dat", "transferred", "", nil)
 	if w := postTransferBody(t, r, body, contentType); w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 for a running server, got %d: %s", w.Code, w.Body.String())
 	}
@@ -247,7 +295,7 @@ func TestPostTransfers_IntoExistingServerRefusesRunningServer(t *testing.T) {
 func TestPostTransfers_ExistingServerRefusedWithoutOption(t *testing.T) {
 	r, _, _, _, client := newExistingTransferRouter(t, environment.ProcessOfflineState)
 
-	body, contentType := transferBody(t, "world/level.dat", "transferred", "")
+	body, contentType := transferBody(t, "world/level.dat", "transferred", "", nil)
 	if w := postTransferBody(t, r, body, contentType); w.Code != http.StatusConflict {
 		t.Fatalf("expected 409 without WithTransfersIntoExistingServers, got %d: %s", w.Code, w.Body.String())
 	}

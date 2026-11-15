@@ -20,7 +20,6 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/pelican/wings/config"
-	"github.com/pelican/wings/environment"
 	"github.com/pelican/wings/router/middleware"
 	"github.com/pelican/wings/router/tokens"
 	"github.com/pelican/wings/server"
@@ -123,9 +122,11 @@ func postTransfers(c *gin.Context) {
 	// directory also means that a failed transfer only removes what it created.
 	//
 	// A manager configured with WithTransfersIntoExistingServers fills a server it
-	// already has instead, as long as that server is offline and not installing.
-	// The server and its data directory existed before the transfer, so a failed
-	// transfer leaves both in place.
+	// already has instead, as long as that server is offline, not busy and its data
+	// directory is empty. The transfer holds the server's power lock until it is
+	// done, so the server cannot be started while its files arrive. Nothing was in
+	// the data directory before, so a failed transfer empties it again and keeps
+	// the server itself.
 	existing, exists := manager.Get(id)
 	intoExisting := exists && manager.TransfersIntoExistingServers()
 	if exists && !intoExisting {
@@ -134,11 +135,26 @@ func postTransfers(c *gin.Context) {
 		})
 		return
 	}
-	if intoExisting && (existing.IsInstalling() || existing.Environment == nil || existing.Environment.State() != environment.ProcessOfflineState) {
-		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
-			"error": "This server must be offline and not installing to receive a transfer.",
-		})
-		return
+	if intoExisting {
+		release, err := existing.LockForIncomingTransfer()
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+				"error": "This server must be offline and not busy to receive a transfer.",
+			})
+			return
+		}
+		defer release()
+		if empty, err := isEmptyDirectory(filepath.Join(config.Get().System.Data, id)); err != nil || !empty {
+			existing.SetTransferring(false)
+			if err != nil {
+				middleware.CaptureAndAbort(c, fmt.Errorf("failed to check for existing server files: %w", err))
+				return
+			}
+			c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+				"error": "Files for this server already exist on this node.",
+			})
+			return
+		}
 	}
 	dataDir := filepath.Join(config.Get().System.Data, id)
 	if !pooled && !intoExisting {
@@ -214,8 +230,9 @@ func postTransfers(c *gin.Context) {
 
 		if !successful && intoExisting {
 			trnsfr.Server.Events().Publish(server.TransferStatusEvent, "failure")
-			// The server and its files were here before the transfer: keep them, and
-			// remove only the backups the transfer received.
+			// The server was here before the transfer and its data directory was
+			// empty: keep the server, and remove what the transfer wrote.
+			emptyDirectory(trnsfr.Log(), filepath.Join(config.Get().System.Data, id))
 			removeReceivedBackups(trnsfr.Log(), id, receivedBackups)
 			trnsfr.Server.SetTransferring(false)
 		} else if !successful {
@@ -660,5 +677,39 @@ func removeReceivedBackups(l *log.Entry, id string, receivedBackups []string) {
 	// Only removed when empty, so backups this node already had are kept.
 	if dir := config.Get().System.BackupDirectory; dir != "" {
 		_ = os.Remove(filepath.Join(dir, id))
+	}
+}
+
+// isEmptyDirectory reports whether dir is missing or has no entries.
+func isEmptyDirectory(dir string) (bool, error) {
+	f, err := os.Open(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	} else if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	if _, err := f.Readdirnames(1); errors.Is(err, io.EOF) {
+		return true, nil
+	} else if err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// emptyDirectory removes everything inside dir and keeps dir itself, which a
+// server's open filesystem root refers to.
+func emptyDirectory(l *log.Entry, dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			l.WithError(err).Warn("failed to list the server files of a failed transfer")
+		}
+		return
+	}
+	for _, e := range entries {
+		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+			l.WithField("file", e.Name()).WithError(err).Warn("failed to delete a server file of a failed transfer")
+		}
 	}
 }

@@ -59,6 +59,35 @@ func (s *Server) ExecutingPowerAction() bool {
 	return s.powerLock.IsLocked()
 }
 
+// LockForIncomingTransfer prepares the server to receive an incoming transfer
+// into itself (see WithTransfersIntoExistingServers). It takes the power action
+// lock, so a start that is already past its checks in HandlePowerAction finishes
+// first and no new one can begin, and fails if the server is not offline or is
+// installing, restoring or already transferring. On success the server is marked
+// as transferring; the caller holds the lock until the transfer is done and then
+// calls release.
+func (s *Server) LockForIncomingTransfer() (release func(), err error) {
+	if err := s.powerLock.Acquire(); err != nil {
+		return nil, errors.Wrap(err, "server: a power action is in progress")
+	}
+	switch {
+	case s.IsInstalling():
+		err = ErrServerIsInstalling
+	case s.IsRestoring():
+		err = ErrServerIsRestoring
+	case s.IsTransferring():
+		err = ErrServerIsTransferring
+	case s.Environment == nil || s.Environment.State() != environment.ProcessOfflineState:
+		err = ErrIsRunning
+	}
+	if err != nil {
+		s.powerLock.Release()
+		return nil, err
+	}
+	s.SetTransferring(true)
+	return s.powerLock.Release, nil
+}
+
 // HandlePowerAction is a helper function that can receive a power action and then process the
 // actions that need to occur for it. This guards against someone calling Start() twice at the
 // same time, or trying to restart while another restart process is currently running.

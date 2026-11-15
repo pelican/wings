@@ -59,10 +59,11 @@ func WithInstaller(i Installer) ManagerOption {
 
 // WithTransfersIntoExistingServers lets an incoming transfer fill a server the
 // manager already has, instead of refusing it. It is meant for embedders that
-// create the server before the transfer arrives, with an empty data directory.
-// The server must be offline and not installing. A failed transfer leaves that
-// server, its environment and its files in place, and removes only the backups
-// the transfer received.
+// create the server before the transfer arrives. The server must be offline and
+// not busy, and its data directory empty; the transfer holds the server's power
+// lock while it runs (see Server.LockForIncomingTransfer). A failed transfer
+// keeps the server and its environment, empties the data directory again and
+// removes the backups the transfer received.
 func WithTransfersIntoExistingServers() ManagerOption {
 	return func(m *Manager) {
 		m.transfersIntoExisting = true
