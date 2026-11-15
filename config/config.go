@@ -293,7 +293,6 @@ type Backups struct {
 	// Defaults to "best_speed" (level 1)
 	CompressionLevel string `default:"best_speed" yaml:"compression_level"`
 
-
 	// RestoreHostAllowlist allows backup restore downloads to connect to otherwise blocked
 	// private/internal destinations. Entries may be hostnames, IP addresses, or CIDR ranges.
 	RestoreHostAllowlist []string `yaml:"restore_host_allowlist"`
@@ -576,63 +575,6 @@ func GetJwtAlgorithm() *jwt.HMACSHA {
 	return _jwtAlgo
 }
 
-// WriteToDisk writes the configuration to the disk. This is a thread safe operation
-// and will only allow one write at a time. Additional calls while writing are
-// queued up.
-// PluginsOnDisk returns the plugins block as it is in c's configuration file
-// now. `wings plugins` commands change that file from another process while
-// the daemon runs, so the daemon's in-memory copy can be stale. Fields the
-// file does not set get their defaults, as at startup. It decodes into a fresh
-// value: yaml.v2 merges into maps it is given, so starting from c.Plugins
-// would keep registries or grants that are no longer in the file.
-func PluginsOnDisk(c *Configuration) (PluginConfiguration, error) {
-	_writeLock.Lock()
-	defer _writeLock.Unlock()
-	var fresh PluginConfiguration
-	if err := defaults.Set(&fresh); err != nil {
-		return c.Plugins, err
-	}
-	current := struct {
-		Plugins PluginConfiguration `yaml:"plugins"`
-	}{Plugins: fresh}
-	// If the file can't be read, the caller keeps what is in memory.
-	if c.path == "" {
-		return c.Plugins, errors.New("config: no configuration file path to read plugins from")
-	}
-	b, err := os.ReadFile(c.path)
-	if err != nil {
-		return c.Plugins, err
-	}
-	if err := yaml.Unmarshal(b, &current); err != nil {
-		return c.Plugins, err
-	}
-	return current.Plugins, nil
-}
-
-func WriteToDisk(c *Configuration) error {
-	_writeLock.Lock()
-	defer _writeLock.Unlock()
-
-	//goland:noinspection GoVetCopyLock
-	ccopy := *c
-	// If debugging is set with the flag, don't save that to the configuration file,
-	// otherwise you'll always end up in debug mode.
-	if _debugViaFlag {
-		ccopy.Debug = false
-	}
-	if c.path == "" {
-		return errors.New("cannot write configuration, no path defined in struct")
-	}
-	b, err := yaml.Marshal(&ccopy)
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(c.path, b, 0o600); err != nil {
-		return err
-	}
-	return nil
-}
-
 // EnsurePelicanUser ensures that the Pelican core user exists on the
 // system. This user will be the owner of all data in the root data directory
 // and is used as the user within containers. If files are not owned by this
@@ -741,6 +683,7 @@ func FromFile(path string) error {
 	Set(c)
 	return nil
 }
+
 // ConfigureDirectories ensures that all the system directories exist on the
 // system. These directories are created so that only the owner can read the data,
 // and no other users.

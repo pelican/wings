@@ -500,12 +500,18 @@ func newPluginsToggleCommand(verb string, enable bool) *cobra.Command {
 		Args:  cobra.ExactArgs(1),
 		Run: func(cmd *cobra.Command, args []string) {
 			name := args[0]
+			// Change the block as it is in the file now, under the config
+			// file lock, so another command or the daemon writing at the same
+			// time can't undo it (or this undo theirs).
 			c := config.Get()
-			togglePlugin(&c.Plugins, name, enable)
-			if err := config.WriteToDisk(c); err != nil {
+			p, err := config.UpdatePluginsOnDisk(c, func(p *config.PluginConfiguration) {
+				togglePlugin(p, name, enable)
+			})
+			if err != nil {
 				fmt.Fprintf(os.Stderr, "failed to write config: %v\n", err)
 				os.Exit(1)
 			}
+			c.Plugins = p
 			config.Set(c)
 			fmt.Printf("%sd %q. Restart Wings for external providers to (re)spawn.\n", verb, name)
 		},
