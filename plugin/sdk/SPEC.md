@@ -61,7 +61,7 @@ A plugin that wants to be configured from the Panel declares its settings in
 
 ```yaml
 settings:
-  - key: webhook_url          # letters, digits, _ . - (at most 64)
+  - key: webhook_url          # letters, digits, _ -; no dots (at most 64)
     label: Webhook URL        # optional; the key is shown otherwise
     description: Where to post state changes.
     type: string              # string | number | boolean | select (default string)

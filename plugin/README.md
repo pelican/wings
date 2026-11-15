@@ -151,9 +151,13 @@ Panel (`POST /api/update`) keeps the node's existing plugin policy, because the
 plugins directory also holds the operator's trust approvals.
 
 Changes apply without a restart. A running Wings checks the config file, the
-plugins directory and the trust store (`<plugins directory>/.trust.json`) every
-5 seconds. When one changed it applies the plugins block from the file and
-reconciles external plugins (`external.Reconcile`):
+plugins directory, the trust store (`<plugins directory>/.trust.json`) and the
+installed plugins' files every 5 seconds. Plugin files are compared by
+metadata only (size, times, inode; nothing is read): each plugin's top level
+and entrypoint files every poll, every file in its tree every 12th poll (about
+a minute). When something changed it applies the plugins block from the file
+and reconciles external plugins (`external.Reconcile`); it also reconciles
+once when it starts:
 
 - an enabled, trusted plugin that is not loaded is loaded; its process starts
   on its first event;
@@ -161,8 +165,15 @@ reconciles external plugins (`external.Reconcile`):
   without a new approval is unloaded and its process stopped (a disabled
   plugin gets no events, but a live process could still call the host API);
 - a loaded plugin approved again with a new fingerprint (`wings plugins
-  update`), or whose `grants` changed, is replaced by a new process;
+  update`), whose `grants` changed, or whose directory moved, is replaced by a
+  new process;
 - anything else keeps running as it is.
+
+Before it starts (or restarts) a plugin process, Wings hashes the plugin's
+files again and refuses to start it if they no longer match its approval, so
+an edit made between two polls never runs. If the plugins directory can't be
+listed, a loaded plugin keeps running only while its files, approval and
+grants still check out.
 
 Native event listeners, scheduled tasks and HTTP routes check the enable state
 each time they run. A disabled plugin's routes stay mounted and answer 404.
@@ -199,7 +210,7 @@ How far it may go is the node operator's decision, set per node:
 |-------|---------------|-|
 | `off` | nothing; every plugin request from the Panel is refused | |
 | `view` | list plugins, show one and read its files; enable, disable and change settings of plugins this node already trusts | **default** |
-| `signed` | also install, update and uninstall plugins from the registries in `plugins.registries`, when the archive is signed by a key in `plugins.trusted_keys` | |
+| `signed` | also list what the registries in `plugins.registries` offer, and install, update and uninstall plugins from them, when the archive is signed by a key in `plugins.trusted_keys` | |
 | `full` | also install or update from any URL or an uploaded archive, signed or not | Panel admins can run code on this node |
 
 No level covers changing the level itself, `trusted_keys`, `registries` or
@@ -213,6 +224,9 @@ wings plugins panel-access signed        # write plugins.panel_access to config.
 wings configure --plugin-access signed ...   # set it while auto-deploying a node
 WINGS_PLUGIN_PANEL_ACCESS=signed         # in Wings' environment (systemd unit, container)
 ```
+
+An unknown value means `off`, and so does `WINGS_PLUGIN_PANEL_ACCESS` set but
+empty. The Panel's endpoints are documented in [`API.md`](API.md).
 
 The environment variable wins over the file. An unknown value in either is
 logged and treated as `off`, so a typo never grants more than intended.
@@ -305,7 +319,10 @@ plugins:
 ```
 
 `${VAR}` is expanded from the environment, so tokens stay out of `config.yml`.
-The auth is sent to both the registry index fetch and the archive download.
+The auth is sent only to the registry's own origin (scheme, host and port):
+with the index fetch, and with the archive download when the archive is
+served from there too. It is dropped on any request or redirect to another
+origin, and for the rest of a redirect chain once it has left the origin.
 
 ```
 wings plugins add @pelican/state-log                     # by namespace
@@ -376,7 +393,9 @@ key for `trusted_keys`:
 
 Policy: unsigned + not required → allowed; unsigned + `require_signatures` →
 rejected; a present signature must verify against a trusted key regardless
-(a signature that fails means tampering). The archive is signed over its sha256
+(a signature that fails means tampering). A registry entry whose `signature`
+is present but not a non-empty string (`""`, `null`, a number) is invalid and
+can't be installed; it never counts as unsigned. The archive is signed over its sha256
 digest, so a tampered archive fails even if its sha256 matches a forged manifest.
 
 ## Next reading
