@@ -841,12 +841,16 @@ func destinationState(stage *install.StagedInstall, name string) (string, error)
 		return "", err
 	}
 	state := "dest:" + dest
-	manifests, issues, err := plugin.DiscoverDetailed(filepath.Dir(stage.DestDir))
+	destDir, err := filepath.Abs(stage.DestDir)
+	if err != nil {
+		return "", err
+	}
+	manifests, issues, err := plugin.DiscoverDetailed(filepath.Dir(destDir))
 	if err != nil {
 		return "", err
 	}
 	for _, m := range manifests {
-		if m.Name == name && m.Dir() != stage.DestDir {
+		if m.Name == name && m.Dir() != destDir {
 			state += "\x00elsewhere:" + m.Dir()
 		}
 	}
