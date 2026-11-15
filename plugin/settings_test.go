@@ -73,6 +73,8 @@ func TestManifestRefusesABadSettingsSchema(t *testing.T) {
 		"duplicate key":       "  - {key: a}\n  - {key: a}\n",
 		"empty key":           "  - {type: string}\n",
 		"key with slash":      "  - {key: a/b}\n",
+		"key with a dot":      "  - {key: a.b}\n",
+		"key starting with -": "  - {key: -a}\n",
 		"select without opts": "  - {key: a, type: select}\n",
 		"options on a string": "  - {key: a, options: [x]}\n",
 		"default wrong type":  "  - {key: a, type: number, default: lots}\n",

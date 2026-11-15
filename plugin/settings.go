@@ -97,7 +97,9 @@ const (
 	maxSettingOptionCount = 500
 )
 
-var settingKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_.-]*$`)
+// settingKeyPattern is the contract's (A3.1). No dots: the Panel's form
+// library reads a dot in a field name as nesting.
+var settingKeyPattern = regexp.MustCompile(`^[A-Za-z0-9_][A-Za-z0-9_-]*$`)
 
 // validateSettingsSchema checks a manifest's settings list. It also turns
 // numeric defaults into float64, the type JSON numbers decode to, so a default
@@ -110,7 +112,7 @@ func validateSettingsSchema(settings []Setting) error {
 	for i := range settings {
 		s := &settings[i]
 		if s.Key == "" || len(s.Key) > maxSettingKeyLength || !settingKeyPattern.MatchString(s.Key) {
-			return fmt.Errorf("setting %d has an invalid key %q (letters, digits, _ . -; at most %d characters)", i, s.Key, maxSettingKeyLength)
+			return fmt.Errorf("setting %d has an invalid key %q (letters, digits, _ and -, not starting with -; at most %d characters)", i, s.Key, maxSettingKeyLength)
 		}
 		if seen[s.Key] {
 			return fmt.Errorf("setting %q is declared twice", s.Key)
