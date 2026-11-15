@@ -36,7 +36,7 @@ func TestPluginRouteScopesInheritCoreAuth(t *testing.T) {
 	config.Set(cfg)
 
 	ok := func(c *gin.Context) { c.String(http.StatusOK, "plugin") }
-	// A disabled plugin's routes, even public ones, are not mounted.
+	// A disabled plugin's routes, even public ones, don't answer.
 	plugin.RegisterRoutes("switchedoff",
 		plugin.Route{Scope: plugin.ScopePublic, Method: http.MethodGet, Path: "/ping", Handler: ok},
 	)
@@ -61,9 +61,8 @@ func TestPluginRouteScopesInheritCoreAuth(t *testing.T) {
 		{"node with token", "/api/ext/authcheck/ping", "secret", http.StatusOK},
 		{"server without token", "/api/servers/missing/ext/authcheck/ping", "", http.StatusUnauthorized},
 		{"server with token, unknown server", "/api/servers/missing/ext/authcheck/ping", "secret", http.StatusNotFound},
-		// Not mounted, so it is an unknown path, which Wings answers with 401
-		// because the auth middleware sits on the engine. Mounted, it was 200.
-		{"disabled plugin's public route", "/ext/switchedoff/ping", "", http.StatusUnauthorized},
+		// Mounted but answering 404 while the plugin is disabled.
+		{"disabled plugin's public route", "/ext/switchedoff/ping", "", http.StatusNotFound},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -77,5 +76,55 @@ func TestPluginRouteScopesInheritCoreAuth(t *testing.T) {
 				t.Fatalf("GET %s: status %d, want %d (body %q)", tt.path, rec.Code, tt.want, rec.Body.String())
 			}
 		})
+	}
+}
+
+// TestPluginRoutesFollowTheEnablePolicyLive covers enabling and disabling a
+// plugin while Wings runs (from the CLI or the Panel): its routes must start
+// and stop answering without rebuilding the router.
+func TestPluginRoutesFollowTheEnablePolicyLive(t *testing.T) {
+	t.Setenv("WINGS_TOKEN_ID", "")
+	t.Setenv("WINGS_TOKEN", "")
+	cfg, err := config.NewAtPath(filepath.Join(t.TempDir(), "config.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.AuthenticationTokenId = "id"
+	cfg.AuthenticationToken = "secret"
+	if err := cfg.ResolveToken(false); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Plugins.Disabled = []string{"livetoggle"}
+	config.Set(cfg)
+
+	plugin.RegisterRoutes("livetoggle",
+		plugin.Route{Scope: plugin.ScopeNode, Method: http.MethodGet, Path: "/ping", Handler: func(c *gin.Context) { c.String(http.StatusOK, "pong") }},
+	)
+	client := backupTestRemoteClient{credentials: make(chan [2]string, 1)}
+	engine := Configure(server.NewEmptyManager(client), client)
+
+	get := func() int {
+		req := httptest.NewRequest(http.MethodGet, "/api/ext/livetoggle/ping", nil)
+		req.Header.Set("Authorization", "Bearer secret")
+		rec := httptest.NewRecorder()
+		engine.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	setDisabled := func(disabled []string) {
+		p := config.Get().Plugins
+		p.Disabled = disabled
+		plugin.ApplyPolicy(p)
+	}
+
+	if code := get(); code != http.StatusNotFound {
+		t.Fatalf("disabled at startup: status %d, want 404", code)
+	}
+	setDisabled(nil)
+	if code := get(); code != http.StatusOK {
+		t.Fatalf("after enabling: status %d, want 200", code)
+	}
+	setDisabled([]string{"livetoggle"})
+	if code := get(); code != http.StatusNotFound {
+		t.Fatalf("after disabling again: status %d, want 404", code)
 	}
 }

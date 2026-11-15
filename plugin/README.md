@@ -164,9 +164,8 @@ reconciles external plugins (`external.Reconcile`):
   update`), or whose `grants` changed, is replaced by a new process;
 - anything else keeps running as it is.
 
-Native event listeners and scheduled tasks check the enable state each time
-they run. Native HTTP routes are still mounted once at startup: enabling or
-disabling a plugin with routes needs a restart for its routes.
+Native event listeners, scheduled tasks and HTTP routes check the enable state
+each time they run. A disabled plugin's routes stay mounted and answer 404.
 
 Per-plugin settings and state live in the plugin's data directory,
 `<plugins directory>/.data/<name>/`, passed to the plugin as `WINGS_PLUGIN_DATA`
