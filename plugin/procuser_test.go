@@ -286,3 +286,44 @@ func statMode(t *testing.T, p string) os.FileMode {
 	}
 	return info.Mode().Perm()
 }
+
+// TestCheckReadOnlyToRefusesASymlinkTheUserOwns: in a sticky directory the
+// owner of an entry can replace it, so a symlink the plugin's user owns on
+// the path to the plugin lets it point the path at its own code.
+func TestCheckReadOnlyToRefusesASymlinkTheUserOwns(t *testing.T) {
+	if os.Geteuid() != 0 {
+		t.Skip("needs root to give a symlink to another user")
+	}
+	base := t.TempDir()
+	if err := os.Chmod(base, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	real := filepath.Join(base, "real", "plugins", "demo")
+	if err := os.MkdirAll(real, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	sticky := filepath.Join(base, "shared")
+	if err := os.Mkdir(sticky, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(sticky, 0o777|os.ModeSticky); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(sticky, "plugins")
+	if err := os.Symlink(filepath.Join(base, "real", "plugins"), link); err != nil {
+		t.Fatal(err)
+	}
+	u := ProcessUser{Name: "nobody", Uid: 65534, Gid: 65534, Switch: true}
+	if err := CheckReadOnlyTo(filepath.Join(link, "demo"), u); err != nil {
+		t.Fatalf("a root-owned symlink in a sticky directory is fine: %v", err)
+	}
+	if err := os.Lchown(link, 65534, 65534); err != nil {
+		t.Fatal(err)
+	}
+	err := CheckReadOnlyTo(filepath.Join(link, "demo"), u)
+	// Linux's fs.protected_symlinks already stops root following it here
+	// ("permission denied"); Wings must refuse it itself, by name.
+	if err == nil || !strings.Contains(err.Error(), "symlink owned by nobody") || !strings.Contains(err.Error(), link) {
+		t.Fatalf("a symlink the plugin's user owns must be refused, got %v", err)
+	}
+}
