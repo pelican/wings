@@ -12,6 +12,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+	"time"
 	"unicode/utf8"
 )
 
@@ -141,8 +142,14 @@ func completeRunes(b []byte) int {
 // directory in it changes. Whether one changed is judged from metadata only
 // (path, type, mode, size, inode, modification and change time), so listing
 // unchanged plugins costs one lstat per file rather than reading them.
+//
+// A file rewritten within one tick of the filesystem's clock keeps its times,
+// so a result is only remembered when every entry is older than formRacyWindow
+// at the time it was read (as git does for "racily clean" files); a directory
+// changed moments ago is read again on every call until then.
 func CachedForm(dir string) (FormInfo, error) {
-	sig, err := statSignature(dir)
+	start := time.Now()
+	sig, newest, err := statSignature(dir)
 	if err != nil {
 		return FormInfo{}, err
 	}
@@ -156,6 +163,9 @@ func CachedForm(dir string) (FormInfo, error) {
 	if err != nil {
 		return FormInfo{}, err
 	}
+	if !newest.Before(start.Add(-formRacyWindow)) {
+		return info, nil
+	}
 	formCache.Lock()
 	defer formCache.Unlock()
 	if formCache.entries == nil || len(formCache.entries) >= maxFormCache {
@@ -164,6 +174,11 @@ func CachedForm(dir string) (FormInfo, error) {
 	formCache.entries[dir] = formCacheEntry{sig: sig, info: info}
 	return info.clone(), nil
 }
+
+// formRacyWindow is how much older than a read every file must be for
+// CachedForm to remember the result: more than any filesystem's timestamp
+// granularity (ext3 and HFS+ have one second).
+var formRacyWindow = 2 * time.Second
 
 // maxFormCache bounds the cache; it starts over when full.
 const maxFormCache = 256
@@ -183,11 +198,12 @@ func (f FormInfo) clone() FormInfo {
 	return f
 }
 
-// statSignature hashes the metadata of every entry under dir.
-func statSignature(dir string) (string, error) {
+// statSignature hashes the metadata of every entry under dir, and returns
+// the newest modification or change time among them.
+func statSignature(dir string) (sig string, newest time.Time, err error) {
 	root, err := os.OpenRoot(dir)
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
 	defer root.Close()
 	h := sha256.New()
@@ -203,11 +219,17 @@ func statSignature(dir string) (string, error) {
 		if st, ok := info.Sys().(*syscall.Stat_t); ok {
 			ino = uint64(st.Ino)
 		}
-		fmt.Fprintf(h, "%s\x00%d\x00%d\x00%d\x00%d\x00%d\x00", name, info.Mode(), info.Size(), ino, info.ModTime().UnixNano(), changeTime(info))
+		ctime := changeTime(info)
+		fmt.Fprintf(h, "%s\x00%d\x00%d\x00%d\x00%d\x00%d\x00", name, info.Mode(), info.Size(), ino, info.ModTime().UnixNano(), ctime)
+		for _, t := range []time.Time{info.ModTime(), time.Unix(0, ctime)} {
+			if t.After(newest) {
+				newest = t
+			}
+		}
 		return nil
 	})
 	if err != nil {
-		return "", err
+		return "", time.Time{}, err
 	}
-	return hex.EncodeToString(h.Sum(nil)), nil
+	return hex.EncodeToString(h.Sum(nil)), newest, nil
 }
