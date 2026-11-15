@@ -22,8 +22,8 @@ type Manifest struct {
 	Name       string     `yaml:"name"`
 	Capability Capability `yaml:"capability"`
 
-	// Authoring metadata. Optional for a plugin to run, but expected for anything
-	// distributed; a marketplace (M5) would require them.
+	// Authoring metadata. Optional for a plugin to run; `wings plugins add`
+	// and the trust prompt show them to the operator.
 	Version     string `yaml:"version"`
 	Author      string `yaml:"author"`
 	Description string `yaml:"description"`
@@ -32,7 +32,7 @@ type Manifest struct {
 	// the code, issues, and releases.
 	Source string `yaml:"source"`
 	// Update is a URL to an update manifest ({version, download, sha256,
-	// signature}) that a future auto-updater (M5) checks to offer upgrades.
+	// signature}) that `wings plugins update` checks for a newer version.
 	Update string `yaml:"update"`
 
 	// MinWings is the minimum Wings version this plugin supports.
@@ -170,8 +170,8 @@ func (e DiscoveryError) Error() string {
 // and returns every manifest that loads and validates. Directories without a
 // manifest are skipped, and a missing plugins directory is not an error. No
 // plugin is executed: this is the read-only half of "discover != execute".
-// Callers apply enable/grant policy to the result before anything is spawned
-// (external-transport wiring lands in a later milestone).
+// Callers apply trust, enable and grant policy to the result before anything
+// is spawned (see external.LoadEnabled).
 func Discover(dir string) ([]Manifest, error) {
 	manifests, issues, err := DiscoverDetailed(dir)
 	if err != nil {

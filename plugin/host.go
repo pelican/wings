@@ -45,9 +45,9 @@ func HostHandler(api HostAPI, granted []string) jsonrpc.Handler {
 
 // GrantsFor computes the host capabilities effectively granted to a plugin: the
 // manifest's requested capabilities narrowed by any per-plugin override in
-// configuration policy. With no override the manifest request is honored as-is
-// (the permissive first-party default); tightening this to user-approved grants
-// is the M5 marketplace step.
+// configuration policy. With no override the manifest request is honored as-is;
+// the operator already approved that request when trusting the plugin, and
+// plugins.grants.<name> can narrow it further.
 func GrantsFor(m Manifest) []string {
 	overrides := config.Get().Plugins.Grants
 	if override, ok := overrides[m.Name]; ok {

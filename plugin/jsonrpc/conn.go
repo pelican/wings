@@ -85,6 +85,42 @@ type message struct {
 }
 
 // Conn is a JSON-RPC connection over a reader/writer pair.
+//
+// # How a connection runs and ends
+//
+// Two goroutines run for its whole life, plus one per request being handled:
+//
+//   - readLoop reads one message per line. A request starts its own goroutine
+//     (at most MaxConcurrentRequests; beyond that it is refused with
+//     ErrCodeBusy), a notification is queued (at most NotificationQueueSize;
+//     newer ones are dropped), and a response is handed to the Call waiting
+//     for it.
+//   - notificationLoop handles queued notifications one at a time, in order.
+//
+// Handlers never run on readLoop, so a handler may Call the peer and still
+// get its answer. Every write holds wmu and is bounded by WriteTimeout.
+//
+// Rules a change must keep. Most bugs found here were in shutdown order, so
+// run `go test -race ./plugin/jsonrpc/ ./plugin/sdk/` after any change.
+//
+//  1. readLoop hands a response to its Call before it fires readDone, so a
+//     Call that sees readDone, or the close that follows it, still finds an
+//     answer the peer sent before hanging up (answerAfterEnd). Test:
+//     TestCallReturnsAResponseSentJustBeforeClose.
+//  2. When the peer stops sending (EOF, a bad or oversized message), readDone
+//     fires at once and every waiting or new Call fails with ErrClosed. The
+//     connection stays open until every queued notification is handled and
+//     every running request has written its reply; then Drained and Done
+//     fire. Tests: TestCallFailsOnceThePeerStopsSending, and in plugin/sdk
+//     TestServeEventListenerAnswersBeforeReturning and
+//     TestServeEventListenerHandlesQueuedEventsBeforeReturning.
+//  3. A write error or a write timeout closes the connection at once. Tests:
+//     TestWriteErrorClosesTheConnection, TestWriteTimesOutWhenThePeerStopsReading.
+//  4. readLoop is the only sender on notes and closes it when it returns.
+//     The connection itself closes once, through closeOnce, so Close may be
+//     called at any time and more than once.
+//  5. Inbound work is bounded. Tests: TestRequestFloodStaysBounded,
+//     TestSlowNotificationHandlerStaysBounded, TestOversizedMessageClosesTheConnection.
 type Conn struct {
 	w       *bufio.Writer
 	enc     *json.Encoder

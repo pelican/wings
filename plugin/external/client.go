@@ -29,7 +29,7 @@ const (
 // use; the process is (re)spawned on demand.
 type Client struct {
 	manifest plugin.Manifest
-	handler  jsonrpc.Handler // inbound host-callback handler (nil until M3)
+	handler  jsonrpc.Handler // inbound host-callback handler; nil rejects every call
 
 	mu        sync.Mutex
 	conn      *jsonrpc.Conn

@@ -428,8 +428,9 @@ type PluginConfiguration struct {
 	// taking precedence over Autoload and Enabled. This is what `wings plugins
 	// disable` writes.
 	Disabled []string `json:"disabled" yaml:"disabled"`
-	// Grants optionally overrides, per provider name, the host capabilities a
-	// plugin may use. Reserved for external transports in a later milestone.
+	// Grants optionally narrows, per plugin name, the host methods an external
+	// plugin may call (requires.hostAPI in its manifest). A method must be in
+	// both lists. Without an entry the plugin gets what its manifest requests.
 	Grants map[string][]string `json:"grants" yaml:"grants"`
 	// Registries maps a namespace to a plugin registry, used by
 	// `wings plugins add @namespace/name`. Private (company) registries carry an

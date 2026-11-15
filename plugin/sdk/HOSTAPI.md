@@ -19,7 +19,8 @@ backing symbol it wraps.
   is listed in "Implemented today".
 - **Grants** = manifest `requires.hostAPI` **∩** operator policy
   (`GrantsFor`/`intersect`). First-party default = grant everything requested
-  (permissive). Marketplace (M5) = user-approved subset. Full surface either way.
+  (the operator approves that request when trusting the plugin), narrowed by
+  `plugins.grants.<name>` when set. Full surface either way.
 - **Wire.** Request/response via `conn.Call`; **streaming** (console, stats,
   install output, backup progress) via `conn.Notify` — the host pushes
   notifications to the plugin, same channel as `events`.
@@ -128,7 +129,8 @@ Omit or high-trust-gate: `fs.symlink`, delete-root/`TruncateRootDirectory`,
 
 Coupling: create/restore call `remote.Client` (`SetBackupStatus`,
 `GetBackupRemoteUploadURLs`, `SendRestorationStatus`). Exposing cleanly needs the
-BackupProvider refactor (M4) — this domain lands with M4, not before.
+BackupProvider refactor, which the RFC defers — this domain lands with it, not
+before.
 
 ### platform — manager / env / events / network / activity
 
@@ -172,7 +174,7 @@ BackupProvider refactor (M4) — this domain lands with M4, not before.
 - **Streaming**: a `host.subscribe`-style call that registers the plugin for a
   topic; host pushes `conn.Notify`. Reuse the event delivery path.
 - **Per-server scope**: a `grantedServers(plugin)` gate every method calls first.
-- **Backup domain waits on M4** (remote.Client coupling).
+- **Backup domain waits on the deferred backup provider** (remote.Client coupling).
 
 ## Rollout order
 
@@ -183,4 +185,5 @@ BackupProvider refactor (M4) — this domain lands with M4, not before.
 3. **Streaming** — `console.stream`, `state/stats.subscribe`.
 4. **Mutating (gated)** — `server.power/command`, `fs.write/...`,
    `events.publish`, `activity.log`.
-5. **M4** — `backup.*` alongside the restic provider.
+5. **Backups** — `backup.*` alongside the restic provider, once the RFC's
+   deferred backup work lands.
