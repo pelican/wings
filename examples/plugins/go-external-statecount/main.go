@@ -16,7 +16,6 @@ import (
 	"path/filepath"
 	"sync"
 
-	"github.com/pelican/wings/plugin"
 	"github.com/pelican/wings/plugin/sdk"
 )
 
@@ -31,7 +30,7 @@ func (*counter) Name() string     { return "statecount" }
 func (*counter) Events() []string { return []string{"server.state"} }
 
 // OnEvent counts the change and writes the counts back to disk.
-func (c *counter) OnEvent(_ context.Context, e plugin.Event) error {
+func (c *counter) OnEvent(_ context.Context, e sdk.Event) error {
 	state, _ := e.Data["state"].(string)
 	c.mu.Lock()
 	defer c.mu.Unlock()

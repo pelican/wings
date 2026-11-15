@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"github.com/pelican/wings/plugin"
+	"github.com/pelican/wings/plugin/sdk"
 )
 
 func TestCountsSurviveARestart(t *testing.T) {
@@ -14,7 +14,7 @@ func TestCountsSurviveARestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, s := range []string{"running", "offline", "running"} {
-		if err := c.OnEvent(context.Background(), plugin.Event{Type: "server.state", Server: "abc", Data: map[string]any{"state": s}}); err != nil {
+		if err := c.OnEvent(context.Background(), sdk.Event{Type: "server.state", Server: "abc", Data: map[string]any{"state": s}}); err != nil {
 			t.Fatal(err)
 		}
 	}

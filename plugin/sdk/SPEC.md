@@ -65,11 +65,13 @@ Config splits by ownership:
 }
 ```
 
-The Go SDK (`sdk.ServeEventListener`) answers `initialize` and dispatches `event`
-notifications for you (see `examples/plugins/go-external-statecount`); any
-other language implements the two messages directly (see
-`examples/plugins/state-log` for Bun and `examples/plugins/python-install-log`
-for Python).
+The Go SDK answers `initialize` and dispatches `event` notifications for you:
+`sdk.ServeEventListener(l)` for a listener that only receives events (see
+`examples/plugins/go-external-statecount`), or `sdk.Serve(func(h *sdk.Host)
+sdk.EventListener { ... })` for one that also calls back into Wings with
+`h.Call(ctx, "server.logs", params, &result)`. Any other language implements
+the messages directly (see `examples/plugins/state-log` for Bun and
+`examples/plugins/python-install-log` for Python).
 
 ## Host callbacks (plugin → host, request)
 
