@@ -153,7 +153,7 @@ func newPluginsAddCommand() *cobra.Command {
 				fmt.Fprintf(os.Stderr, "install failed: %v\n", err)
 				os.Exit(1)
 			default:
-				fmt.Printf("installed and trusted %s %s. Restart Wings to load it.\n", m.Name, m.Version)
+				fmt.Printf("installed and trusted %s %s. A running Wings loads it within a few seconds.\n", m.Name, m.Version)
 			}
 		},
 	}
@@ -190,7 +190,7 @@ func newPluginsTrustCommand() *cobra.Command {
 				fmt.Println("not trusted.")
 				return
 			}
-			fmt.Printf("trusted %s. Restart Wings to load it.\n", m.Name)
+			fmt.Printf("trusted %s. A running Wings loads it within a few seconds.\n", m.Name)
 		},
 	}
 }
@@ -210,7 +210,7 @@ func newPluginsUntrustCommand() *cobra.Command {
 				fmt.Fprintf(os.Stderr, "%v\n", err)
 				os.Exit(1)
 			}
-			fmt.Printf("untrusted %s. Restart Wings to unload it.\n", args[0])
+			fmt.Printf("untrusted %s. A running Wings stops it within a few seconds.\n", args[0])
 		},
 	}
 }
@@ -342,7 +342,7 @@ func newPluginsUpdateCommand() *cobra.Command {
 				fmt.Fprintf(os.Stderr, "update failed: %v\n", err)
 				os.Exit(1)
 			default:
-				fmt.Printf("updated and trusted %s to %s. Restart Wings to load the new version.\n", st.Name, st.Latest)
+				fmt.Printf("updated and trusted %s to %s. A running Wings switches to it within a few seconds.\n", st.Name, st.Latest)
 			}
 		},
 	}
@@ -449,7 +449,7 @@ func newPluginsToggleCommand(verb string, enable bool) *cobra.Command {
 			}
 			c.Plugins = p
 			config.Set(c)
-			fmt.Printf("%sd %q. Restart Wings for external providers to (re)spawn.\n", verb, name)
+			fmt.Printf("%sd %q. A running Wings applies this within a few seconds.\n", verb, name)
 		},
 	}
 }

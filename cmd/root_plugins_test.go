@@ -10,6 +10,7 @@ import (
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/plugin"
 	"github.com/pelican/wings/plugin/external"
+	"github.com/pelican/wings/plugin/install"
 )
 
 // TestCLIPluginChangesApplyWithoutRestart runs the daemon's reload against the
@@ -43,7 +44,7 @@ func TestCLIPluginChangesApplyWithoutRestart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := recordPluginTrust(m); err != nil {
+	if err := install.RecordTrust(m); err != nil {
 		t.Fatal(err)
 	}
 
@@ -111,7 +112,7 @@ func TestCLIPluginChangesApplyWithoutRestart(t *testing.T) {
 	waitFor("stop the untrusted plugin", false)
 
 	// `wings plugins trust`.
-	if err := recordPluginTrust(m); err != nil {
+	if err := install.RecordTrust(m); err != nil {
 		t.Fatal(err)
 	}
 	waitFor("load the trusted plugin", true)
