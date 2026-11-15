@@ -251,6 +251,13 @@ func CheckReadOnlyTo(dir string, u ProcessUser) error {
 	}
 	ancestors := func(from string) error {
 		for p := filepath.Dir(from); ; p = filepath.Dir(p) {
+			// A symlink u owns can be replaced by u wherever its parent lets
+			// owners move their own entries, as a sticky directory does.
+			if li, err := os.Lstat(p); err == nil && li.Mode()&fs.ModeSymlink != 0 {
+				if st, ok := li.Sys().(*syscall.Stat_t); ok && int(st.Uid) == u.Uid {
+					return fmt.Errorf("plugin: %s is a symlink owned by %s, the user the plugin runs as, which could point it elsewhere; the path to the plugin must be read-only to it", p, u.Name)
+				}
+			}
 			info, err := os.Stat(p)
 			if err != nil {
 				return err
