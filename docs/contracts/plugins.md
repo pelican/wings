@@ -1,10 +1,10 @@
 # Contract: plugins across Wings and Panel
 
-**Contract v3.1, 2026-11-15.** Source of truth for plugin interfaces shared by pelican/wings and pelican/panel.
-Owner: Alexandru Vlad (Scai). Sections: R (registry format), L (Panel access levels), A (Wings plugin HTTP
-API for the Panel).
+**Contract v3.2, 2026-11-15.** Source of truth for plugin interfaces shared by pelican/wings and pelican/panel.
+Owner: Alexandru Vlad (Scai). Sections: R (registry format), L (Panel access levels), S (security model and
+responsibilities), A (Wings plugin HTTP API for the Panel).
 
-Work against this contract, as of v3.1:
+Work against this contract, as of v3.2:
 - pelican/wings PR 251 (stacked on PR 250), branch `scai/plugin-panel-api`: sections R (Wings side), L, A.
 - pelican/panel PR 2785, branch `scai/plugin-registries`: section R for Panel plugins.
 - pelican/panel PR 2786, branch `scai/wings-plugins-contract` (builds on pelican/panel PR 2701): sections L, A.
@@ -78,6 +78,12 @@ a company server) or a site that generates it (the Pelican Hub, planned at
 
 Unknown fields are ignored by both sides (forward compatible). Maximum document size: 1 MiB.
 
+**Archive layout.** The manifest (`plugin.yaml` for Wings, `plugin.json` for the Panel) is either at the
+archive's root, or inside a single top-level directory with nothing else at the top level (how GitHub
+release archives and the Hub package plugins); in that case that directory's contents are the plugin. Any
+other layout is refused with a message about the layout. Error messages never show internal staging
+paths.
+
 ### R2. Fetching and downloading
 
 1. https only, on every hop. A redirect to a non-https URL is refused. At most 10 redirects.
@@ -138,6 +144,44 @@ wins). A Panel config push can never change it. An unknown value means `off`.
 At every level the Panel cannot change the node's registries, trusted keys, signature requirement or grants.
 Ways to set it: `wings configure --plugin-access <level>` (the Panel's auto-deploy command can add this flag
 for new nodes), `wings plugins panel-access <level>` on an existing node, or the environment variable.
+
+## S. Security model and responsibilities
+
+A plugin is code the operator chooses to run. Neither side can make arbitrary code safe or readable; what
+they must do is make the operator's decision informed, make it stick, and limit the damage when trust is
+misplaced.
+
+**Guaranteed (both sides, as each applies):**
+- Nothing runs until it is approved (operator on the node, or a Panel admin within the node's level, L).
+- What runs is exactly what was approved: the approval covers a hash of the plugin's files; a plugin whose
+  files changed is stopped and not started again until approved again.
+- Host access is deny by default: a plugin can call only the host methods it requested and was granted.
+- Downloads follow R2 (https, sha256, signatures, same-origin credentials).
+
+**Not guaranteed, and said so at every approval:**
+- That the code is safe, or readable: a plugin may ship compiled binaries.
+- That host access bounds the plugin: it limits what the plugin can ask Wings; the process itself has the
+  access of the OS user it runs as.
+
+**Process user (Wings).** When Wings runs as root, external plugins run as Wings' system user
+(`system.user`, `pelican` by default), never as root. The plugin's own directory is read-only to that
+user; its data directory (`<plugins>/.data/<name>`) is owned by it. The operator may opt out with
+`plugins.run_as_root: true` (CLI only, like the rest of L). When Wings itself is not root (rootless, or a
+developer machine), plugins run as that same user. Native plugins run inside Wings.
+
+**Disclosure at approval.** Every approval, the CLI's prompt and the Panel's (A4), shows: name, version,
+author, source; whether it is **source** or **binary**, and which files are binary; the signature status;
+the requested host access; the OS user it runs as; and this sentence: "This plugin runs on this node as
+<user>, with that user's access to the machine. The host access listed only limits what it can ask Wings."
+A file is text when it is valid UTF-8 and has no NUL bytes; a plugin with any other file is `binary`.
+
+**Responsibilities.** Wings and the Panel: the guarantees and the disclosure above, safe defaults, and
+honest documentation. The node operator: what to install, which registries and keys to trust, the Panel's
+level. The plugin author: an honest manifest, published source, signed releases. A registry (and the Hub):
+review, signing, taking down bad releases.
+
+**Not yet** (follow-ups, not promised by this version): sandboxing beyond the OS user (seccomp,
+namespaces), host access scoped per server, registry-driven revocation, and a source-only policy.
 
 ## A. Wings plugin HTTP API for the Panel
 
@@ -206,6 +250,9 @@ A body of `[]` is treated as `{}`.
 | `meta.can_enable`, `can_disable`, `can_configure`, `can_update`, `can_uninstall` | bool | plugin state combined with the node's access level; the Panel shows actions from these |
 | `meta.load_order` | number | always 0 |
 | `meta.registered` | object | what the plugin registered (e.g. `{"hooks": [...]}`) |
+| `meta.form` | `"source"` \| `"binary"` \| `"native"` | S; `native` for plugins compiled into Wings |
+| `meta.binary_files` | [string] | up to 20 plugin-relative paths of non-text files; `[]` when `form` isn't `binary` |
+| `meta.runs_as` | string | the OS user the plugin runs as (S); for native plugins, Wings' own user |
 
 Every list that is present is an array, never `null`.
 
@@ -229,9 +276,10 @@ allows updates; whether a newer version exists comes from `update-check`.
 1. First call: Wings downloads, checks and stages the archive (nothing is installed) and answers **202**:
    `{"status": "approval_required", "action": "install"|"update"|"import", "plugin": {name, version, author,
    description, capability, source, entrypoint, events, settings}, "host_access": [string], "replaces":
-   string|null, "signed": bool, "approval_token": string, "expires_at": RFC 3339, "approve_with": {method,
-   path, body}}`.
-2. The Panel shows the admin `plugin`, `host_access`, `replaces` and `signed`, and asks for approval.
+   string|null, "signed": bool, "form": "source"|"binary", "binary_files": [string], "runs_as": string,
+   "approval_token": string, "expires_at": RFC 3339, "approve_with": {method, path, body}}`.
+2. The Panel shows the admin `plugin`, `host_access`, `replaces`, `signed`, `form` (with `binary_files`) and
+   `runs_as`, with the sentence from S, and asks for approval.
 3. Second call to the **same** endpoint with `{"approve": "<approval_token>"}`: Wings installs, records the
    approval in the node's trust store and loads the plugin; **200** `{"status": "installed"|"updated",
    "plugin": Plugin}`.
@@ -289,3 +337,6 @@ order. `POST /api/plugins/order` answers 501; the Panel should not offer reorder
   `update` refuse untrusted external plugins (409 `reason: "untrusted"`) and never fetch their URL; 409s may carry
   `reason` (`token`, `destination_changed`, `untrusted`); R2.6 records that the Hub's signing key ships as a
   default trusted key once the Hub signs releases.
+- v3.2 (2026-11-15, owner approved): R1 archive layout (manifest at the root or in one top-level directory;
+  no staging paths in errors); new section S (security model, responsibilities, process user, disclosure);
+  `meta.form`, `meta.binary_files`, `meta.runs_as` (A3) and the same in the staged response (A4).
