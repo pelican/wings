@@ -1,6 +1,6 @@
 module github.com/pelican/wings
 
-go 1.26.1
+go 1.27.4
 
 require (
 	emperror.dev/errors v0.8.1
@@ -9,7 +9,6 @@ require (
 	github.com/apex/log v1.9.0
 	github.com/asaskevich/govalidator v0.0.0-20230301143203-a9d515a09cc2
 	github.com/beevik/etree v1.8.1
-	github.com/buger/jsonparser v1.6.1
 	github.com/cenkalti/backoff/v4 v4.3.0
 	github.com/creasty/defaults v1.8.0
 	github.com/docker/docker v28.5.2+incompatible
