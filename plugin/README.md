@@ -238,9 +238,10 @@ logged and treated as `off`, so a typo never grants more than intended.
 on a new node). A running Wings applies a change to the file within a few
 seconds.
 
-Why only the operator: external plugins run on the node as the Wings user,
-usually root, with the host access their manifest asks for. Letting the Panel
-put new code there hands everyone with Panel admin rights a shell on the node.
+Why only the operator: external plugins run on the node as `system.user`
+(root with `plugins.run_as_root`), which owns every server's files, with the
+host access their manifest asks for. Letting the Panel put new code there
+hands everyone with Panel admin rights a shell on the node as that user.
 Like `allowed_mounts`, it is set where the node is run, and a configuration
 push from the Panel never changes it.
 
@@ -278,10 +279,12 @@ informed, make it stick, and limit the damage when trust is misplaced.
 
 **Guaranteed:**
 
-- Nothing runs until it is approved (`wings plugins add`, `update` or `trust`).
+- Nothing runs until it is approved: by the operator (`wings plugins add`,
+  `update` or `trust`), or by a Panel admin within the node's
+  `plugins.panel_access` level (see `API.md`).
 - What runs is exactly what was approved: the approval covers a hash of the
   plugin's files and of its manifest's entrypoint, events and host access. A
-  plugin whose files changed is not loaded at Wings' next start until it is
+  plugin whose files changed is stopped and not started again until it is
   approved again.
 - Host access is deny by default: a plugin can call only the host methods it
   requested and was granted.
@@ -328,7 +331,7 @@ Limits to keep in mind:
 
 **Responsibilities.** Wings: the guarantees and the disclosure above, safe
 defaults, and honest documentation. The node operator: what to install, which
-registries and keys to trust. The plugin author: an honest manifest, published
+registries and keys to trust, and the Panel's access level. The plugin author: an honest manifest, published
 source, signed releases. A registry (and the Pelican Hub): review, signing, and
 taking down bad releases.
 

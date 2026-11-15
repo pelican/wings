@@ -129,7 +129,10 @@ One plugin (also the body of `GET /api/plugins/{id}`):
     "can_disable": true,
     "can_configure": true,
     "can_update": true,
-    "can_uninstall": true
+    "can_uninstall": true,
+    "form": "source",
+    "binary_files": [],
+    "runs_as": "pelican"
   }
 }
 ```
@@ -151,6 +154,16 @@ One plugin (also the body of `GET /api/plugins/{id}`):
   `can_update` means the plugin has an update URL and the level allows
   updates; whether a newer version exists comes from `update-check`.
   `load_order` is always 0.
+- `meta.form` is `source` (every file in the plugin's directory is text:
+  valid UTF-8 with no NUL bytes), `binary` (any other file, such as a
+  compiled program), or `native` (compiled into Wings). `meta.binary_files`
+  lists up to 20 of a binary plugin's non-text files, as paths inside the
+  plugin; it is `[]` otherwise. A plugin whose files can't be read is
+  reported as `binary`.
+- `meta.runs_as` is the OS user the plugin runs as: for an external plugin,
+  `system.user` when Wings runs as root (or `root` with
+  `plugins.run_as_root`), or Wings' own user when Wings isn't root; for a
+  native plugin, Wings' own user. See "What an approval means".
 - `panel_access` is always present, and `enabled` is always `true`
   (reserved). `url`, `update_url` and `wings_version` are left out when
   empty, and `entrypoint` for native plugins. Every list that is present is
@@ -214,8 +227,8 @@ At most 5000 files are listed (`truncated` says if there were more).
 {"file": "lib/util.ts", "size": 812, "binary": false, "content": "..."}
 ```
 
-A file that is not valid UTF-8 comes back with `"binary": true` and no
-`content`. Everything is read through an `os.Root` opened on the plugin's
+A file that is not text (valid UTF-8 with no NUL bytes, as for `meta.form`)
+comes back with `"binary": true` and no `content`. Everything is read through an `os.Root` opened on the plugin's
 directory: `..`, absolute paths and symlinks leading out of it are refused.
 Settings live in the data directory, not here, so they never show up.
 
@@ -287,14 +300,20 @@ HTTP/1.1 202 Accepted
   "host_access": ["server.logs"],
   "replaces": null,
   "signed": true,
+  "form": "binary",
+  "binary_files": ["bin/state-log"],
+  "runs_as": "pelican",
   "approval_token": "5f2c...e9",
   "expires_at": "2026-11-15T12:10:00Z",
   "approve_with": {"method": "POST", "path": "/api/plugins/state-log/install", "body": {"approve": "5f2c...e9"}}
 }
 ```
 
-Show the admin `plugin` and `host_access`. If they approve, send the token
-back to the same endpoint:
+Show the admin `plugin`, `host_access`, `replaces`, `signed`, `form` (with
+`binary_files`) and `runs_as`, with the sentence in "What an approval means"
+below, and ask them to approve. `form`, `binary_files` and `runs_as` mean what
+they do in the plugin object. If they approve, send the token back to the
+same endpoint:
 
 ```http
 POST /api/plugins/state-log/install
@@ -334,6 +353,24 @@ trusted plugins.
     staging (also under another directory name), 409. Stage again.
 - `replaces` is the version being replaced (`update`, or an `import` over an
   installed plugin), or `null`.
+- Archives have `plugin.yaml` at their root, or inside a single top-level
+  directory with nothing else next to it (how GitHub release archives and the
+  Pelican Hub package plugins); that directory's contents become the plugin.
+  Any other layout is a 422 saying so. Error messages never show the staging
+  directory's path.
+
+#### What an approval means
+
+Approving runs the plugin's code on the node. Wings does not review it, and
+a `binary` plugin's code can't be read. Host access limits what the plugin can
+ask Wings; the process itself has the access of the OS user it runs as
+(`runs_as`), and `system.user` owns every server's files. Contract section S
+asks every approval to say so with this sentence, with `runs_as` for `<user>`:
+
+> This plugin runs on this node as <user>, with that user's access to the
+> machine. The host access listed only limits what it can ask Wings.
+
+The threat model is in [`README.md`](README.md#threat-model).
 
 **Install** (`POST /api/plugins/{id}/install`): `{id}` is looked up in the
 node's configured registries (`plugins.registries`). It must be in exactly
@@ -362,8 +399,7 @@ the advertised version.
 or a `multipart/form-data` upload with the archive in the field `plugin`
 (and an optional `signature` field). The plugin's name comes from the
 archive's `plugin.yaml`; an installed plugin of that name is replaced.
-Archives are `.tar.gz` or `.zip` with `plugin.yaml` at the top, at most
-200 MiB. Approve with `POST /api/plugins/import` and `{"approve": "<token>"}`.
+Archives are `.tar.gz` or `.zip`, laid out as above, at most 200 MiB. Approve with `POST /api/plugins/import` and `{"approve": "<token>"}`.
 
 ### Uninstall
 

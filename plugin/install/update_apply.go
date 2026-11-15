@@ -591,3 +591,10 @@ func swapIn(root *os.Root, name, staging string) (string, error) {
 	}
 	return holder, nil
 }
+
+// Form says whether the staged plugin is source or binary, and lists its
+// binary files (contract S). Errors don't show the staging path.
+func (s *StagedInstall) Form() (plugin.FormInfo, error) {
+	f, err := plugin.DetectForm(s.StagingDir)
+	return f, hideStaging(err, s.StagingDir)
+}

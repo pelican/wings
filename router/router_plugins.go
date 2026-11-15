@@ -192,6 +192,12 @@ type pluginMetaJSON struct {
 	CanUpdate    bool   `json:"can_update"`
 	CanUninstall bool   `json:"can_uninstall"`
 	Error        string `json:"error,omitempty"`
+	// Form is "source", "binary" or "native" (contract S); BinaryFiles
+	// lists up to 20 of a binary plugin's non-text files; RunsAs is the OS
+	// user the plugin runs as.
+	Form        plugin.Form `json:"form"`
+	BinaryFiles []string    `json:"binary_files"`
+	RunsAs      string      `json:"runs_as"`
 }
 
 type registeredJSON struct {
@@ -273,6 +279,8 @@ func describePlugin(info plugin.ProviderInfo, ts *plugin.TrustStore, level plugi
 		meta.Status, meta.StatusMessage = "disabled", info.Reason
 	}
 
+	meta.Form, meta.BinaryFiles, meta.RunsAs = describeProcess(info)
+
 	external := info.Kind == plugin.KindExternal
 	meta.CanEnable = level.Allows(plugin.ActionToggle) && !info.Enabled && runnable && meta.Error == ""
 	meta.CanDisable = level.Allows(plugin.ActionToggle) && info.Enabled
@@ -282,6 +290,34 @@ func describePlugin(info plugin.ProviderInfo, ts *plugin.TrustStore, level plugi
 	meta.CanUninstall = level.Allows(plugin.ActionInstallSigned) && external
 	p.Meta = meta
 	return p
+}
+
+// describeProcess returns a plugin's form, its binary files and the OS user
+// it runs as (contract S). A native plugin is compiled into Wings and runs as
+// Wings' own user. An external plugin whose files can't be read is reported
+// as binary: Wings can't say it is readable.
+func describeProcess(info plugin.ProviderInfo) (plugin.Form, []string, string) {
+	if info.Kind != plugin.KindExternal {
+		return plugin.FormNative, []string{}, plugin.WingsUser().Name
+	}
+	form, binary := plugin.FormBinary, []string{}
+	if info.Manifest != "" {
+		if f, err := plugin.CachedForm(filepath.Dir(info.Manifest)); err == nil {
+			form, binary = f.Form, f.BinaryFiles
+		}
+	}
+	return form, binary, processUserName()
+}
+
+// processUserName is the name of the OS user external plugins run as. If
+// they can't run (system.user is root without plugins.run_as_root), it is the
+// configured system.user, which they run as once that is fixed.
+func processUserName() string {
+	u, err := plugin.ExternalProcessUser()
+	if err != nil {
+		return config.Get().System.Username
+	}
+	return u.Name
 }
 
 // apiVersionNumber turns a manifest apiVersion ("v1") into the Panel's
@@ -544,7 +580,8 @@ func getPluginSource(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusRequestEntityTooLarge, gin.H{"error": fmt.Sprintf("%q is larger than %d bytes", file, maxSourceFileBytes)})
 		return
 	}
-	if !utf8.Valid(b) {
+	// Text as contract S defines it, as in meta.form: valid UTF-8, no NUL.
+	if !utf8.Valid(b) || bytes.IndexByte(b, 0) >= 0 {
 		c.JSON(http.StatusOK, gin.H{"file": file, "size": len(b), "binary": true})
 		return
 	}
@@ -817,8 +854,12 @@ func respondStaged(c *gin.Context, action, path string, stage *install.StagedIns
 		err = check(m)
 	}
 	var digest, token, destination string
+	var form plugin.FormInfo
 	if err == nil {
 		digest, err = stage.Digest()
+	}
+	if err == nil {
+		form, err = stage.Form()
 	}
 	if err == nil {
 		destination, err = destinationState(stage, m.Name)
@@ -866,6 +907,9 @@ func respondStaged(c *gin.Context, action, path string, stage *install.StagedIns
 		"host_access":    nonNil(m.Requires.HostAPI),
 		"replaces":       replaces,
 		"signed":         p.signed,
+		"form":           form.Form,
+		"binary_files":   form.BinaryFiles,
+		"runs_as":        processUserName(),
 		"approval_token": token,
 		"expires_at":     p.expires.UTC().Format(time.RFC3339),
 		"approve_with":   gin.H{"method": http.MethodPost, "path": path, "body": gin.H{"approve": token}},
