@@ -20,6 +20,8 @@ var boundaries = []struct {
 	why        string // shown when the rule is broken
 }{
 	{"plugin/contract", nil, false, "plugin authors import it; it must stay standard library only"},
+	{"plugin/jsonrpc", nil, false, "the wire transport; the SDK depends on it"},
+	{"plugin/sdk", []string{"plugin/contract", "plugin/jsonrpc"}, false, "every Go plugin binary links it"},
 	{"plugin", []string{"config", "system", "plugin/contract", "plugin/jsonrpc"}, true, "the runtime must not depend on installing, running external plugins, or the server layer"},
 }
 
