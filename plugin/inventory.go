@@ -44,6 +44,12 @@ func Inventory() ([]ProviderInfo, error) {
 	var out []ProviderInfo
 
 	for _, s := range defaultRegistry.snapshot() {
+		// A loaded external plugin is in the registry too (its client); it is
+		// listed below from its manifest, so listing it here would add a
+		// second, "native" entry that hides the real one.
+		if ext, ok := s.(ExternalListener); ok && ext.External() {
+			continue
+		}
 		enabled, reason := enableState(s.Name())
 		out = append(out, ProviderInfo{
 			Name:       s.Name(),
@@ -135,6 +141,13 @@ func issueName(issue DiscoveryIssue) string {
 		return filepath.Base(issue.Dir)
 	}
 	return filepath.Base(filepath.Dir(issue.Manifest))
+}
+
+// ExternalListener is implemented by event listeners that front an external
+// plugin process (plugin/external), so the inventory doesn't list them as
+// native plugins.
+type ExternalListener interface {
+	External() bool
 }
 
 // Find returns the ProviderInfo for a given name, if present in the inventory.

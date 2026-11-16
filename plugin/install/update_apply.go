@@ -22,46 +22,53 @@ import (
 
 // StageUpdate downloads, verifies, and extracts an update without replacing the
 // live plugin directory. Callers can inspect stage.Manifest before Commit.
-func StageUpdate(ctx context.Context, st UpdateStatus) (*StagedInstall, error) {
+func StageUpdate(ctx context.Context, st UpdateStatus, opts ...StageOption) (*StagedInstall, error) {
 	if st.download == "" || st.sha256 == "" || st.dir == "" {
 		return nil, errors.New("plugin: incomplete update status; run CheckUpdate first")
 	}
-	return stageArchive(ctx, st.download, st.sha256, st.signature, st.dir, auth{})
+	return stageArchive(ctx, st.download, st.sha256, st.signature, st.dir, auth{}, applyStageOptions(opts))
 }
 
-func stageArchive(ctx context.Context, download, wantSHA256, signature, destDir string, a auth) (*StagedInstall, error) {
+func stageArchive(ctx context.Context, download, wantSHA256, signature, destDir string, a auth, o stageOptions) (*StagedInstall, error) {
 	archivePath, digest, err := downloadAndVerify(ctx, download, wantSHA256, a)
 	if err != nil {
 		return nil, err
 	}
 	defer os.Remove(archivePath)
-
-	signed, err := enforceSignature(digest, signature)
+	staging, signed, err := extractToStaging(ctx, archivePath, digest, signature, filepath.Dir(destDir), o)
 	if err != nil {
 		return nil, err
 	}
+	return &StagedInstall{DestDir: destDir, StagingDir: staging, archiveDigest: digest, signature: signature, signed: signed}, nil
+}
 
-	// Stage inside destDir's parent so the final swap is an atomic
-	// same-filesystem rename (avoids a cross-device copy).
-	parent := filepath.Dir(destDir)
+// extractToStaging applies the signing policy to a verified archive and
+// unpacks it into a new hidden staging directory in parent, returning its
+// path and whether the archive's signature verified. Staging inside the
+// plugins directory makes the final swap an atomic same-filesystem rename (no
+// cross-device copy).
+func extractToStaging(ctx context.Context, archivePath string, digest []byte, signature, parent string, o stageOptions) (string, bool, error) {
+	signed, err := enforceSignature(digest, signature, o)
+	if err != nil {
+		return "", false, err
+	}
 	if err := os.MkdirAll(parent, 0o755); err != nil {
-		return nil, err
+		return "", false, err
 	}
 	root, err := os.OpenRoot(parent)
 	if err != nil {
-		return nil, err
+		return "", false, err
 	}
 	defer root.Close()
 	staging, err := mkdirHidden(root, ".wings-install-")
 	if err != nil {
-		return nil, hideStaging(err, "")
+		return "", false, hideStaging(err, "")
 	}
-
 	if err := extractPlugin(ctx, archivePath, filepath.Join(parent, staging)); err != nil {
 		_ = root.RemoveAll(staging)
-		return nil, hideStaging(err, filepath.Join(parent, staging))
+		return "", false, hideStaging(err, filepath.Join(parent, staging))
 	}
-	return &StagedInstall{DestDir: destDir, StagingDir: filepath.Join(parent, staging), signed: signed}, nil
+	return filepath.Join(parent, staging), signed, nil
 }
 
 // extractPlugin unpacks a plugin archive into dest and moves the plugin's
@@ -120,14 +127,29 @@ type StagedInstall struct {
 	// lock is the plugins directory's install lock, held from Commit until
 	// Finish or Rollback.
 	lock *os.File
-	// signed is whether the archive's signature verified.
-	signed bool
+	// archiveDigest and signature are the archive's sha256 and the signature
+	// offered with it, kept so the signing policy can be applied again at
+	// approval (CheckSignature). signed is whether that signature verified.
+	archiveDigest []byte
+	signature     string
+	signed        bool
 }
 
 // Signed reports whether the archive's signature verified against a key in
 // plugins.trusted_keys when it was staged. An unsigned archive staged where
 // no signature was required is not signed.
 func (s *StagedInstall) Signed() bool { return s.signed }
+
+// CheckSignature applies the signing policy, as configured now, to the staged
+// archive again: plugins.trusted_keys or plugins.require_signatures may have
+// changed since it was staged.
+func (s *StagedInstall) CheckSignature(opts ...StageOption) error {
+	if s.archiveDigest == nil {
+		return errors.New("plugin: the staged archive's digest is unknown")
+	}
+	_, err := enforceSignature(s.archiveDigest, s.signature, applyStageOptions(opts))
+	return err
+}
 
 // installLockName is the lock file installs take in the plugins directory.
 // A hidden file, so discovery never looks at it.
@@ -182,7 +204,12 @@ func (s *StagedInstall) Manifest() (plugin.Manifest, error) {
 // until Finish discards it or Rollback restores it, so a caller that still has
 // work to do after the swap (recording the operator's approval) can undo it.
 // If the swap itself fails, the previous version is already back in place.
-func (s *StagedInstall) Commit() error {
+func (s *StagedInstall) Commit() error { return s.CommitIf(nil) }
+
+// CommitIf is Commit, but runs ok under the install lock first and commits
+// only if it returns nil: a check of the destination there can't be raced by
+// another install.
+func (s *StagedInstall) CommitIf(ok func() error) error {
 	if s.committed {
 		return nil
 	}
@@ -195,10 +222,19 @@ func (s *StagedInstall) Commit() error {
 	if err != nil {
 		return err
 	}
-	holder, err := swapIn(root, name, staging)
-	if err != nil {
+	release := func() {
 		_ = unix.Flock(int(lock.Fd()), unix.LOCK_UN)
 		_ = lock.Close()
+	}
+	if ok != nil {
+		if err := ok(); err != nil {
+			release()
+			return err
+		}
+	}
+	holder, err := swapIn(root, name, staging)
+	if err != nil {
+		release()
 		return hideStaging(err, s.StagingDir)
 	}
 	s.lock = lock
@@ -267,7 +303,9 @@ func (s *StagedInstall) Cleanup() error {
 
 // downloadAndVerify streams the archive to a temp file while hashing it, checks
 // the digest against the expected value, and returns the temp path plus the raw
-// digest (used for signature verification).
+// digest (used for signature verification). An empty wantSHA256 skips the
+// check; only StageURL, which has no registry entry to take one from, passes
+// one, and its callers' policy decides whether that is acceptable.
 func downloadAndVerify(ctx context.Context, rawURL, wantSHA256 string, a auth) (string, []byte, error) {
 	body, err := httpsGet(ctx, rawURL, maxUpdateArchiveBytes, a)
 	if err != nil {
@@ -288,7 +326,7 @@ func downloadAndVerify(ctx context.Context, rawURL, wantSHA256 string, a auth) (
 	tmp.Close()
 
 	digest := h.Sum(nil)
-	if got := hex.EncodeToString(digest); !strings.EqualFold(got, wantSHA256) {
+	if got := hex.EncodeToString(digest); wantSHA256 != "" && !strings.EqualFold(got, wantSHA256) {
 		os.Remove(tmp.Name())
 		return "", nil, fmt.Errorf("plugin: checksum mismatch (want %s, got %s)", wantSHA256, got)
 	}
@@ -552,4 +590,11 @@ func swapIn(root *os.Root, name, staging string) (string, error) {
 		return "", fmt.Errorf("plugin: installing new plugin: %w", err)
 	}
 	return holder, nil
+}
+
+// Form says whether the staged plugin is source or binary, and lists its
+// binary files (contract S). Errors don't show the staging path.
+func (s *StagedInstall) Form() (plugin.FormInfo, error) {
+	f, err := plugin.DetectForm(s.StagingDir)
+	return f, hideStaging(err, s.StagingDir)
 }

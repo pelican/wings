@@ -86,6 +86,10 @@ func Configure(m *wserver.Manager, client remote.Client) *gin.Engine {
 	protected.DELETE("/api/transfers/:server", deleteTransfer)
 	protected.POST("/api/deauthorize-user", postDeauthorizeUser)
 
+	// The Panel's plugin management API. Each handler also checks the node's
+	// plugins.panel_access level (router_plugins.go, plugin/API.md).
+	registerPluginAPI(protected)
+
 	// These are server specific routes, and require that the request be authorized, and
 	// that the server exist on the Daemon.
 	server := router.Group("/api/servers/:server")

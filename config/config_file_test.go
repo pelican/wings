@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strconv"
+	"sync"
 	"testing"
 )
 
@@ -109,5 +110,71 @@ func TestUpdatePluginsOnDiskFromSeveralProcesses(t *testing.T) {
 	}
 	if len(got.Disabled) != processes*changes {
 		t.Fatalf("%d of %d changes survived", len(got.Disabled), processes*changes)
+	}
+}
+
+func TestPluginsOnDiskReadsTheFilesBlock(t *testing.T) {
+	c := newTestConfig(t)
+	if _, err := UpdatePluginsOnDisk(c, func(p *PluginConfiguration) {
+		p.Disabled = []string{"x"}
+		p.PanelAccess = "signed"
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// c in memory still has the defaults; the file is what counts.
+	p, err := PluginsOnDisk(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !slices.Equal(p.Disabled, []string{"x"}) || p.PanelAccess != "signed" || !p.Autoload {
+		t.Fatalf("PluginsOnDisk = %+v, want the block in the file with defaults for the rest", p)
+	}
+}
+
+// TestRunningPluginsEndAsTheFile has the daemon change the plugins block (as
+// the Panel API does) while its watcher reloads the block other processes
+// wrote, and checks the running block ends equal to the file. The race it is
+// about, an older copy applied after the lock was released, is too narrow to
+// hit reliably (30 runs with the old placement passed); it is closed by
+// construction, since the running block now only changes under the file lock.
+func TestRunningPluginsEndAsTheFile(t *testing.T) {
+	c := newTestConfig(t)
+	Set(c)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(2)
+		go func(i int) {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				name := fmt.Sprintf("p%d", (i+j)%5)
+				if _, err := UpdatePluginsOnDisk(c, func(p *PluginConfiguration) {
+					if slices.Contains(p.Disabled, name) {
+						p.Disabled = slices.DeleteFunc(p.Disabled, func(n string) bool { return n == name })
+					} else {
+						p.Disabled = append(p.Disabled, name)
+					}
+				}); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}(i)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				if _, err := ReloadPluginsFromDisk(c); err != nil {
+					t.Error(err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	onDisk, err := pluginsFromFile(c.path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if running := Get().Plugins.Disabled; !slices.Equal(running, onDisk.Disabled) {
+		t.Fatalf("running disabled list %v, file %v", running, onDisk.Disabled)
 	}
 }

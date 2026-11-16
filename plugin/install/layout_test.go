@@ -39,10 +39,10 @@ type stageResult struct {
 	err        error
 }
 
-// stagePaths stages archive the ways a registry entry and an update manifest
-// do, each into a fresh plugins directory, and returns the results by path.
-// The URL and upload imports (StageURL, StageFile) go through the same
-// staging step; they are covered where they are defined.
+// stagePaths stages archive every way Wings stages one, each into a fresh
+// plugins directory, and returns the results by path: a registry entry
+// (add), an update manifest (update), a URL import (url) and an uploaded
+// archive (upload).
 func stagePaths(t *testing.T, archive string) map[string]stageResult {
 	t.Helper()
 	setConfig(t)
@@ -57,6 +57,14 @@ func stagePaths(t *testing.T, archive string) map[string]stageResult {
 	pluginDir(t, filepath.Join(dir, "demo"), "demo v1")
 	s, err = StageUpdate(context.Background(), UpdateStatus{Name: "demo", download: url, sha256: sum, dir: filepath.Join(dir, "demo")})
 	out["update"] = stageResult{dir, s, err}
+
+	dir = t.TempDir()
+	s, err = StageURL(context.Background(), url, sum, "", dir)
+	out["url"] = stageResult{dir, s, err}
+
+	dir = t.TempDir()
+	s, err = StageFile(context.Background(), archive, "", dir)
+	out["upload"] = stageResult{dir, s, err}
 	return out
 }
 

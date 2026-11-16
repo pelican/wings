@@ -6,6 +6,7 @@ package external
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -31,10 +32,32 @@ const (
 type Client struct {
 	manifest plugin.Manifest
 	handler  jsonrpc.Handler // inbound host-callback handler; nil rejects every call
+	// verify, if set, runs before every process start; an error keeps the
+	// process from starting. Reconcile uses it to check the plugin's files
+	// still match its approval.
+	verify func() error
 
 	mu        sync.Mutex
 	conn      *jsonrpc.Conn
 	lastSpawn time.Time
+	closed    bool
+}
+
+// errClosed is returned for a client that Close has stopped.
+var errClosed = errors.New("plugin stopped")
+
+// Close stops the plugin process, if it is running, and keeps the client from
+// starting it again. Events still queued for the plugin are dropped.
+func (c *Client) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.closed = true
+	if c.conn == nil {
+		return nil
+	}
+	err := c.conn.Close()
+	c.conn = nil
+	return err
 }
 
 // NewClient returns a client for a discovered manifest. handler receives inbound
@@ -60,6 +83,9 @@ func (c *Client) ensureSession(ctx context.Context) (*jsonrpc.Conn, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.closed {
+		return nil, fmt.Errorf("plugin %q: %w", c.manifest.Name, errClosed)
+	}
 	if c.conn != nil {
 		select {
 		case <-c.conn.Done():
@@ -72,6 +98,11 @@ func (c *Client) ensureSession(ctx context.Context) (*jsonrpc.Conn, error) {
 		return nil, fmt.Errorf("plugin %q: in respawn backoff", c.manifest.Name)
 	}
 	c.lastSpawn = time.Now()
+	if c.verify != nil {
+		if err := c.verify(); err != nil {
+			return nil, fmt.Errorf("plugin %q: not starting it: %w", c.manifest.Name, err)
+		}
+	}
 
 	cmd, err := c.command()
 	if err != nil {
@@ -203,6 +234,9 @@ func (c *Client) EventListener() plugin.EventListener { return eventListener{c} 
 
 func (c *Client) emit(ctx context.Context, e plugin.Event) error {
 	conn, err := c.ensureSession(ctx)
+	if errors.Is(err, errClosed) {
+		return nil // stopped on purpose; nothing to report
+	}
 	if err != nil {
 		return err
 	}
@@ -216,6 +250,11 @@ func (s eventListener) Events() []string {
 	return plugin.EffectiveEvents(s.c.manifest)
 }
 func (s eventListener) OnEvent(ctx context.Context, e plugin.Event) error { return s.c.emit(ctx, e) }
+
+var _ plugin.ExternalListener = eventListener{}
+
+// External marks this listener as an external plugin (plugin.ExternalListener).
+func (eventListener) External() bool { return true }
 
 // stderrDrainTimeout bounds how long Close waits for the stderr reader after
 // killing the plugin; a child process the plugin started can keep the pipe open.
@@ -279,45 +318,10 @@ func pipeLines(r io.Reader, max int, emit func(string)) {
 }
 
 // LoadEnabled discovers manifests in dir and registers a provider for each
-// enabled plugin according to its capability. Nothing is spawned until first
-// use. api backs the host-callback handler each plugin receives, restricted to
-// the capabilities that plugin was granted.
+// enabled, trusted plugin according to its capability. Nothing is spawned
+// until first use. api backs the host-callback handler each plugin receives,
+// restricted to the capabilities that plugin was granted. It is Reconcile with
+// nothing loaded yet.
 func LoadEnabled(dir string, api plugin.HostAPI) error {
-	manifests, issues, err := plugin.DiscoverDetailed(dir)
-	for _, issue := range issues {
-		log.WithField("manifest", issue.Manifest).
-			WithField("error", issue.Err).
-			Warn("external plugin discovery issue")
-	}
-
-	trust, terr := plugin.LoadTrustStore()
-	if terr != nil {
-		log.WithField("error", terr).Warn("could not load plugin trust store; treating external plugins as untrusted")
-	}
-
-	for _, m := range manifests {
-		if !plugin.Enabled(m.Name) {
-			continue
-		}
-		// Workspace-Trust gate: an external plugin only loads once the operator
-		// has explicitly approved its security-relevant manifest fields.
-		if trust == nil || !trust.IsTrusted(m) {
-			log.WithField("plugin", m.Name).
-				Warn("external plugin is not trusted; run `wings plugins trust` to approve — skipping")
-			continue
-		}
-		handler := plugin.HostHandler(api, plugin.GrantsFor(m))
-		client := NewClient(m, handler)
-		switch m.Capability {
-		case plugin.CapabilityEvents:
-			plugin.RegisterEventListener(client.EventListener())
-		default:
-			log.WithField("plugin", m.Name).
-				WithField("capability", string(m.Capability)).
-				Warn("unknown plugin capability; skipping")
-			continue
-		}
-		log.WithField("plugin", m.Name).Debug("registered external plugin")
-	}
-	return err
+	return Reconcile(dir, api)
 }

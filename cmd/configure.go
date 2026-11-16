@@ -9,6 +9,7 @@ import (
 	"os"
 	"path"
 	"regexp"
+	"strings"
 	"time"
 
 	"github.com/charmbracelet/huh"
@@ -17,6 +18,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/pelican/wings/config"
+	"github.com/pelican/wings/plugin"
 )
 
 var configureArgs struct {
@@ -26,6 +28,7 @@ var configureArgs struct {
 	Node          string
 	Override      bool
 	AllowInsecure bool
+	PluginAccess  string
 }
 
 var configureCmd = &cobra.Command{
@@ -41,9 +44,26 @@ func init() {
 	configureCmd.PersistentFlags().StringVarP(&configureArgs.ConfigPath, "config-path", "c", config.DefaultLocation, "The path where the configuration file should be made")
 	configureCmd.PersistentFlags().BoolVar(&configureArgs.Override, "override", false, "Set to true to override an existing configuration for this node")
 	configureCmd.PersistentFlags().BoolVar(&configureArgs.AllowInsecure, "allow-insecure", false, "Set to true to disable certificate checking")
+	configureCmd.PersistentFlags().StringVar(&configureArgs.PluginAccess, "plugin-access", "", "Set how much the Panel may do with plugins on this node: off, view, signed or full (plugins.panel_access). Without it the value in the file is kept")
+}
+
+// pluginAccessFlag returns the level --plugin-access asks for, or "" if the
+// flag was not given.
+func pluginAccessFlag() (plugin.PanelAccess, error) {
+	if configureArgs.PluginAccess == "" {
+		return "", nil
+	}
+	return plugin.ParsePanelAccess(strings.ToLower(strings.TrimSpace(configureArgs.PluginAccess)))
 }
 
 func configureCmdRun(cmd *cobra.Command, args []string) {
+	// Check the flags that need no Panel before asking it anything.
+	access, err := pluginAccessFlag()
+	if err != nil {
+		fmt.Println("Invalid --plugin-access:", err)
+		os.Exit(1)
+	}
+
 	if configureArgs.AllowInsecure {
 		http.DefaultTransport.(*http.Transport).TLSClientConfig = &tls.Config{
 			InsecureSkipVerify: true,
@@ -159,6 +179,16 @@ func configureCmdRun(cmd *cobra.Command, args []string) {
 	cfg.Plugins = plugins
 	if err = config.WriteToDiskKeepingPlugins(cfg); err != nil {
 		panic(err)
+	}
+	// Plugin policy is still the operator's: the flag is how one sets it
+	// when deploying many nodes, under the same lock `wings plugins` uses.
+	if access != "" {
+		if _, err := config.UpdatePluginsOnDisk(cfg, func(p *config.PluginConfiguration) {
+			p.PanelAccess = string(access)
+		}); err != nil {
+			panic(err)
+		}
+		fmt.Printf("Set plugins.panel_access to %s.\n", access)
 	}
 
 	fmt.Println("Successfully configured wings.")
