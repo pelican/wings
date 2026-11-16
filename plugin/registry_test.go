@@ -149,6 +149,26 @@ func TestListenerGetsEventsInOrderAndSurvivesAPanic(t *testing.T) {
 	}
 }
 
+func TestInventoryListsRouteAndTaskOnlyPlugins(t *testing.T) {
+	c := setConfig(t)
+	c.Plugins.Directory = t.TempDir()
+	config.Set(c)
+	RegisterRoutes("inv-routes", Route{Scope: ScopeNode, Method: "GET", Path: "/x"})
+	RegisterTask("inv-tasks", Task{Name: "t", Interval: time.Minute})
+
+	inv, err := Inventory()
+	if err != nil {
+		t.Fatal(err)
+	}
+	seen := map[string]int{}
+	for _, p := range inv {
+		seen[p.Name]++
+	}
+	if seen["inv-routes"] != 1 || seen["inv-tasks"] != 1 {
+		t.Fatalf("route-only and task-only plugins should each be listed once, got %v", seen)
+	}
+}
+
 // parkedListener wants every event type in events and blocks in its first
 // OnEvent until release closes, so its worker allocates nothing meanwhile.
 type parkedListener struct {
