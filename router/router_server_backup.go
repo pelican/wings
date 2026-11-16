@@ -183,7 +183,10 @@ func postServerRestoreBackup(c *gin.Context) {
 		}
 	}
 
-	s.SetRestoring(true)
+	if !s.StartRestoring() {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": "A backup is already being restored to this server."})
+		return
+	}
 	hasError := true
 	defer func() {
 		if !hasError {
@@ -207,7 +210,6 @@ func postServerRestoreBackup(c *gin.Context) {
 			s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from local backup.")
 			s.Events().Publish(server.BackupRestoreCompletedEvent, "")
 			logger.Info("completed server restoration from local backup")
-			s.SetRestoring(false)
 		}(s, local, logger)
 		hasError = false
 		c.Status(http.StatusAccepted)
@@ -269,7 +271,6 @@ func postServerRestoreBackup(c *gin.Context) {
 		s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from remote backup.")
 		s.Events().Publish(server.BackupRestoreCompletedEvent, "")
 		logger.Info("completed server restoration from remote backup")
-		s.SetRestoring(false)
 	}(s, backupUuid, logger)
 
 	hasError = false
@@ -505,6 +506,10 @@ func isAllowedBackupRestoreDestination(host string, addr netip.Addr) bool {
 // archive. Many hosts (GitHub releases, CDNs, object stores) serve archives as
 // generic binary data, so for those the body has to start with the gzip magic
 // bytes instead. Anything else, like an HTML error or login page, is refused.
+// restoreProbeTimeout is how long the start of a download without a gzip content
+// type is waited for.
+var restoreProbeTimeout = 30 * time.Second
+
 func openRestoreArchive(res *http.Response) (io.ReadCloser, error) {
 	contentType := res.Header.Get("Content-Type")
 	if isSupportedBackupRestoreContentType(contentType) {
@@ -514,8 +519,15 @@ func openRestoreArchive(res *http.Response) (io.ReadCloser, error) {
 		return nil, stderrors.New("The provided backup link is not a supported content type. \"" + contentType + "\" is not application/x-gzip.")
 	}
 
+	// The response headers have arrived, but the host can still hold back the body
+	// while the request is handled. Closing the body ends the wait.
 	buffered := bufio.NewReader(res.Body)
-	if magic, err := buffered.Peek(2); err != nil || magic[0] != 0x1f || magic[1] != 0x8b {
+	timer := time.AfterFunc(restoreProbeTimeout, func() { _ = res.Body.Close() })
+	magic, err := buffered.Peek(2)
+	if !timer.Stop() {
+		return nil, stderrors.New("The provided backup link did not send any data.")
+	}
+	if err != nil || magic[0] != 0x1f || magic[1] != 0x8b {
 		return nil, stderrors.New("The provided backup link did not return a gzip archive.")
 	}
 	return struct {

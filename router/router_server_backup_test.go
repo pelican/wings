@@ -253,6 +253,48 @@ func TestPostServerRestoreBackupRejectsBadDownloadStatus(t *testing.T) {
 	}
 }
 
+func TestPostServerRestoreBackupRejectsConcurrentRestore(t *testing.T) {
+	client := backupTestRemoteClient{restoreStatus: make(chan string, 1)}
+	backupID := "11111111-1111-1111-1111-111111111111"
+	c, w, s := newBackupRestoreContext(t, client, backupID, `{"adapter":"s3","download_url":"https://example.com/archive.tar.gz"}`)
+	defer s.CtxCancel()
+	s.SetRestoring(true)
+
+	postServerRestoreBackup(c)
+
+	if c.Writer.Status() != http.StatusConflict {
+		t.Fatalf("expected a second restore to be rejected, got status %d body %s", c.Writer.Status(), w.Body.String())
+	}
+	if !s.IsRestoring() {
+		t.Fatal("expected the running restore to stay marked as restoring")
+	}
+}
+
+func TestOpenRestoreArchiveGivesUpOnSilentBody(t *testing.T) {
+	previous := restoreProbeTimeout
+	restoreProbeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { restoreProbeTimeout = previous })
+
+	body, writer := io.Pipe()
+	defer writer.Close()
+	res := &http.Response{Header: http.Header{"Content-Type": {"application/octet-stream"}}, Body: body}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := openRestoreArchive(res)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected a link that sends no data to be rejected")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the probe to give up on a link that sends no data")
+	}
+}
+
 func TestBackupRestoreContentTypeValidation(t *testing.T) {
 	tests := map[string]bool{
 		"application/gzip":                   true,
