@@ -8,6 +8,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -248,6 +249,36 @@ func TestPostTransfers_IntoExistingServerFailureKeepsServer(t *testing.T) {
 		t.Errorf("expected one failed transfer report, got %v", got)
 	}
 	assertUnclaimed(t)
+}
+
+func TestPostTransfers_IntoExistingServerFailedCleanupKeepsServerLocked(t *testing.T) {
+	r, m, s, _, client := newExistingTransferRouter(t, environment.ProcessOfflineState, wserver.WithTransfersIntoExistingServers())
+	removeAll = func(string) error { return errors.New("device busy") }
+	defer func() { removeAll = os.RemoveAll }()
+
+	body, contentType := transferBody(t, "world/level.dat", "transferred", "not-the-checksum", nil)
+	if w := postTransferBody(t, r, body, contentType); w.Code < 400 {
+		t.Fatalf("expected a checksum mismatch to fail the transfer, got %d", w.Code)
+	}
+
+	if got, ok := m.Get(transferTestServer); !ok || got != s {
+		t.Error("the existing server must stay registered when the transfer fails")
+	}
+	if !s.IsTransferring() {
+		t.Error("a server whose partial files could not be removed must stay transferring, so it cannot be started")
+	}
+	if s.ExecutingPowerAction() {
+		t.Error("expected the power lock to be released")
+	}
+	if got := client.reported(); len(got) != 1 || got[0] {
+		t.Errorf("expected one failed transfer report, got %v", got)
+	}
+	// The claim is kept, so a retry is refused until Wings is restarted.
+	if incomingClaims.claim(transferTestServer) {
+		incomingClaims.release(transferTestServer)
+		t.Error("expected the claim to be kept after a failed cleanup")
+	}
+	incomingClaims.release(transferTestServer)
 }
 
 func TestPostTransfers_IntoExistingServerRefusesExistingFiles(t *testing.T) {

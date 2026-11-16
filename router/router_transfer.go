@@ -231,10 +231,16 @@ func postTransfers(c *gin.Context) {
 		if !successful && intoExisting {
 			trnsfr.Server.Events().Publish(server.TransferStatusEvent, "failure")
 			// The server was here before the transfer and its data directory was
-			// empty: keep the server, and remove what the transfer wrote.
-			emptyDirectory(trnsfr.Log(), filepath.Join(config.Get().System.Data, id))
+			// empty: keep the server, and remove what the transfer wrote. If any of
+			// it is left, the server stays transferring, so it cannot be started on
+			// a partial copy, and the claim refuses a retry until Wings is restarted.
 			removeReceivedBackups(trnsfr.Log(), id, receivedBackups)
-			trnsfr.Server.SetTransferring(false)
+			if emptyDirectory(trnsfr.Log(), filepath.Join(config.Get().System.Data, id)) {
+				trnsfr.Server.SetTransferring(false)
+			} else {
+				keepClaim = true
+				trnsfr.Log().Error("could not remove the files of a failed transfer; the server stays locked until Wings is restarted")
+			}
 		} else if !successful {
 			trnsfr.Server.Events().Publish(server.TransferStatusEvent, "failure")
 			// Only this request's instance can have this ID, see the checks above.
@@ -697,19 +703,25 @@ func isEmptyDirectory(dir string) (bool, error) {
 	return false, nil
 }
 
+// removeAll is os.RemoveAll, replaceable in tests.
+var removeAll = os.RemoveAll
+
 // emptyDirectory removes everything inside dir and keeps dir itself, which a
-// server's open filesystem root refers to.
-func emptyDirectory(l *log.Entry, dir string) {
+// server's open filesystem root refers to. It reports whether dir is empty.
+func emptyDirectory(l *log.Entry, dir string) bool {
 	entries, err := os.ReadDir(dir)
-	if err != nil {
-		if !errors.Is(err, os.ErrNotExist) {
-			l.WithError(err).Warn("failed to list the server files of a failed transfer")
-		}
-		return
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	} else if err != nil {
+		l.WithError(err).Warn("failed to list the server files of a failed transfer")
+		return false
 	}
+	ok := true
 	for _, e := range entries {
-		if err := os.RemoveAll(filepath.Join(dir, e.Name())); err != nil {
+		if err := removeAll(filepath.Join(dir, e.Name())); err != nil {
 			l.WithField("file", e.Name()).WithError(err).Warn("failed to delete a server file of a failed transfer")
+			ok = false
 		}
 	}
+	return ok
 }
