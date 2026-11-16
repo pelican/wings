@@ -1,0 +1,3 @@
+node_modules/
+# Platform-specific standalone binary produced by `bun run compile`.
+wings-plugin-state-log
