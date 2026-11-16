@@ -1,10 +1,12 @@
 package router
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
 	stderrors "errors"
+	"io"
 	"mime"
 	"net"
 	"net/http"
@@ -243,18 +245,17 @@ func postServerRestoreBackup(c *gin.Context) {
 		return
 	}
 	// Don't allow content types that we know are going to give us problems.
-	if !isSupportedBackupRestoreContentType(res.Header.Get("Content-Type")) {
+	archive, err := openRestoreArchive(res)
+	if err != nil {
 		_ = res.Body.Close()
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-			"error": "The provided backup link is not a supported content type. \"" + res.Header.Get("Content-Type") + "\" is not application/x-gzip.",
-		})
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
 
 	// The server's files are only removed once the backup could be downloaded, so a
 	// broken link does not leave the server empty.
 	if !truncateForRestore(c, s, data.TruncateDirectory, logger) {
-		_ = res.Body.Close()
+		_ = archive.Close()
 		return
 	}
 
@@ -262,7 +263,7 @@ func postServerRestoreBackup(c *gin.Context) {
 		logger.Info("starting restoration process for server backup from remote location")
 		// Any link is streamed the same way, the S3 adapter only reads the archive.
 		// The Panel is notified with the identifier it gave.
-		if err := s.RestoreBackup(backup.NewS3(client, uuid, s.ID(), ""), res.Body); err != nil {
+		if err := s.RestoreBackup(backup.NewS3(client, uuid, s.ID(), ""), archive); err != nil {
 			logger.WithField("error", errors.WithStack(err)).Error("failed to restore remote backup to server")
 		}
 		s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from remote backup.")
@@ -498,6 +499,44 @@ func isAllowedBackupRestoreDestination(host string, addr netip.Addr) bool {
 		}
 	}
 	return false
+}
+
+// openRestoreArchive returns the body of a backup download, if it is a gzip
+// archive. Many hosts (GitHub releases, CDNs, object stores) serve archives as
+// generic binary data, so for those the body has to start with the gzip magic
+// bytes instead. Anything else, like an HTML error or login page, is refused.
+func openRestoreArchive(res *http.Response) (io.ReadCloser, error) {
+	contentType := res.Header.Get("Content-Type")
+	if isSupportedBackupRestoreContentType(contentType) {
+		return res.Body, nil
+	}
+	if !isGenericBinaryContentType(contentType) {
+		return nil, stderrors.New("The provided backup link is not a supported content type. \"" + contentType + "\" is not application/x-gzip.")
+	}
+
+	buffered := bufio.NewReader(res.Body)
+	if magic, err := buffered.Peek(2); err != nil || magic[0] != 0x1f || magic[1] != 0x8b {
+		return nil, stderrors.New("The provided backup link did not return a gzip archive.")
+	}
+	return struct {
+		io.Reader
+		io.Closer
+	}{buffered, res.Body}, nil
+}
+
+// isGenericBinaryContentType reports whether a content type says nothing more
+// than that the response is binary data, or is missing.
+func isGenericBinaryContentType(value string) bool {
+	mediaType, _, err := mime.ParseMediaType(value)
+	if err != nil {
+		mediaType = strings.TrimSpace(value)
+	}
+	switch strings.ToLower(mediaType) {
+	case "", "application/octet-stream", "binary/octet-stream":
+		return true
+	default:
+		return false
+	}
 }
 
 func isSupportedBackupRestoreContentType(value string) bool {

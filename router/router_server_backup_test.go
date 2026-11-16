@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -268,6 +269,51 @@ func TestBackupRestoreContentTypeValidation(t *testing.T) {
 		if got := isSupportedBackupRestoreContentType(contentType); got != expected {
 			t.Fatalf("expected content type %q support to be %v, got %v", contentType, expected, got)
 		}
+	}
+}
+
+// Archives served as generic binary data are accepted when they are gzip, which
+// is how GitHub releases, CDNs and many object stores serve .tar.gz files.
+func TestOpenRestoreArchive(t *testing.T) {
+	gzipBody := "\x1f\x8b\x08\x00rest-of-archive"
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+		accepted    bool
+	}{
+		{"gzip content type", "application/x-gzip", "anything", true},
+		{"octet-stream gzip", "application/octet-stream", gzipBody, true},
+		{"binary/octet-stream gzip", "binary/octet-stream", gzipBody, true},
+		{"missing content type gzip", "", gzipBody, true},
+		{"octet-stream not gzip", "application/octet-stream", "<html>login</html>", false},
+		{"octet-stream empty", "application/octet-stream", "", false},
+		{"html even if gzip", "text/html; charset=utf-8", gzipBody, false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			res := &http.Response{Header: http.Header{}, Body: io.NopCloser(strings.NewReader(test.body))}
+			if test.contentType != "" {
+				res.Header.Set("Content-Type", test.contentType)
+			}
+
+			archive, err := openRestoreArchive(res)
+			if (err == nil) != test.accepted {
+				t.Fatalf("expected accepted=%v, got error %v", test.accepted, err)
+			}
+			if err != nil {
+				return
+			}
+			// The bytes peeked at are still read by the restore.
+			read, err := io.ReadAll(archive)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(read) != test.body {
+				t.Fatalf("expected the whole body to be read, got %q", read)
+			}
+		})
 	}
 }
 
