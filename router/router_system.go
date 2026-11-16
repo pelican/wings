@@ -239,9 +239,24 @@ func postUpdateConfiguration(c *gin.Context) {
 		return
 	}
 
+	// config.Get() copies the struct but its maps are shared with the running
+	// configuration, so decoding a pushed "plugins" block into them would
+	// change the live registries and grants. Give the decoder nothing to share;
+	// the block is replaced from the file below anyway.
+	cfg.Plugins = config.PluginConfiguration{}
 	if err := c.BindJSON(&cfg); err != nil {
 		return
 	}
+
+	// Plugin policy belongs to the node operator and is only read from the
+	// config file. A push must not change it: the plugins directory also holds
+	// the operator's trust approvals, so pointing it somewhere a server user can
+	// write would let them get a plugin run by Wings. WriteToDiskKeepingPlugins
+	// below replaces this with the block in the file as it is when written:
+	// `wings plugins enable/disable` edit the file from another process, and
+	// writing the startup copy back would undo those changes. The copy in
+	// memory is only used if the file can't be read.
+	cfg.Plugins = config.Get().Plugins
 
 	// Keep the SSL certificates the same since the Panel will send through Lets Encrypt
 	// default locations. However, if we picked a different location manually we don't
@@ -278,7 +293,7 @@ func postUpdateConfiguration(c *gin.Context) {
 
 	// Try to write this new configuration to the disk before updating our global
 	// state with it.
-	if err := config.WriteToDisk(cfg); err != nil {
+	if err := config.WriteToDiskKeepingPlugins(cfg); err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}

@@ -195,7 +195,9 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 		return
 	}
 
-	if err := config.WriteToDisk(config.Get()); err != nil {
+	// Keep the file's plugins block: `wings plugins` commands may have
+	// changed it since this process read the file.
+	if err := config.WriteToDiskKeepingPlugins(config.Get()); err != nil {
 		if !errors.Is(err, unix.EROFS) {
 			log.WithField("error", err).Error("failed to write configuration to disk")
 		} else {

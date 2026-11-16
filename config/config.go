@@ -293,7 +293,6 @@ type Backups struct {
 	// Defaults to "best_speed" (level 1)
 	CompressionLevel string `default:"best_speed" yaml:"compression_level"`
 
-
 	// RestoreHostAllowlist allows backup restore downloads to connect to otherwise blocked
 	// private/internal destinations. Entries may be hostnames, IP addresses, or CIDR ranges.
 	RestoreHostAllowlist []string `yaml:"restore_host_allowlist"`
@@ -405,6 +404,59 @@ type Configuration struct {
 
 	// IgnorePanelConfigUpdates causes confiuration updates that are sent by the panel to be ignored.
 	IgnorePanelConfigUpdates bool `json:"ignore_panel_config_updates" yaml:"ignore_panel_config_updates"`
+
+	// Plugins configures the capability-provider plugin system.
+	Plugins PluginConfiguration `json:"plugins" yaml:"plugins"`
+}
+
+// PluginConfiguration holds the policy for the plugin system. It intentionally
+// carries only policy — which providers are permitted, and what they may access
+// — not per-plugin plumbing. External plugins describe themselves via a manifest
+// (plugin.yaml) in Directory; native providers register themselves in code.
+type PluginConfiguration struct {
+	// Directory is scanned for external plugin manifests during discovery.
+	// It's outside RootDirectory, which is created 0700: external plugins run
+	// as system.user and must be able to reach their own directory.
+	Directory string `default:"/var/lib/pelican-plugins" json:"directory" yaml:"directory"`
+	// Autoload activates every registered/discovered provider when Enabled is
+	// empty. Set it to false alongside an explicit Enabled allowlist to lock the
+	// system down.
+	Autoload bool `default:"true" json:"autoload" yaml:"autoload"`
+	// Enabled is an optional allowlist of provider names. When non-empty only the
+	// listed providers are active, regardless of Autoload.
+	Enabled []string `json:"enabled" yaml:"enabled"`
+	// Disabled is a blocklist of provider names. A name here is never active,
+	// taking precedence over Autoload and Enabled. This is what `wings plugins
+	// disable` writes.
+	Disabled []string `json:"disabled" yaml:"disabled"`
+	// Grants optionally narrows, per plugin name, the host methods an external
+	// plugin may call (requires.hostAPI in its manifest). A method must be in
+	// both lists. Without an entry the plugin gets what its manifest requests.
+	Grants map[string][]string `json:"grants" yaml:"grants"`
+	// Registries maps a namespace to a plugin registry, used by
+	// `wings plugins add @namespace/name`. Private (company) registries carry an
+	// auth token or headers.
+	Registries map[string]PluginRegistry `json:"registries" yaml:"registries"`
+	// RequireSignatures rejects installing or updating a plugin whose archive is
+	// not signed by a trusted key.
+	RequireSignatures bool `json:"require_signatures" yaml:"require_signatures"`
+	// TrustedKeys are the base64 Ed25519 public keys (optionally "id:key")
+	// permitted to sign plugin archives.
+	TrustedKeys []string `json:"trusted_keys" yaml:"trusted_keys"`
+	// RunAsRoot starts external plugin processes as root when Wings runs as
+	// root. By default they run as system.user, with that user's access to
+	// the machine, never as root. Like the rest of this block, only the node
+	// operator sets it (in this file); a Panel config push can't.
+	RunAsRoot bool `json:"run_as_root" yaml:"run_as_root"`
+}
+
+// PluginRegistry describes a plugin registry index and optional auth for private
+// (company) registries. Token and Headers values are environment-expanded
+// (${VAR}) so secrets stay out of the config file.
+type PluginRegistry struct {
+	URL     string            `json:"url" yaml:"url"`
+	Token   string            `json:"token" yaml:"token"`
+	Headers map[string]string `json:"headers" yaml:"headers"`
 }
 
 // SearchRecursion holds the configuration for directory search recursion settings.
@@ -530,33 +582,6 @@ func GetJwtAlgorithm() *jwt.HMACSHA {
 	return _jwtAlgo
 }
 
-// WriteToDisk writes the configuration to the disk. This is a thread safe operation
-// and will only allow one write at a time. Additional calls while writing are
-// queued up.
-func WriteToDisk(c *Configuration) error {
-	_writeLock.Lock()
-	defer _writeLock.Unlock()
-
-	//goland:noinspection GoVetCopyLock
-	ccopy := *c
-	// If debugging is set with the flag, don't save that to the configuration file,
-	// otherwise you'll always end up in debug mode.
-	if _debugViaFlag {
-		ccopy.Debug = false
-	}
-	if c.path == "" {
-		return errors.New("cannot write configuration, no path defined in struct")
-	}
-	b, err := yaml.Marshal(&ccopy)
-	if err != nil {
-		return err
-	}
-	if err := os.WriteFile(c.path, b, 0o600); err != nil {
-		return err
-	}
-	return nil
-}
-
 // EnsurePelicanUser ensures that the Pelican core user exists on the
 // system. This user will be the owner of all data in the root data directory
 // and is used as the user within containers. If files are not owned by this
@@ -665,6 +690,7 @@ func FromFile(path string) error {
 	Set(c)
 	return nil
 }
+
 // ConfigureDirectories ensures that all the system directories exist on the
 // system. These directories are created so that only the owner can read the data,
 // and no other users.
