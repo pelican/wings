@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -53,5 +54,43 @@ func TestDisablingTheLastAllowlistedPluginKeepsTheAllowlist(t *testing.T) {
 	config.Set(c)
 	if !plugin.Enabled("only") || plugin.Enabled("other") {
 		t.Fatalf("re-enabling should restore exactly the allowlist; policy %+v", c.Plugins)
+	}
+}
+
+func TestWritePrivateKeyRefusesExistingFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wings-plugin.key")
+	if err := os.WriteFile(path, []byte("old\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := writePrivateKey(path, "secret"); err == nil {
+		t.Fatal("expected an existing key file to be refused")
+	}
+	b, _ := os.ReadFile(path)
+	if string(b) != "old\n" {
+		t.Fatalf("existing file was modified: %q", b)
+	}
+}
+
+func TestWritePrivateKeyCreatesPrivateFile(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "wings-plugin.key")
+	if err := writePrivateKey(path, "secret"); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if perm := info.Mode().Perm(); perm != 0o600 {
+		t.Fatalf("key file mode = %o, want 600", perm)
+	}
+}
+
+func TestKeygenAndSignDoNotNeedANodeConfig(t *testing.T) {
+	root := newPluginsCommand()
+	for _, sub := range root.Commands() {
+		want := sub.Name() != "keygen" && sub.Name() != "sign"
+		if got := needsNodeConfig(sub); got != want {
+			t.Errorf("needsNodeConfig(%s) = %v, want %v", sub.Name(), got, want)
+		}
 	}
 }
