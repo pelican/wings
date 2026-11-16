@@ -24,6 +24,7 @@ var boundaries = []struct {
 	{"plugin/sdk", []string{"plugin/contract", "plugin/jsonrpc"}, false, "every Go plugin binary links it"},
 	{"examples/plugins/go-external-statecount", []string{"plugin/sdk", "plugin/contract", "plugin/jsonrpc"}, false, "the example shows what a Go plugin links"},
 	{"plugin", []string{"config", "system", "plugin/contract", "plugin/jsonrpc"}, true, "the runtime must not depend on installing, running external plugins, or the server layer"},
+	{"plugin/install", []string{"config", "system", "plugin", "plugin/contract", "plugin/jsonrpc"}, true, "installing must not depend on running plugins or the server layer"},
 	{"plugin/external", []string{"config", "system", "plugin", "plugin/contract", "plugin/jsonrpc"}, true, "running external plugins must not depend on installing them or the server layer"},
 }
 
