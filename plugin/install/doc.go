@@ -3,9 +3,10 @@
 // sha256 and signature, unpacks it into a staging directory under an os.Root,
 // and swaps it into place with a backup so the swap can be rolled back.
 //
-// Nothing here runs a plugin or records the operator's approval. Callers stage
-// with StageAdd or StageUpdate, show the staged manifest, Commit, record the
-// approval in the trust store (plugin.LoadTrustStore), then Finish, or
-// Rollback if recording the approval failed. `wings plugins add` and `update`
-// are the callers (cmd/plugins.go).
+// Nothing here runs a plugin. Callers stage with StageAdd or StageUpdate (a
+// registry or update manifest), or StageURL or StageFile (any archive), show
+// the staged manifest, and pass the stage to Install with an Approver. Install
+// commits, records the approval in the trust store, and rolls back if that
+// fails. `wings plugins add` and `update` (cmd/plugins.go) approve at a
+// prompt; the Panel API (router/router_plugins.go) approves with a token.
 package install

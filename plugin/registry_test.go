@@ -3,6 +3,8 @@ package plugin
 import (
 	"context"
 	"fmt"
+	"os"
+	"path/filepath"
 	"runtime"
 	"testing"
 	"time"
@@ -205,5 +207,98 @@ func TestEmitReadsThePolicyOncePerEvent(t *testing.T) {
 
 	if allocs := testing.AllocsPerRun(50, func() { r.Emit(e) }); allocs > 2 {
 		t.Fatalf("Emit with 40 listeners made %.0f allocations, want at most 2 (one policy read)", allocs)
+	}
+}
+
+// countingListener records events; a pointer, so it is comparable.
+type countingListener struct {
+	name string
+	got  chan Event
+}
+
+func (c *countingListener) Name() string     { return c.name }
+func (c *countingListener) Events() []string { return []string{"*"} }
+func (c *countingListener) OnEvent(_ context.Context, e Event) error {
+	c.got <- e
+	return nil
+}
+
+// TestRemoveEventListenerOnlyRemovesThatListener covers how the external
+// loader stops a plugin: it removes the listener it registered, and must not
+// remove one registered under the same name since.
+func TestRemoveEventListenerOnlyRemovesThatListener(t *testing.T) {
+	setConfig(t)
+	r := NewRegistry()
+	first := &countingListener{name: "p", got: make(chan Event, 4)}
+	second := &countingListener{name: "p", got: make(chan Event, 4)}
+
+	r.RegisterEventListener(first)
+	if l, ok := r.EventListener("p"); !ok || l != first {
+		t.Fatalf("EventListener(p) = %v, %v; want the registered listener", l, ok)
+	}
+	r.RegisterEventListener(second)
+	if r.RemoveEventListener(first) {
+		t.Fatal("removed p although the registered listener is a newer one")
+	}
+	if l, _ := r.EventListener("p"); l != second {
+		t.Fatal("the newer listener was removed")
+	}
+	if !r.RemoveEventListener(second) {
+		t.Fatal("did not remove the registered listener")
+	}
+	if _, ok := r.EventListener("p"); ok {
+		t.Fatal("p is still registered")
+	}
+	r.Emit(Event{Type: "server.state"})
+	select {
+	case e := <-second.got:
+		t.Fatalf("a removed listener got %v", e)
+	case <-time.After(100 * time.Millisecond):
+	}
+	if r.RemoveEventListener(second) {
+		t.Fatal("removing twice reported success")
+	}
+}
+
+// externalListener stands in for an external plugin's client, which live
+// reload registers in the same registry as native listeners.
+type externalListener struct{ name string }
+
+func (e externalListener) Name() string                       { return e.name }
+func (externalListener) Events() []string                     { return []string{"*"} }
+func (externalListener) OnEvent(context.Context, Event) error { return nil }
+func (externalListener) External() bool                       { return true }
+
+// TestInventoryListsALoadedExternalPluginOnce covers a running node: the
+// loaded external plugin is in the registry and has a manifest, and it must be
+// listed once, as external, not also as a native copy (found in the lab: the
+// Panel then acted on the native copy and every action failed).
+func TestInventoryListsALoadedExternalPluginOnce(t *testing.T) {
+	c := setConfig(t)
+	c.Plugins.Directory = t.TempDir()
+	config.Set(c)
+	dir := filepath.Join(c.Plugins.Directory, "inv-ext")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, ManifestFile), []byte("apiVersion: v1\nname: inv-ext\ncapability: events\nversion: 1.2.0\nentrypoint: [\"./run\"]\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	l := externalListener{name: "inv-ext"}
+	RegisterEventListener(l)
+	t.Cleanup(func() { Default().RemoveEventListener(l) })
+
+	var found []ProviderInfo
+	inv, _ := Inventory()
+	for _, p := range inv {
+		if p.Name == "inv-ext" {
+			found = append(found, p)
+		}
+	}
+	if len(found) != 1 || found[0].Kind != KindExternal || found[0].Version != "1.2.0" {
+		t.Fatalf("inv-ext listed as %+v; want once, external, version 1.2.0", found)
+	}
+	if p, ok, _ := Find("inv-ext"); !ok || p.Kind != KindExternal {
+		t.Fatalf("Find(inv-ext) = %+v, %v; want the external entry", p, ok)
 	}
 }

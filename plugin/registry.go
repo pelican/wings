@@ -96,6 +96,33 @@ func (r *Registry) RegisterEventListener(s EventListener) {
 	r.listeners[s.Name()] = newListenerWorker(s)
 }
 
+// EventListener returns the listener registered under name, if any.
+func (r *Registry) EventListener(name string) (EventListener, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	w, ok := r.listeners[name]
+	if !ok {
+		return nil, false
+	}
+	return w.listener, true
+}
+
+// RemoveEventListener unregisters s if it is still the listener registered
+// under its name, and reports whether it was. A listener that has since been
+// replaced under the same name stays. s must be of a comparable type. The
+// listener gets no new events; what it has queued is still delivered.
+func (r *Registry) RemoveEventListener(s EventListener) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	w, ok := r.listeners[s.Name()]
+	if !ok || w.listener != s {
+		return false
+	}
+	close(w.queue)
+	delete(r.listeners, s.Name())
+	return true
+}
+
 func (r *Registry) eventListeners() []EventListener {
 	r.mu.RLock()
 	defer r.mu.RUnlock()

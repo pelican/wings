@@ -43,14 +43,14 @@ func TestEnforceSignaturePolicy(t *testing.T) {
 	digest := sha256.Sum256([]byte("x"))
 
 	// Unsigned + not required -> allowed.
-	if _, err := enforceSignature(digest[:], ""); err != nil {
+	if _, err := enforceSignature(digest[:], "", stageOptions{}); err != nil {
 		t.Fatalf("unsigned should be allowed when not required: %v", err)
 	}
 
 	// Unsigned + required -> rejected.
 	c.Plugins.RequireSignatures = true
 	config.Set(c)
-	if _, err := enforceSignature(digest[:], ""); err == nil {
+	if _, err := enforceSignature(digest[:], "", stageOptions{}); err == nil {
 		t.Fatal("unsigned must be rejected when signatures are required")
 	}
 }
