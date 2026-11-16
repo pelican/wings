@@ -42,6 +42,25 @@ func TestBackupPayloadWithoutUser(t *testing.T) {
 	}
 }
 
+// A JTI denied by the Panel also revokes a backup token without a user.
+func TestBackupPayloadWithoutUserRespectsJTIDenylist(t *testing.T) {
+	bootTime := time.Now().Add(-time.Hour)
+	resetDenylistState(t, bootTime)
+
+	denied := time.Now()
+	denylist.Store("revoked", denied)
+
+	before := BackupPayload{Payload: jwt.Payload{JWTID: "revoked", IssuedAt: jwt.NumericDate(denied.Add(-time.Minute))}, ServerUuid: "server"}
+	if !before.Denylisted() {
+		t.Error("expected a token issued before its JTI was denied to be denied")
+	}
+
+	after := BackupPayload{Payload: jwt.Payload{JWTID: "revoked", IssuedAt: jwt.NumericDate(denied.Add(time.Minute))}, ServerUuid: "server"}
+	if after.Denylisted() {
+		t.Error("expected a token issued after its JTI was denied to be accepted")
+	}
+}
+
 // Other user-bound tokens still need a user.
 func TestFilePayloadWithoutUserIsDenied(t *testing.T) {
 	bootTime := time.Now()

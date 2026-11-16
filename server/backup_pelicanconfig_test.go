@@ -139,6 +139,21 @@ func TestBackupStoresPelicanConfigAsFirstEntry(t *testing.T) {
 	}
 }
 
+// A file on the disk is never mistaken for the server configuration, even when
+// its header has the same name and is owned by a user named "pelican", which is
+// the default Wings user.
+func TestPelicanConfigEntryRequiresReservedOwner(t *testing.T) {
+	onDisk := &tar.Header{Name: ".pelicanconfig", Typeflag: tar.TypeReg, Uname: "pelican", Gname: "pelican"}
+	if filesystem.IsPreludeHeader(onDisk, backup.PelicanConfigFile) {
+		t.Fatal("expected a .pelicanconfig owned by pelican:pelican not to be a prelude")
+	}
+
+	prelude := &tar.Header{Name: ".pelicanconfig", Typeflag: tar.TypeReg, Uname: filesystem.PreludeOwner, Gname: filesystem.PreludeOwner}
+	if !filesystem.IsPreludeHeader(prelude, backup.PelicanConfigFile) {
+		t.Fatal("expected the prelude header to be detected")
+	}
+}
+
 // Without a configuration nothing is added to the archive, and restoring it does
 // not create a .pelicanconfig.
 func TestBackupWithoutPelicanConfig(t *testing.T) {

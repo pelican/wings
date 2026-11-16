@@ -70,7 +70,10 @@ type Archive struct {
 
 // PreludeOwner is the user and group name set on a prelude entry, so it can be
 // told apart from a file of the same name that was in the server's directory.
-const PreludeOwner = "pelican"
+// It contains a ":", which a system user or group name cannot, so a header built
+// from a file on the disk never has it, even when the file is owned by a user
+// named "pelican".
+const PreludeOwner = "pelican:prelude"
 
 // PreludeFile is a file that is not on the disk but is written as the first
 // entry of an archive, such as the .pelicanconfig stored with a backup.
@@ -381,6 +384,11 @@ func (a *Archive) addToArchive(p, rel string) error {
 	}
 
 	header.Name = rel
+	// The owner names come from the system, so they cannot be the reserved prelude
+	// owner, but make sure a file on the disk is never mistaken for a prelude.
+	if header.Uname == PreludeOwner || header.Gname == PreludeOwner {
+		header.Uname, header.Gname = "", ""
+	}
 	if s.IsDir() {
 		header.Name += "/"
 	}
