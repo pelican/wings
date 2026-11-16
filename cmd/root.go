@@ -206,7 +206,7 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	// Discover and register enabled external capability plugins. Manifests are
 	// read without executing anything; the plugin processes are spawned lazily
 	// on first use. Native providers register themselves via package init.
-	if err := external.LoadEnabled(config.Get().Plugins.Directory, nil); err != nil {
+	if err := external.LoadEnabled(config.Get().Plugins.Directory, pluginHost{manager}); err != nil {
 		log.WithField("error", err).Warn("plugin discovery was incomplete")
 	}
 
