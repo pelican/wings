@@ -1,0 +1,480 @@
+// Package jsonrpc implements a minimal bidirectional JSON-RPC 2.0 connection
+// over a byte stream (typically a plugin subprocess's stdio). Messages are
+// newline-delimited JSON objects. Both peers may issue requests and
+// notifications, which is what lets the host call a plugin and a plugin call
+// back into the host over the same connection.
+package jsonrpc
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"strconv"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// ErrClosed is returned for calls made on or after the connection closes.
+var ErrClosed = errors.New("jsonrpc: connection closed")
+
+// ErrWriteTimeout is returned when a message could not be written within
+// WriteTimeout. The connection is closed when that happens.
+var ErrWriteTimeout = errors.New("jsonrpc: write timed out; connection closed")
+
+// WriteTimeout bounds how long writing one message may take, including waiting
+// for earlier writes. A peer that stops reading would otherwise block every
+// writer forever once the pipe fills. When it is exceeded the connection is
+// closed, which for a plugin kills the process and unblocks the stuck write.
+// Each connection reads it once, when it is created.
+var WriteTimeout = 10 * time.Second
+
+// NotificationQueueSize bounds the inbound notifications waiting for the
+// handler. They are handled one at a time, in the order they arrived; when the
+// handler falls this far behind, newer ones are dropped (see Dropped) instead
+// of piling up as goroutines. Each connection reads it once, when it is
+// created.
+var NotificationQueueSize = 256
+
+// MaxConcurrentRequests bounds the inbound requests one connection handles at
+// once. A request beyond it is answered right away with ErrCodeBusy instead of
+// starting another goroutine, so a peer that floods requests cannot make this
+// side grow without limit. Each connection reads it once, when it is created.
+var MaxConcurrentRequests = 64
+
+// ErrCodeBusy is the JSON-RPC error code for a request refused because
+// MaxConcurrentRequests were already being handled.
+const ErrCodeBusy = -32003
+
+// MaxMessageSize bounds one inbound message, i.e. one line. A peer that sends
+// more without a newline has the connection closed instead of making this side
+// buffer it all. Each connection reads it once, when it is created.
+var MaxMessageSize = 16 << 20
+
+// ErrMessageTooLarge is why the connection closed when a message exceeded
+// MaxMessageSize.
+var ErrMessageTooLarge = errors.New("jsonrpc: message exceeds the size limit; connection closed")
+
+// Handler processes an inbound request or notification from the peer. For a
+// notification (no response expected) the returned values are ignored. A nil
+// Handler rejects inbound requests with a method-not-found error.
+type Handler func(ctx context.Context, method string, params json.RawMessage) (any, error)
+
+// Error is a JSON-RPC error object.
+type Error struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}
+
+func (e *Error) Error() string { return fmt.Sprintf("jsonrpc: %d %s", e.Code, e.Message) }
+
+// message is any JSON-RPC frame. ID is kept raw because JSON-RPC 2.0 allows a
+// string or a number, and a peer written in another language (JavaScript
+// especially) commonly uses strings; it is echoed back byte-for-byte.
+type message struct {
+	JSONRPC string          `json:"jsonrpc"`
+	ID      json.RawMessage `json:"id,omitempty"`
+	Method  string          `json:"method,omitempty"`
+	Params  json.RawMessage `json:"params,omitempty"`
+	Result  json.RawMessage `json:"result,omitempty"`
+	Error   *Error          `json:"error,omitempty"`
+}
+
+// Conn is a JSON-RPC connection over a reader/writer pair.
+//
+// # How a connection runs and ends
+//
+// Two goroutines run for its whole life, plus one per request being handled:
+//
+//   - readLoop reads one message per line. A request starts its own goroutine
+//     (at most MaxConcurrentRequests; beyond that it is refused with
+//     ErrCodeBusy), a notification is queued (at most NotificationQueueSize;
+//     newer ones are dropped), and a response is handed to the Call waiting
+//     for it.
+//   - notificationLoop handles queued notifications one at a time, in order.
+//
+// Handlers never run on readLoop, so a handler may Call the peer and still
+// get its answer. Every write holds wmu and is bounded by WriteTimeout.
+//
+// Rules a change must keep. Most bugs found here were in shutdown order, so
+// run `go test -race ./plugin/jsonrpc/ ./plugin/sdk/` after any change.
+//
+//  1. readLoop hands a response to its Call before it fires readDone, so a
+//     Call that sees readDone, or the close that follows it, still finds an
+//     answer the peer sent before hanging up (answerAfterEnd). Test:
+//     TestCallReturnsAResponseSentJustBeforeClose.
+//  2. When the peer stops sending (EOF, a bad or oversized message), readDone
+//     fires at once and every waiting or new Call fails with ErrClosed. The
+//     connection stays open until every queued notification is handled and
+//     every running request has written its reply; then Drained and Done
+//     fire. Tests: TestCallFailsOnceThePeerStopsSending, and in plugin/sdk
+//     TestServeEventListenerAnswersBeforeReturning and
+//     TestServeEventListenerHandlesQueuedEventsBeforeReturning.
+//  3. A write error or a write timeout closes the connection at once. Tests:
+//     TestWriteErrorClosesTheConnection, TestWriteTimesOutWhenThePeerStopsReading.
+//  4. readLoop is the only sender on notes and closes it when it returns.
+//     The connection itself closes once, through closeOnce, so Close may be
+//     called at any time and more than once.
+//  5. Inbound work is bounded. Tests: TestRequestFloodStaysBounded,
+//     TestSlowNotificationHandlerStaysBounded, TestOversizedMessageClosesTheConnection.
+type Conn struct {
+	w       *bufio.Writer
+	enc     *json.Encoder
+	wmu     sync.Mutex
+	handler Handler
+
+	nextID  atomic.Uint64
+	pending sync.Map // string(id) -> chan message
+
+	closeOnce    sync.Once
+	closed       chan struct{}
+	closer       io.Closer
+	writeTimeout time.Duration
+
+	readDone chan struct{} // closed when the peer stops sending
+	notes    chan message  // inbound notifications, in arrival order
+	drained  chan struct{} // closed once every queued notification is handled
+	dropped  atomic.Uint64
+
+	inflight   chan struct{}  // one slot per inbound request being handled
+	requests   sync.WaitGroup // inbound requests still being handled
+	maxMessage int
+}
+
+// NewConn starts a connection reading from r and writing to w. handler may be
+// nil. If closer is non-nil it is closed when the connection terminates (e.g. to
+// reap a subprocess). The read loop runs in a background goroutine.
+func NewConn(r io.Reader, w io.Writer, handler Handler, closer io.Closer) *Conn {
+	bw := bufio.NewWriter(w)
+	c := &Conn{
+		w:       bw,
+		enc:     json.NewEncoder(bw),
+		handler: handler,
+		closed:  make(chan struct{}),
+		closer:  closer,
+
+		readDone: make(chan struct{}),
+
+		writeTimeout: WriteTimeout,
+		notes:        make(chan message, NotificationQueueSize),
+		drained:      make(chan struct{}),
+		inflight:     make(chan struct{}, MaxConcurrentRequests),
+		maxMessage:   MaxMessageSize,
+	}
+	go c.readLoop(r)
+	go c.notificationLoop()
+	return c
+}
+
+// Dropped reports how many inbound notifications were dropped because the
+// handler had NotificationQueueSize of them still waiting.
+func (c *Conn) Dropped() uint64 { return c.dropped.Load() }
+
+// notificationLoop hands queued notifications to the handler one at a time.
+// They are not handled on the read loop itself: a handler that makes a Call
+// (a plugin asking Wings for something while handling an event) needs the read
+// loop free to receive the response.
+func (c *Conn) notificationLoop() {
+	defer close(c.drained)
+	for m := range c.notes {
+		c.serveNotification(m)
+	}
+	// The read loop has stopped, so no request can start now; let the ones
+	// already running write their responses, then close.
+	c.requests.Wait()
+	c.close()
+}
+
+// Drained returns a channel that is closed once the peer has stopped sending
+// (its side of the stream ended) and every notification and request it sent
+// before that has been handled, requests including their responses. The
+// connection closes (Done) at the same point, or earlier on a write error,
+// a write timeout or Close. Done alone closes as soon as the stream ends, while queued
+// notifications may still be waiting.
+func (c *Conn) Drained() <-chan struct{} { return c.drained }
+
+func (c *Conn) readLoop(r io.Reader) {
+	// Messages are one JSON value per line. Reading a line at a time with a
+	// size cap bounds what a peer can make this side buffer; a json.Decoder
+	// on the raw stream keeps growing its buffer until a value completes.
+	br := bufio.NewReaderSize(r, 64<<10)
+	for {
+		frame, err := readFrame(br, c.maxMessage)
+		var m message
+		if err == nil {
+			frame = bytes.TrimSpace(frame)
+			if len(frame) == 0 {
+				continue
+			}
+			err = json.Unmarshal(frame, &m)
+		}
+		if err != nil {
+			// The peer stopped sending. Close only once what it already sent
+			// is done (notificationLoop): answers to its requests must still
+			// be written, so don't close the connection here. Calls still
+			// waiting can't be answered any more; readDone tells them.
+			close(c.readDone)
+			close(c.notes) // the read loop is the only sender
+			return
+		}
+		hasID := len(m.ID) > 0 && string(m.ID) != "null"
+		switch {
+		case m.Method != "" && hasID:
+			select {
+			case c.inflight <- struct{}{}:
+				c.requests.Add(1)
+				go func(m message) {
+					defer func() { <-c.inflight; c.requests.Done() }()
+					c.serveRequest(m)
+				}(m)
+			default:
+				// Answered from the read loop, which stays free to deliver
+				// responses to this side's own calls. If the peer also stops
+				// reading, the write timeout closes the connection.
+				_ = c.write(message{ID: m.ID, Error: &Error{Code: ErrCodeBusy, Message: "too many concurrent requests"}})
+			}
+		case m.Method != "":
+			select {
+			case c.notes <- m:
+			default:
+				c.dropped.Add(1)
+			}
+		case hasID:
+			if ch, ok := c.pending.LoadAndDelete(string(m.ID)); ok {
+				ch.(chan message) <- m
+			}
+		}
+	}
+}
+
+func (c *Conn) serveRequest(m message) {
+	var (
+		result any
+		err    error
+	)
+	if c.handler == nil {
+		err = &Error{Code: -32601, Message: "method not found"}
+	} else {
+		result, err = c.safeHandle(m.Method, m.Params)
+	}
+
+	resp := message{ID: m.ID}
+	switch {
+	case err != nil:
+		var e *Error
+		if errors.As(err, &e) {
+			resp.Error = e
+		} else {
+			resp.Error = &Error{Code: -32000, Message: err.Error()}
+		}
+	default:
+		raw, mErr := json.Marshal(result)
+		if mErr != nil {
+			resp.Error = &Error{Code: -32603, Message: mErr.Error()}
+		} else {
+			resp.Result = raw
+		}
+	}
+	_ = c.write(resp)
+}
+
+func (c *Conn) serveNotification(m message) {
+	if c.handler == nil {
+		return
+	}
+	// A panic in a notification handler has no response to carry it; swallow it
+	// so a faulty handler cannot take down the connection's read loop goroutine.
+	defer func() { _ = recover() }()
+	_, _ = c.handler(context.Background(), m.Method, m.Params)
+}
+
+// safeHandle invokes the handler with panic recovery. A panicking handler must
+// not crash the process; it becomes an internal JSON-RPC error so the caller
+// still gets a response and the connection stays alive.
+func (c *Conn) safeHandle(method string, params json.RawMessage) (result any, err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			result = nil
+			err = &Error{Code: -32603, Message: fmt.Sprintf("handler panic in %q", method)}
+		}
+	}()
+	return c.handler(context.Background(), method, params)
+}
+
+func (c *Conn) write(m message) error {
+	m.JSONRPC = "2.0"
+	select {
+	case <-c.closed:
+		return ErrClosed
+	default:
+	}
+	done := make(chan error, 1)
+	go func() {
+		c.wmu.Lock()
+		select {
+		case <-c.closed:
+			c.wmu.Unlock()
+			done <- ErrClosed
+			return
+		default:
+		}
+		err := c.enc.Encode(m)
+		if err == nil {
+			err = c.w.Flush()
+		}
+		c.wmu.Unlock()
+		if err != nil {
+			// A failed write leaves the stream unusable (bufio.Writer keeps
+			// the error). Close, so Done fires, waiting calls return, and an
+			// owner such as the plugin client starts a fresh session instead
+			// of reusing this one.
+			c.close()
+		}
+		done <- err
+	}()
+	timer := time.NewTimer(c.writeTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return err
+	case <-c.closed:
+		// The message may have been written just before the peer hung up
+		// (and, for a Call, answered); report what actually happened.
+		select {
+		case err := <-done:
+			return err
+		default:
+			return ErrClosed
+		}
+	case <-timer.C:
+		c.close()
+		return ErrWriteTimeout
+	}
+}
+
+// Call issues a request and waits for the response or ctx cancellation. result
+// may be nil to discard the payload. It fails with ErrClosed once the peer has
+// stopped sending without answering, even while the connection is still open
+// for the replies to requests it sent earlier.
+func (c *Conn) Call(ctx context.Context, method string, params any, result any) error {
+	raw, err := marshalParams(params)
+	if err != nil {
+		return err
+	}
+	id := strconv.FormatUint(c.nextID.Add(1), 10)
+	ch := make(chan message, 1)
+	c.pending.Store(id, ch)
+	defer c.pending.Delete(id)
+
+	if err := c.write(message{ID: json.RawMessage(id), Method: method, Params: raw}); err != nil {
+		// A peer can read the request, answer and hang up before the write
+		// is reported done. The read loop hands any response over before it
+		// closes the connection, so an answer that arrived is waiting here.
+		if errors.Is(err, ErrClosed) {
+			select {
+			case resp := <-ch:
+				return decodeResponse(resp, result)
+			default:
+			}
+		}
+		return err
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-c.closed:
+		return answerAfterEnd(ch, result)
+	case <-c.readDone:
+		// The peer stopped sending, so no answer can arrive after this.
+		// The connection stays open until requests already received have
+		// answered, but this call must not wait for it.
+		return answerAfterEnd(ch, result)
+	case resp := <-ch:
+		return decodeResponse(resp, result)
+	}
+}
+
+// answerAfterEnd returns the response a call got before the connection closed
+// or the peer stopped sending, or ErrClosed if none came. The read loop hands a
+// response over before either happens, so a peer that answered and then hung
+// up has its answer waiting in ch; that call is not reported as failed.
+func answerAfterEnd(ch chan message, result any) error {
+	select {
+	case resp := <-ch:
+		return decodeResponse(resp, result)
+	default:
+		return ErrClosed
+	}
+}
+
+func decodeResponse(resp message, result any) error {
+	if resp.Error != nil {
+		return resp.Error
+	}
+	if result != nil && len(resp.Result) > 0 {
+		return json.Unmarshal(resp.Result, result)
+	}
+	return nil
+}
+
+// Notify sends a notification for which no response is expected.
+func (c *Conn) Notify(method string, params any) error {
+	raw, err := marshalParams(params)
+	if err != nil {
+		return err
+	}
+	return c.write(message{Method: method, Params: raw})
+}
+
+// Done returns a channel closed when the connection terminates.
+func (c *Conn) Done() <-chan struct{} { return c.closed }
+
+// Close terminates the connection and reaps the underlying closer.
+func (c *Conn) Close() error { c.close(); return nil }
+
+func (c *Conn) close() {
+	c.closeOnce.Do(func() {
+		close(c.closed)
+		if c.closer != nil {
+			_ = c.closer.Close()
+		}
+	})
+}
+
+func marshalParams(params any) (json.RawMessage, error) {
+	if params == nil {
+		return nil, nil
+	}
+	if raw, ok := params.(json.RawMessage); ok {
+		return raw, nil
+	}
+	return json.Marshal(params)
+}
+
+// readFrame returns the next line from br, newline included, or
+// ErrMessageTooLarge once it passes max bytes. Data after the last newline is
+// returned as a final frame at EOF.
+func readFrame(br *bufio.Reader, max int) ([]byte, error) {
+	var buf []byte
+	for {
+		chunk, err := br.ReadSlice('\n')
+		if len(buf)+len(chunk) > max+1 { // +1 for the newline itself
+			return nil, ErrMessageTooLarge
+		}
+		buf = append(buf, chunk...)
+		switch {
+		case err == nil:
+			return buf, nil
+		case errors.Is(err, bufio.ErrBufferFull):
+			continue
+		case errors.Is(err, io.EOF) && len(bytes.TrimSpace(buf)) > 0:
+			return buf, nil
+		default:
+			return nil, err
+		}
+	}
+}
