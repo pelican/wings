@@ -7,6 +7,7 @@ import (
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
 	"github.com/pelican/wings/config"
+	"github.com/pelican/wings/plugin"
 	"github.com/pelican/wings/remote"
 	"github.com/pelican/wings/router/middleware"
 	wserver "github.com/pelican/wings/server"
@@ -61,10 +62,19 @@ func Configure(m *wserver.Manager, client remote.Client) *gin.Engine {
 	// and requests are authenticated through a JWT the panel issues to the other daemon.
 	router.POST("/api/transfers", postTransfers)
 
+	// Public (unauthenticated) plugin routes. Created BEFORE the authorization
+	// middleware below so they do not inherit it — this is the ScopePublic group
+	// (e.g. health checks). Nothing is mounted here unless a plugin opts in.
+	pluginPublic := router.Group("/ext")
+
 	// All the routes beyond this mount will use an authorization middleware
 	// and will not be accessible without the correct Authorization header provided.
 	protected := router.Use(middleware.RequireAuthorization())
 	protected.POST("/api/update", postUpdateConfiguration)
+
+	// Node-scoped plugin routes (ScopeNode) inherit the Bearer authorization
+	// mounted just above, but are not tied to a specific server.
+	pluginNode := router.Group("/api/ext")
 	protected.GET("/api/system", getSystemInformation)
 	protected.GET("/api/diagnostics", getDiagnostics)
 	protected.GET("/api/system/docker/disk", getDockerDiskUsage)
@@ -127,6 +137,15 @@ func Configure(m *wserver.Manager, client remote.Client) *gin.Engine {
 			backup.DELETE("/:backup", deleteServerBackup)
 		}
 	}
+
+	// Mount native plugin routes now that every scope's group and middleware are
+	// in place. ScopeServer routes inherit the server group's Bearer +
+	// ServerExists checks; each route is namespaced under /ext/<plugin>/.
+	mountPluginRoutes(map[plugin.Scope]gin.IRoutes{
+		plugin.ScopePublic: pluginPublic,
+		plugin.ScopeNode:   pluginNode,
+		plugin.ScopeServer: server.Group("/ext"),
+	})
 
 	return router
 }

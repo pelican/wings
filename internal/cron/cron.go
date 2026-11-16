@@ -90,5 +90,8 @@ func Scheduler(ctx context.Context, m *server.Manager) (gocron.Scheduler, error)
 		return nil, errors.Wrap(err, "cron: failed to create sftp job")
 	}
 
+	// Register any native plugin tasks on the shared scheduler.
+	schedulePluginTasks(ctx, s)
+
 	return s, nil
 }
