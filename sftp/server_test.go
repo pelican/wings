@@ -46,6 +46,21 @@ func startTestServerWithAuth(t *testing.T, limits connectionLimits, auth func(ss
 	return listener.Addr().String()
 }
 
+// requireLoopbackAliases skips the test when the given loopback addresses cannot
+// be bound as a connection's source address. The whole 127.0.0.0/8 range is
+// local on Linux (where CI runs these), but macOS only assigns 127.0.0.1 unless
+// the operator configures aliases, so binding 127.0.0.2 there fails.
+func requireLoopbackAliases(t *testing.T, ips ...string) {
+	t.Helper()
+	for _, ip := range ips {
+		l, err := net.Listen("tcp", net.JoinHostPort(ip, "0"))
+		if err != nil {
+			t.Skipf("loopback alias %s is not available on this host: %v", ip, err)
+		}
+		_ = l.Close()
+	}
+}
+
 // dial opens a connection from the given loopback address and reports whether
 // the server accepted it, which it signals by sending its version banner.
 func dial(t *testing.T, addr string, from string) (net.Conn, bool) {
@@ -80,6 +95,8 @@ func TestUnauthenticatedConnectionsAreClosedAfterTimeout(t *testing.T) {
 }
 
 func TestUnauthenticatedConnectionsAreLimited(t *testing.T) {
+	// This test relies on connecting from distinct source addresses.
+	requireLoopbackAliases(t, "127.0.0.2", "127.0.0.3")
 	addr := startTestServer(t, connectionLimits{handshakeTimeout: time.Minute, maxPending: 3, maxPendingPerIP: 2})
 
 	// Two connections from one address are accepted, the third is not.
