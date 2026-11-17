@@ -5,9 +5,23 @@ import (
 	"sync/atomic"
 	"testing"
 
+	"context"
+
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
+	"github.com/pelican/wings/remote"
 )
+
+// installStateClient records the install-state notifications sent to the Panel.
+type installStateClient struct {
+	remote.Client
+	statuses []bool
+}
+
+func (c *installStateClient) SetInstallationStatus(_ context.Context, _ string, data remote.InstallStatusRequest) error {
+	c.statuses = append(c.statuses, data.Successful)
+	return nil
+}
 
 // Only one of many concurrent requests can start a transfer.
 func TestStartTransferringIsExclusive(t *testing.T) {
@@ -120,7 +134,15 @@ func TestLifecycleClaimsAreMutuallyExclusiveUnderRace(t *testing.T) {
 // concurrent restore would then skip waiting for it to stop before truncating
 // files.
 func TestInstallIsRefusedAndInertWhileRestoring(t *testing.T) {
-	s := newConfiguredServer(t)
+	setTestConfig(t)
+	client := &installStateClient{}
+	s, err := New(client)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SyncWithConfiguration(serverConfiguration(t, testServerUuid, 1)); err != nil {
+		t.Fatal(err)
+	}
 	env := &recordingStateEnvironment{state: environment.ProcessRunningState}
 	s.Environment = env
 
@@ -133,11 +155,17 @@ func TestInstallIsRefusedAndInertWhileRestoring(t *testing.T) {
 	}
 
 	env.mu.Lock()
-	defer env.mu.Unlock()
 	if len(env.states) != 0 {
+		env.mu.Unlock()
 		t.Fatalf("expected a refused install not to change the environment state, got %v", env.states)
 	}
+	env.mu.Unlock()
 	if !s.IsRestoring() {
 		t.Fatal("expected the server to still be restoring")
+	}
+	// The Panel must still be told the install did not succeed, since the request
+	// was already answered with a 202.
+	if len(client.statuses) != 1 || client.statuses[0] {
+		t.Fatalf("expected one unsuccessful install-state notification to the Panel, got %v", client.statuses)
 	}
 }

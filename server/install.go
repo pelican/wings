@@ -44,6 +44,15 @@ func (s *Server) install(reinstall bool) error {
 	// run the install or its completion handling: marking the environment offline
 	// here could let a concurrent restore truncate files while the container runs.
 	if !s.startLifecycle(s.installing) {
+		// The server is busy with another lifecycle operation. Report an
+		// unsuccessful install so the Panel gets a terminal outcome for the request
+		// (it has already been answered with a 202), but do not mark the environment
+		// offline or publish the completed event, which a concurrent restore could
+		// trust and then truncate files while the container is still running.
+		s.Log().Warn("refusing install: another installation, transfer, or restore is already in progress")
+		if serr := s.SyncInstallState(false, reinstall); serr != nil {
+			s.Log().WithField("error", serr).Warn("failed to notify the Panel that the install was refused")
+		}
 		return errors.New("install: another installation, transfer, or restore is already in progress for this server")
 	}
 	defer s.installing.Store(false)
