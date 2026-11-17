@@ -944,33 +944,27 @@ func (f *ConfigurationFile) parsePropertiesFile(file ConfigFile) error {
 	return rewrite(file, s.Bytes())
 }
 
-// sizeChecker is implemented by files whose size counts against a disk limit.
-type sizeChecker interface {
-	// CheckSize returns an error if the file cannot grow to size bytes.
-	CheckSize(size int64) error
-}
-
-// rewrite replaces the contents of file with data. The file is left unchanged if
-// data is too large, or would not fit in the disk space the file may use, rather
-// than being truncated and then only partly written.
+// rewrite replaces the contents of file with data. The new contents are written
+// first and the old tail is trimmed afterwards, rather than truncating first, so
+// that a write the quota-tracked handle refuses (because the result would not fit
+// in the server's disk limit) leaves the original file intact instead of emptying
+// it. A shrinking replacement never needs to reserve space, so it cannot fail
+// that way either.
 func rewrite(file ConfigFile, data []byte) error {
 	if len(data) > maxConfigFileSize {
 		return errors.Errorf("parser: refusing to write configuration file %q: result exceeds limit of %d bytes", file.Name(), maxConfigFileSize)
-	}
-	if c, ok := file.(sizeChecker); ok {
-		if err := c.CheckSize(int64(len(data))); err != nil {
-			return err
-		}
 	}
 
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-	if _, err := file.Write(data); err != nil {
+	n, err := file.Write(data)
+	if err != nil {
 		return errors.Wrap(err, "parser: failed to write configuration file to disk")
+	}
+	// Remove any bytes of the old, longer contents left after the new ones.
+	if err := file.Truncate(int64(n)); err != nil {
+		return errors.Wrap(err, "parser: failed to trim configuration file on disk")
 	}
 	return nil
 }

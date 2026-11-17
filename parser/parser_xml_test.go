@@ -35,13 +35,15 @@ func TestNestedXMLOverDepthLimitIsNotRewritten(t *testing.T) {
 	require.Equal(t, content, string(b))
 }
 
-// fullFile is a configuration file that reports there is no room for it to grow.
-type fullFile struct {
+// quotaRejectingFile is a configuration file whose Write is refused before any
+// bytes are written, as a quota-tracked handle does when the result would not
+// fit in the server's disk limit.
+type quotaRejectingFile struct {
 	*os.File
 }
 
-func (fullFile) CheckSize(int64) error {
-	return os.ErrPermission
+func (quotaRejectingFile) Write([]byte) (int, error) {
+	return 0, os.ErrPermission
 }
 
 // A rewrite that would not fit within the disk limit leaves the file unchanged,
@@ -54,7 +56,7 @@ func TestRewriteThatDoesNotFitLeavesFileUnchanged(t *testing.T) {
 	require.NoError(t, err)
 	defer f.Close()
 
-	require.Error(t, rewrite(fullFile{f}, []byte("motd=a much longer message of the day\n")))
+	require.Error(t, rewrite(quotaRejectingFile{f}, []byte("motd=a much longer message of the day\n")))
 
 	b, err := os.ReadFile(path)
 	require.NoError(t, err)

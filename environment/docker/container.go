@@ -451,11 +451,20 @@ func (e *Environment) SendCommand(c string) error {
 
 	// Only one command may set the deadline and write at a time; otherwise a
 	// second command could push the deadline forward for a write that is already
-	// blocked, keeping it alive indefinitely. Take the lock before reading the
-	// stream so that a command that waited here, for example while the stream was
-	// being replaced during console recovery, writes to the current stream rather
-	// than one that has since been closed.
-	e.sendMu.Lock()
+	// blocked, keeping it alive indefinitely. Bound how long a command waits for
+	// its turn, so that commands do not queue without limit behind a write that is
+	// stuck because the process never reads its input (the HTTP command and stop
+	// paths are not rate limited like the websocket). Taking the lock before
+	// reading the stream also means a command that waited here, for example while
+	// the stream was being replaced during console recovery, writes to the current
+	// stream rather than one that has since been closed.
+	deadline := time.Now().Add(commandWriteTimeout)
+	for !e.sendMu.TryLock() {
+		if time.Now().After(deadline) {
+			return errors.New("environment/docker: timed out waiting to send command to container")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	defer e.sendMu.Unlock()
 
 	e.mu.RLock()
