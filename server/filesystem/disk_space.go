@@ -112,10 +112,12 @@ func (fs *Filesystem) DiskUsage(allowStaleValue bool) (int64, error) {
 		// value. This is a blocking operation to the calling process.
 		if !allowStaleValue {
 			return fs.updateCachedDiskUsage()
-		} else if !fs.lookupInProgress.Load() {
+		} else if fs.lookupInProgress.SwapIf(true) {
 			// Otherwise, if we allow a stale value and there isn't a valid item in the cache and we aren't
 			// currently performing a lookup, just do the disk usage calculation in the background.
+			// Claiming the lookup first means many callers cannot each start one.
 			go func(fs *Filesystem) {
+				defer fs.lookupInProgress.Store(false)
 				if _, err := fs.updateCachedDiskUsage(); err != nil {
 					log.WithField("root", fs.rootPath).WithField("error", err).Warn("failed to update fs disk usage from within routine")
 				}
@@ -135,11 +137,12 @@ func (fs *Filesystem) updateCachedDiskUsage() (int64, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 
-	// Signal that we're currently updating the disk size so that other calls to the disk checking
-	// functions can determine if they should queue up additional calls to this function. Ensure that
-	// we always set this back to "false" when this process is done executing.
-	fs.lookupInProgress.Store(true)
-	defer fs.lookupInProgress.Store(false)
+	// Another caller may have finished a lookup while this one was waiting for the
+	// lock, in which case its result is still fresh and there is no need to walk
+	// the whole directory again.
+	if fs.lastLookupTime.Get().After(time.Now().Add(time.Second * fs.diskCheckInterval * -1)) {
+		return fs.quota.Usage(), nil
+	}
 
 	// If there is no size its either because there is no data (in which case running this function
 	// will have effectively no impact), or there is nothing in the cache, in which case we need to
@@ -147,14 +150,76 @@ func (fs *Filesystem) updateCachedDiskUsage() (int64, error) {
 	// the cache once we've gotten it.
 	size, err := fs.DirectorySize(".")
 
-	// Always cache the size, even if there is an error. We want to always return that value
-	// so that we don't cause an endless loop of determining the disk size if there is a temporary
-	// error encountered.
+	// Always record the lookup, even if there is an error, so that a temporary
+	// error does not cause an endless loop of determining the disk size.
 	fs.lastLookupTime.Set(time.Now())
 
+	// A walk that failed part way through only counted some of the files, so it
+	// must never lower the usage. Otherwise a server that makes the walk fail,
+	// for example with a directory it cannot be read, could escape its limit.
+	if err != nil && size < fs.quota.Usage() {
+		return fs.quota.Usage(), err
+	}
 	fs.quota.SetUsage(size)
 
 	return size, err
+}
+
+// freedByDirectory returns the space that removing the directory would free. A
+// file is only counted once all of its hard links are inside the directory,
+// since otherwise it keeps using its space.
+func (fs *Filesystem) freedByDirectory(dir string) (int64, error) {
+	root, err := fs.openRoot()
+	if err != nil {
+		return 0, err
+	}
+	dir = normalize(dir)
+
+	type inode struct {
+		size  int64
+		links uint64
+		seen  uint64
+	}
+	var size int64
+	linked := make(map[uint64]*inode)
+
+	err = fs2.WalkDir(rootDirFS{root}, dir, func(_ string, d fs2.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs2.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if !d.Type().IsRegular() {
+			return nil
+		}
+		st, err := d.Info()
+		if err != nil {
+			if errors.Is(err, fs2.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		s, ok := st.Sys().(*syscall.Stat_t)
+		if !ok || s.Nlink <= 1 {
+			size += st.Size()
+			return nil
+		}
+		in, ok := linked[s.Ino]
+		if !ok {
+			in = &inode{size: st.Size(), links: uint64(s.Nlink)}
+			linked[s.Ino] = in
+		}
+		in.seen++
+		return nil
+	})
+	for _, in := range linked {
+		if in.seen >= in.links {
+			size += in.size
+		}
+	}
+
+	return size, errors.WrapIf(err, "server/filesystem: failed to walk directory")
 }
 
 // DirectorySize determines the directory size of a given location. Returns the size

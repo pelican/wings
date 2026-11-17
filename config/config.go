@@ -111,6 +111,10 @@ type ApiConfiguration struct {
 	RemoteDownload struct {
 		// MaxRedirects controls how many HTTP redirects are followed when performing a remote download.
 		MaxRedirects int `default:"10" json:"max_redirects" yaml:"max_redirects"`
+		// Allowlist allows remote downloads to connect to otherwise blocked private
+		// or internal destinations. Entries may be hostnames, IP addresses or CIDR
+		// ranges. It can only be set in config.yml.
+		Allowlist []string `json:"-" yaml:"allowlist"`
 	} `json:"remote_download" yaml:"remote_download"`
 
 	// The maximum size for files uploaded through the Panel in MiB.
