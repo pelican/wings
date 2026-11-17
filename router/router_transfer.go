@@ -166,7 +166,15 @@ func postTransfers(c *gin.Context) {
 	}
 
 	i.Server().SetTransferring(true)
-	manager.Add(i.Server())
+	if !manager.AddIfMissing(i.Server()) {
+		// The server was created on this node while the transfer was starting. Its
+		// files now belong to that server, so leave them alone.
+		i.Server().Discard()
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "This server already exists on this node.",
+		})
+		return
+	}
 
 	// We add the transfer to the list of transfers once we have a server instance to use.
 	trnsfr.Server = i.Server()
