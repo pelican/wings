@@ -52,6 +52,35 @@ const maxTextScanTokenSize = 64 * 1024 * 1024
 // maxConfigFileSize caps how large a configuration file we'll attempt to parse.
 const maxConfigFileSize = 64 * 1024 * 1024
 
+// maxXMLDepth is the deepest element nesting of an XML configuration file that
+// is rewritten. Real configuration files are far shallower than this.
+const maxXMLDepth = 512
+
+// xmlDepth returns the element nesting depth of the tree rooted at root,
+// without recursing, so that it cannot itself exhaust the stack.
+func xmlDepth(root *etree.Element) int {
+	if root == nil {
+		return 0
+	}
+	type frame struct {
+		e *etree.Element
+		d int
+	}
+	stack := []frame{{root, 1}}
+	depth := 0
+	for len(stack) > 0 {
+		f := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if f.d > depth {
+			depth = f.d
+		}
+		for _, c := range f.e.ChildElements() {
+			stack = append(stack, frame{c, f.d + 1})
+		}
+	}
+	return depth
+}
+
 // ValueType is the JSON type of a replacement value as written in the egg.
 type ValueType int
 
@@ -480,6 +509,12 @@ func (f *ConfigurationFile) parseXmlFile(file ConfigFile) error {
 	if _, err := doc.ReadFrom(io.LimitReader(file, maxConfigFileSize)); err != nil {
 		return err
 	}
+	// The file is controlled by the server, and a deeply nested document could
+	// exhaust the stack while it is rewritten. The server still boots with the
+	// file as it is, the same as for files over the size limit.
+	if depth := xmlDepth(doc.Root()); depth > maxXMLDepth {
+		return errors.Errorf("parser: refusing to parse configuration file %q: element nesting depth %d exceeds limit of %d", file.Name(), depth, maxXMLDepth)
+	}
 
 	// If there is no root we should create a basic start to the file. This isn't required though,
 	// and if it doesn't work correctly I'll just remove the code.
@@ -537,21 +572,14 @@ func (f *ConfigurationFile) parseXmlFile(file ConfigFile) error {
 		}
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
 	// Ensure the XML is indented properly.
 	doc.Indent(2)
 
-	// Write the XML to the file.
-	if _, err := doc.WriteTo(file); err != nil {
+	var buf bytes.Buffer
+	if _, err := doc.WriteTo(&buf); err != nil {
 		return err
 	}
-	return nil
+	return rewrite(file, buf.Bytes())
 }
 
 // Parses an ini file.
@@ -624,17 +652,11 @@ func (f *ConfigurationFile) parseIniFile(file ConfigFile) error {
 		}
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
+	var buf bytes.Buffer
+	if _, err := cfg.WriteTo(&buf); err != nil {
 		return err
 	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
-	if _, err := cfg.WriteTo(file); err != nil {
-		return err
-	}
-	return nil
+	return rewrite(file, buf.Bytes())
 }
 
 // Parses a json file updating any matching key/value pairs. If a match is not found, the
@@ -651,13 +673,6 @@ func (f *ConfigurationFile) parseJsonFile(file ConfigFile) error {
 		return err
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
 	prettified := pretty.PrettyOptions(data, &pretty.Options{
 		Width:    80,
 		Prefix:   "",
@@ -665,8 +680,8 @@ func (f *ConfigurationFile) parseJsonFile(file ConfigFile) error {
 		SortKeys: false,
 	})
 
-	if _, err := io.Copy(file, bytes.NewReader(prettified)); err != nil {
-		return errors.Wrap(err, "parser: failed to write properties file to disk")
+	if err := rewrite(file, prettified); err != nil {
+		return err
 	}
 	return nil
 }
@@ -689,18 +704,7 @@ func (f *ConfigurationFile) parseYamlFile(file ConfigFile) error {
 		return nil
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
-	// Write the data to the file.
-	if _, err := io.Copy(file, bytes.NewReader(marshaled)); err != nil {
-		return errors.Wrap(err, "parser: failed to write properties file to disk")
-	}
-	return nil
+	return rewrite(file, marshaled)
 }
 
 // Parses a toml file and updates any matching key/value pairs before persisting
@@ -741,17 +745,7 @@ func (f *ConfigurationFile) parseTomlFile(file ConfigFile) error {
 		return err
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
-	if _, err := io.Copy(file, bytes.NewReader(marshaled)); err != nil {
-		return errors.Wrap(err, "parser: failed to write toml file to disk")
-	}
-	return nil
+	return rewrite(file, marshaled)
 }
 
 // normalizeYamlTypes converts json.Number values (produced by UseNumber()) into
@@ -848,23 +842,17 @@ func (f *ConfigurationFile) parseTextFile(file ConfigFile) error {
 			b.Write(line)
 		}
 		b.WriteByte('\n')
+		// Replacements can make the result much larger than the file that was
+		// read, so apply the same limit while building it.
+		if b.Len() > maxConfigFileSize {
+			return errors.Errorf("parser: refusing to write configuration file %q: result exceeds limit of %d bytes", file.Name(), maxConfigFileSize)
+		}
 	}
 	if err := s.Err(); err != nil {
 		return errors.Wrap(err, "parser: failed to scan text file for configuration update")
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
-	// Write the data to the file.
-	if _, err := io.Copy(file, b); err != nil {
-		return errors.Wrap(err, "parser: failed to write properties file to disk")
-	}
-	return nil
+	return rewrite(file, b.Bytes())
 }
 
 // parsePropertiesFile parses a properties file and updates the values within it
@@ -953,16 +941,36 @@ func (f *ConfigurationFile) parsePropertiesFile(file ConfigFile) error {
 		s.WriteString(key + "=" + strings.Trim(strconv.QuoteToASCII(value), "\"") + "\n")
 	}
 
+	return rewrite(file, s.Bytes())
+}
+
+// sizeChecker is implemented by files whose size counts against a disk limit.
+type sizeChecker interface {
+	// CheckSize returns an error if the file cannot grow to size bytes.
+	CheckSize(size int64) error
+}
+
+// rewrite replaces the contents of file with data. The file is left unchanged if
+// data is too large, or would not fit in the disk space the file may use, rather
+// than being truncated and then only partly written.
+func rewrite(file ConfigFile, data []byte) error {
+	if len(data) > maxConfigFileSize {
+		return errors.Errorf("parser: refusing to write configuration file %q: result exceeds limit of %d bytes", file.Name(), maxConfigFileSize)
+	}
+	if c, ok := file.(sizeChecker); ok {
+		if err := c.CheckSize(int64(len(data))); err != nil {
+			return err
+		}
+	}
+
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
 	if err := file.Truncate(0); err != nil {
 		return err
 	}
-
-	// Write the data to the file.
-	if _, err := io.Copy(file, s); err != nil {
-		return errors.Wrap(err, "parser: failed to write properties file to disk")
+	if _, err := file.Write(data); err != nil {
+		return errors.Wrap(err, "parser: failed to write configuration file to disk")
 	}
 	return nil
 }

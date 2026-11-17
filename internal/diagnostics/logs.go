@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/url"
 	"os/exec"
 	"path"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -37,8 +39,8 @@ func GenerateDiagnosticsReport(includeEndpoints bool, includeLogs bool, logLines
 	}
 
 	printHeader(output, "Wings Configuration")
-	if err := config.FromFile(config.DefaultLocation); err != nil {
-	}
+	// The configuration was loaded from the path Wings was given when the command
+	// started, which may not be the default location.
 	cfg := config.Get()
 	fmt.Fprintln(output, "      Panel Location:", redactField(cfg.PanelLocation, includeEndpoints))
 	fmt.Fprintln(output, "")
@@ -105,7 +107,38 @@ func GenerateDiagnosticsReport(includeEndpoints bool, includeLogs bool, logLines
 		fmt.Fprintln(output, "Logs redacted.")
 	}
 
-	return output.String(), nil
+	return redactReport(output.String(), cfg, includeEndpoints), nil
+}
+
+// redactReport removes sensitive values from the whole report, including the
+// logs, rather than only from the fields that print them. The node's token is
+// always removed, and its endpoints are removed unless they should be included.
+func redactReport(report string, cfg *config.Configuration, includeEndpoints bool) string {
+	secrets := []string{cfg.AuthenticationToken, cfg.Token.Token}
+	if !includeEndpoints {
+		secrets = append(secrets,
+			cfg.PanelLocation,
+			cfg.Api.Host,
+			cfg.Api.Ssl.CertificateFile,
+			cfg.Api.Ssl.KeyFile,
+			cfg.System.Sftp.Address,
+		)
+		if u, err := url.Parse(cfg.PanelLocation); err == nil && u.Hostname() != "" {
+			secrets = append(secrets, u.Hostname())
+		}
+	}
+	// Replace longer values first, so that a value containing another is removed
+	// as a whole.
+	sort.Slice(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
+	for _, s := range secrets {
+		// Values such as an empty string or the wildcard address are not sensitive,
+		// and replacing them would mangle the rest of the report.
+		if len(s) < 4 || s == "0.0.0.0" || s == "::" {
+			continue
+		}
+		report = strings.ReplaceAll(report, s, "{redacted}")
+	}
+	return report
 }
 
 func getDockerInfo() (client.ServerVersionResult, dockerSystem.Info, error) {

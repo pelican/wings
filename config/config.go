@@ -415,7 +415,7 @@ type Configuration struct {
 	// additional origins.
 	AllowedOrigins []string `json:"allowed_origins" yaml:"allowed_origins"`
 
-	// AllowCORSPrivateNetwork sets the `Access-Control-Request-Private-Network` header which
+	// AllowCORSPrivateNetwork sets the `Access-Control-Allow-Private-Network` header which
 	// allows client browsers to make requests to internal IP addresses over HTTP.  This setting
 	// is only required by users running Wings without SSL certificates and using internal IP
 	// addresses in order to connect. Most users should NOT enable this setting.

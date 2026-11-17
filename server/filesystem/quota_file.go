@@ -149,6 +149,18 @@ func (f *quotaFile) Truncate(size int64) error {
 	return nil
 }
 
+// CheckSize returns an error if the file cannot grow to size bytes without the
+// server going over its disk limit. Nothing is reserved.
+func (f *quotaFile) CheckSize(size int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if growth := size - f.size; growth > 0 {
+		return f.fs.HasSpaceFor(growth)
+	}
+	return nil
+}
+
 func (f *quotaFile) Close() error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
