@@ -158,9 +158,9 @@ func (e *Environment) reattach() bool {
 		if err == nil {
 			return true
 		}
-		// The container may have only just stopped, in which case it is handled like
-		// any other stop so that crash detection still applies.
-		if c, ierr := e.ContainerInspect(ctx); ierr == nil && c.State != nil && !c.State.Running {
+		// The container may have only just stopped, or been removed, in which case
+		// it is handled like any other stop so that crash detection still applies.
+		if c, ierr := e.ContainerInspect(ctx); errdefs.IsNotFound(ierr) || (ierr == nil && c.State != nil && !c.State.Running) {
 			return false
 		}
 		e.log().WithField("error", err).Error("failed to attach to running container")
@@ -449,6 +449,15 @@ func (e *Environment) SendCommand(c string) error {
 		return ErrCommandControlCharacters
 	}
 
+	// Only one command may set the deadline and write at a time; otherwise a
+	// second command could push the deadline forward for a write that is already
+	// blocked, keeping it alive indefinitely. Take the lock before reading the
+	// stream so that a command that waited here, for example while the stream was
+	// being replaced during console recovery, writes to the current stream rather
+	// than one that has since been closed.
+	e.sendMu.Lock()
+	defer e.sendMu.Unlock()
+
 	e.mu.RLock()
 	stream := e.stream
 	stop := e.meta.Stop
@@ -464,12 +473,8 @@ func (e *Environment) SendCommand(c string) error {
 		e.SetState(environment.ProcessStoppingState)
 	}
 
-	// Only one command may set the deadline and write at a time; otherwise a
-	// second command could push the deadline forward for a write that is already
-	// blocked, keeping it alive indefinitely. The process may never read its
-	// input, so don't wait forever for there to be room for the command.
-	e.sendMu.Lock()
-	defer e.sendMu.Unlock()
+	// The process may never read its input, so don't wait forever for there to be
+	// room for the command.
 	_ = stream.Conn.SetWriteDeadline(time.Now().Add(commandWriteTimeout))
 	_, err := stream.Conn.Write([]byte(c + "\n"))
 

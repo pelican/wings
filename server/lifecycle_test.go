@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/pelican/wings/config"
+	"github.com/pelican/wings/environment"
 )
 
 // Only one of many concurrent requests can start a transfer.
@@ -110,5 +111,33 @@ func TestLifecycleClaimsAreMutuallyExclusiveUnderRace(t *testing.T) {
 		if s.IsTransferring() && s.IsRestoring() {
 			t.Fatalf("iteration %d: server is both transferring and restoring", iter)
 		}
+	}
+}
+
+// A server that is being restored (or transferred) must refuse an install and,
+// crucially, leave the environment state alone. Otherwise install() would mark
+// the environment offline while the container is still running, and the
+// concurrent restore would then skip waiting for it to stop before truncating
+// files.
+func TestInstallIsRefusedAndInertWhileRestoring(t *testing.T) {
+	s := newConfiguredServer(t)
+	env := &recordingStateEnvironment{state: environment.ProcessRunningState}
+	s.Environment = env
+
+	if !s.StartRestoring() {
+		t.Fatal("expected the restore to start")
+	}
+
+	if err := s.Install(); err == nil {
+		t.Fatal("expected install to be refused while a restore is in progress")
+	}
+
+	env.mu.Lock()
+	defer env.mu.Unlock()
+	if len(env.states) != 0 {
+		t.Fatalf("expected a refused install not to change the environment state, got %v", env.states)
+	}
+	if !s.IsRestoring() {
+		t.Fatal("expected the server to still be restoring")
 	}
 }

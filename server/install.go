@@ -39,6 +39,15 @@ func (s *Server) Install() error {
 }
 
 func (s *Server) install(reinstall bool) error {
+	// Claim the install slot before running anything or touching state. If the
+	// server is being transferred or restored, or is already installing, do not
+	// run the install or its completion handling: marking the environment offline
+	// here could let a concurrent restore truncate files while the container runs.
+	if !s.startLifecycle(s.installing) {
+		return errors.New("install: another installation, transfer, or restore is already in progress for this server")
+	}
+	defer s.installing.Store(false)
+
 	var err error
 	if !s.Config().SkipEggScripts {
 		// Send the start event so the Panel can automatically update. We don't
@@ -224,18 +233,6 @@ func (ip *InstallationProcess) RemoveContainer() error {
 // installation container. Once the container finishes installing the results
 // are stored in an installation log in the server's configuration directory.
 func (ip *InstallationProcess) Run() error {
-	ip.Server.Log().Debug("acquiring installation process lock")
-	if !ip.Server.startLifecycle(ip.Server.installing) {
-		return errors.New("install: cannot obtain installation lock")
-	}
-	// We now have an exclusive lock on this installation process. Ensure that whenever this
-	// process is finished that the semaphore is released so that other processes and be executed
-	// without encountering a wait timeout.
-	defer func() {
-		ip.Server.Log().Debug("releasing installation process lock")
-		ip.Server.installing.Store(false)
-	}()
-
 	if err := ip.BeforeExecute(); err != nil {
 		return err
 	}
