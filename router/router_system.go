@@ -335,7 +335,6 @@ func postDeauthorizeUser(c *gin.Context) {
 		return
 	}
 
-	// todo: disconnect websockets more gracefully
 	m := middleware.ExtractManager(c)
 	// Deny the user's tokens before disconnecting them, so that a reconnect racing
 	// the disconnect cannot authenticate with a token issued before the revocation.
@@ -343,14 +342,14 @@ func postDeauthorizeUser(c *gin.Context) {
 		for _, uuid := range data.Servers {
 			if s, ok := m.Get(uuid); ok {
 				tokens.DenyForServer(s.ID(), data.User)
-				s.Websockets().CancelAll()
+				s.Websockets().CancelUser(data.User)
 				s.Sftp().Cancel(data.User)
 			}
 		}
 	} else {
 		for _, s := range m.All() {
 			tokens.DenyForServer(s.ID(), data.User)
-			s.Websockets().CancelAll()
+			s.Websockets().CancelUser(data.User)
 			s.Sftp().Cancel(data.User)
 		}
 	}

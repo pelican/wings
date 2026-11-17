@@ -29,6 +29,14 @@ import (
 
 var ErrNotAttached = errors.Sentinel("not attached to instance")
 
+// ErrCommandControlCharacters is returned when a command sent to a server
+// contains control characters.
+var ErrCommandControlCharacters = errors.Sentinel("environment/docker: command contains control characters")
+
+// commandWriteTimeout is the amount of time allowed for a command to be written
+// to the input of a server process.
+var commandWriteTimeout = time.Second * 10
+
 // A custom console writer that allows us to keep a function blocked until the
 // given stream is properly closed. This does nothing special, only exists to
 // make a noop io.Writer.
@@ -343,21 +351,34 @@ func (e *Environment) Destroy() error {
 // instance. There is no confirmation that this data is sent successfully, only
 // that it gets pushed into the stdin.
 func (e *Environment) SendCommand(c string) error {
-	if !e.IsAttached() {
-		return errors.Wrap(ErrNotAttached, "environment/docker: cannot send command to container")
+	// The container has a TTY, so control characters are interpreted rather than
+	// passed to the process: ^C, ^\ and ^Z would signal the process directly.
+	// Commands may not contain them, other than tabs and line endings.
+	if strings.ContainsFunc(c, func(r rune) bool {
+		return (r < 0x20 && r != '\t' && r != '\n' && r != '\r') || r == 0x7f
+	}) {
+		return ErrCommandControlCharacters
 	}
 
 	e.mu.RLock()
-	defer e.mu.RUnlock()
+	stream := e.stream
+	stop := e.meta.Stop
+	e.mu.RUnlock()
+	if stream == nil {
+		return errors.Wrap(ErrNotAttached, "environment/docker: cannot send command to container")
+	}
 
 	// If the command being processed is the same as the process stop command then we
 	// want to mark the server as entering the stopping state otherwise the process will
 	// stop and Wings will think it has crashed and attempt to restart it.
-	if e.meta.Stop.Type == "command" && c == e.meta.Stop.Value {
+	if stop.Type == "command" && c == stop.Value {
 		e.SetState(environment.ProcessStoppingState)
 	}
 
-	_, err := e.stream.Conn.Write([]byte(c + "\n"))
+	// The process may never read its input, so don't wait forever for there to be
+	// room for the command.
+	_ = stream.Conn.SetWriteDeadline(time.Now().Add(commandWriteTimeout))
+	_, err := stream.Conn.Write([]byte(c + "\n"))
 
 	return errors.Wrap(err, "environment/docker: could not write to container stream")
 }

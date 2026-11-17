@@ -54,7 +54,7 @@ func Configure(m *wserver.Manager, client remote.Client) *gin.Engine {
 	// This route is special it sits above all the other requests because we are
 	// using a JWT to authorize access to it, therefore it needs to be publicly
 	// accessible.
-	router.GET("/api/servers/:server/ws", middleware.ServerExists(), getServerWebsocket)
+	router.GET("/api/servers/:server/ws", middleware.ServerExists(), getServerWebsocket(maxWebsocketConnections, websocketAuthenticationTimeout))
 
 	// This request is called by another daemon when a server is going to be transferred out.
 	// This request does not need the AuthorizationMiddleware as the panel should never call it
