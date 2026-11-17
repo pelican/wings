@@ -69,6 +69,11 @@ func isPooledTransfer(c *gin.Context) bool {
 	return remotePool.Enabled && remotePool.PoolName != "" && sourcePool != "" && strings.EqualFold(remotePool.PoolName, sourcePool)
 }
 
+// maxChecksumSize is the most that is read of a checksum sent with a transfer.
+// A SHA-256 checksum is 64 hexadecimal characters, so anything longer is
+// invalid, and reading it without a limit would let the sender use up memory.
+const maxChecksumSize = 128
+
 // postTransfers .
 func postTransfers(c *gin.Context) {
 	auth := strings.SplitN(c.GetHeader("Authorization"), " ", 2)
@@ -308,7 +313,7 @@ out:
 
 			case strings.HasPrefix(name, "checksum_archive"):
 				trnsfr.Log().Debug("received archive checksum")
-				checksumData, err := io.ReadAll(p)
+				checksumData, err := io.ReadAll(io.LimitReader(p, maxChecksumSize))
 				if err != nil {
 					middleware.CaptureAndAbort(c, err)
 					return
@@ -406,7 +411,7 @@ out:
 				backupName := strings.TrimPrefix(name, "checksum_backup_")
 				trnsfr.Log().WithField("backup", backupName).Debug("received backup checksum")
 
-				checksumData, err := io.ReadAll(p)
+				checksumData, err := io.ReadAll(io.LimitReader(p, maxChecksumSize))
 				if err != nil {
 					middleware.CaptureAndAbort(c, err)
 					return

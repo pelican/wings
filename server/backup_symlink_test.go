@@ -84,7 +84,7 @@ func TestRestoreBackupRecreatesSymlinks(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if err := s.RestoreBackup(b, nil); err != nil {
+	if err := s.RestoreBackup(b, nil, false); err != nil {
 		t.Fatal(err)
 	}
 

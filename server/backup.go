@@ -143,7 +143,10 @@ func (s *Server) Backup(b backup.BackupInterface) error {
 //
 // In addition to the websocket event an API call is triggered to notify the
 // Panel of the new state.
-func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (err error) {
+//
+// If truncate is true the server's files are deleted first, once the server has
+// stopped.
+func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser, truncate bool) (err error) {
 	s.Config().SetSuspended(true)
 	// Local backups will not pass a reader through to this function, so check first
 	// to make sure it is a valid reader before trying to close it.
@@ -169,6 +172,13 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser) (
 			if !cerrdefs.IsNotFound(err) {
 				return errors.WrapIf(err, "server/backup: restore: failed to wait for container stop")
 			}
+		}
+	}
+
+	if truncate {
+		s.Log().Info("deleting server files before restoring backup")
+		if err = s.Filesystem().TruncateRootDirectory(); err != nil {
+			return errors.WrapIf(err, "server/backup: restore: failed to delete server files")
 		}
 	}
 

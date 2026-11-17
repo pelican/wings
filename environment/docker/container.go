@@ -84,8 +84,15 @@ func (e *Environment) Attach(ctx context.Context) error {
 		defer cancel()
 		defer e.stream.Close()
 		defer func() {
-			e.SetState(environment.ProcessOfflineState)
 			e.SetStream(nil)
+			// The stream can end without the container stopping, in which case it is
+			// attached to again rather than treating the server as stopped. A server
+			// marked as stopped while its container keeps running would no longer be
+			// managed, and its disk limit would not be enforced.
+			if e.reattach() {
+				return
+			}
+			e.SetState(environment.ProcessOfflineState)
 		}()
 
 		go func() {
@@ -109,6 +116,53 @@ func (e *Environment) Attach(ctx context.Context) error {
 	}()
 
 	return nil
+}
+
+// reattach is called when the attached stream ends, and attaches to the
+// container again if it is still running, returning true if the container is
+// still running. If that keeps happening, or attaching fails, the container is
+// terminated rather than left running without being managed.
+func (e *Environment) reattach() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancel()
+
+	c, err := e.ContainerInspect(ctx)
+	if err != nil || c.State == nil || !c.State.Running {
+		return false
+	}
+
+	e.mu.Lock()
+	if time.Since(e.reattachedAt) > time.Minute*5 {
+		e.reattachedAt = time.Now()
+		e.reattachedCount = 0
+	}
+	e.reattachedCount++
+	count := e.reattachedCount
+	e.mu.Unlock()
+
+	if count <= 3 {
+		e.log().Warn("lost the attached stream for a running container, attaching again")
+		err := e.Attach(ctx)
+		if err == nil {
+			return true
+		}
+		// The container may have only just stopped, in which case it is handled like
+		// any other stop so that crash detection still applies.
+		if c, ierr := e.ContainerInspect(ctx); ierr == nil && c.State != nil && !c.State.Running {
+			return false
+		}
+		e.log().WithField("error", err).Error("failed to attach to running container")
+	}
+
+	e.log().Error("unable to stay attached to running container, terminating it")
+	// Attaching may have used up the time allowed by ctx, which would leave the
+	// container running without being managed.
+	tctx, tcancel := context.WithTimeout(context.Background(), time.Second*30)
+	defer tcancel()
+	if err := e.Terminate(tctx, "SIGKILL"); err != nil {
+		e.log().WithField("error", err).Error("failed to terminate container")
+	}
+	return true
 }
 
 // InSituUpdate performs an in-place update of the Docker container's resource

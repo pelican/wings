@@ -354,12 +354,12 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 
 	sys := config.Get().System
 	// Ensure the archive directory exists.
-	if err := os.MkdirAll(sys.ArchiveDirectory, 0o755); err != nil {
+	if err := os.MkdirAll(sys.ArchiveDirectory, 0o700); err != nil {
 		log.WithField("error", err).Error("failed to create archive directory")
 	}
 
 	// Ensure the backup directory exists.
-	if err := os.MkdirAll(sys.BackupDirectory, 0o755); err != nil {
+	if err := os.MkdirAll(sys.BackupDirectory, 0o700); err != nil {
 		log.WithField("error", err).Error("failed to create backup directory")
 	}
 

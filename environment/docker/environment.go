@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -55,6 +56,11 @@ type Environment struct {
 
 	// Tracks the environment state.
 	st *system.AtomicString
+
+	// reattachedAt and reattachedCount track how often the attached stream has
+	// been lost for a running container, see reattach. Guarded by mu.
+	reattachedAt    time.Time
+	reattachedCount int
 }
 
 // New creates a new base Docker environment. The ID passed through will be the

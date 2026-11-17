@@ -135,11 +135,11 @@ func TestPower(t *testing.T) {
 				g.Assert(l.IsLocked()).IsFalse()
 
 				err := l.Acquire()
-				g.Assert(errors.Is(err, ErrLockerLocked)).IsTrue()
+				g.Assert(errors.Is(err, ErrLockerDestroyed)).IsTrue()
 				g.Assert(l.IsLocked()).IsFalse()
 
 				err = l.TryAcquire(context.Background())
-				g.Assert(errors.Is(err, ErrLockerLocked)).IsTrue()
+				g.Assert(errors.Is(err, ErrLockerDestroyed)).IsTrue()
 				g.Assert(l.IsLocked()).IsFalse()
 			})
 
@@ -155,7 +155,7 @@ func TestPower(t *testing.T) {
 					l.Destroy()
 
 					err := l.TryAcquire(ctx)
-					g.Assert(errors.Is(err, ErrLockerLocked)).IsTrue()
+					g.Assert(errors.Is(err, ErrLockerDestroyed)).IsTrue()
 				}
 			})
 
@@ -171,7 +171,7 @@ func TestPower(t *testing.T) {
 				l.Destroy()
 
 				err := <-errs
-				g.Assert(errors.Is(err, ErrLockerLocked)).IsTrue()
+				g.Assert(errors.Is(err, ErrLockerDestroyed)).IsTrue()
 				g.Assert(l.IsLocked()).IsFalse()
 			})
 
