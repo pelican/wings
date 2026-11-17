@@ -31,7 +31,8 @@ func TestShutdownOnSignalSavesStatesAndStopsServer(t *testing.T) {
 	go func() { served <- srv.Serve(l) }()
 
 	signals := make(chan os.Signal, 1)
-	go shutdownOnSignal(signals, server.NewEmptyManager(nil), srv)
+	done := make(chan struct{})
+	go shutdownOnSignal(signals, server.NewEmptyManager(nil), srv, done)
 	signals <- syscall.SIGTERM
 
 	select {
@@ -42,4 +43,12 @@ func TestShutdownOnSignalSavesStatesAndStopsServer(t *testing.T) {
 	}
 	_, err = os.Stat(config.Get().System.GetStatesPath())
 	require.NoError(t, err, "expected the server states to be saved")
+
+	// The serving goroutine waits on this channel before the process exits, so it
+	// must be closed once the graceful shutdown has finished.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected shutdown to signal completion")
+	}
 }

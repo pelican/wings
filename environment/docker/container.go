@@ -126,8 +126,20 @@ func (e *Environment) reattach() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer cancel()
 
-	c, err := e.ContainerInspect(ctx)
-	if err != nil || c.State == nil || !c.State.Running {
+	c, err := e.inspectForReattach(ctx)
+	if err != nil {
+		// The container is gone, so the server really did stop.
+		if errdefs.IsNotFound(err) {
+			return false
+		}
+		// The inspect kept failing, so whether the container is running is unknown.
+		// Terminating it is safer than marking a possibly-running container offline,
+		// which would stop its disk limit from being enforced.
+		e.log().WithField("error", err).Error("could not inspect container after losing its stream, terminating it")
+		e.terminateUnmanaged()
+		return true
+	}
+	if c.State == nil || !c.State.Running {
 		return false
 	}
 
@@ -155,14 +167,37 @@ func (e *Environment) reattach() bool {
 	}
 
 	e.log().Error("unable to stay attached to running container, terminating it")
-	// Attaching may have used up the time allowed by ctx, which would leave the
-	// container running without being managed.
+	e.terminateUnmanaged()
+	return true
+}
+
+// inspectForReattach inspects the container, retrying a transient error a few
+// times so that a single failed inspect does not decide the container stopped.
+func (e *Environment) inspectForReattach(ctx context.Context) (container.InspectResponse, error) {
+	var c container.InspectResponse
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if c, err = e.ContainerInspect(ctx); err == nil || errdefs.IsNotFound(err) {
+			return c, err
+		}
+		select {
+		case <-ctx.Done():
+			return c, err
+		case <-time.After(time.Second):
+		}
+	}
+	return c, err
+}
+
+// terminateUnmanaged SIGKILLs a container that can no longer be managed. Attaching
+// may have used up the time allowed by the caller's context, which would leave the
+// container running without being managed, so a fresh timeout is used.
+func (e *Environment) terminateUnmanaged() {
 	tctx, tcancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer tcancel()
 	if err := e.Terminate(tctx, "SIGKILL"); err != nil {
 		e.log().WithField("error", err).Error("failed to terminate container")
 	}
-	return true
 }
 
 // InSituUpdate performs an in-place update of the Docker container's resource
@@ -429,8 +464,12 @@ func (e *Environment) SendCommand(c string) error {
 		e.SetState(environment.ProcessStoppingState)
 	}
 
-	// The process may never read its input, so don't wait forever for there to be
-	// room for the command.
+	// Only one command may set the deadline and write at a time; otherwise a
+	// second command could push the deadline forward for a write that is already
+	// blocked, keeping it alive indefinitely. The process may never read its
+	// input, so don't wait forever for there to be room for the command.
+	e.sendMu.Lock()
+	defer e.sendMu.Unlock()
 	_ = stream.Conn.SetWriteDeadline(time.Now().Add(commandWriteTimeout))
 	_, err := stream.Conn.Write([]byte(c + "\n"))
 

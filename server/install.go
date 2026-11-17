@@ -165,25 +165,31 @@ func (s *Server) SetTransferring(state bool) {
 	}
 }
 
-// StartTransferring marks the server as being transferred, returning false if
-// it already is, or if it is being installed or restored. Checking and setting
-// happen together, so two requests cannot both start a transfer.
-func (s *Server) StartTransferring() bool {
-	if s.IsInstalling() || s.IsRestoring() || !s.transferring.SwapIf(true) {
+// startLifecycle atomically starts one of the mutually exclusive lifecycle
+// operations (install, transfer, restore), returning false if any of them is
+// already in progress. The check and the set are done under lifecycleMu so that
+// two requests cannot both pass the check and start at once.
+func (s *Server) startLifecycle(flag *system.AtomicBool) bool {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.installing.Load() || s.transferring.Load() || s.restoring.Load() {
 		return false
 	}
+	flag.Store(true)
 	s.Sftp().CancelAll()
 	return true
+}
+
+// StartTransferring marks the server as being transferred, returning false if it
+// already is, or if it is being installed or restored.
+func (s *Server) StartTransferring() bool {
+	return s.startLifecycle(s.transferring)
 }
 
 // StartRestoring marks the server as restoring a backup, returning false if it
 // already is, or if it is being installed or transferred.
 func (s *Server) StartRestoring() bool {
-	if s.IsInstalling() || s.IsTransferring() || !s.restoring.SwapIf(true) {
-		return false
-	}
-	s.Sftp().CancelAll()
-	return true
+	return s.startLifecycle(s.restoring)
 }
 
 func (s *Server) IsRestoring() bool {
@@ -219,10 +225,9 @@ func (ip *InstallationProcess) RemoveContainer() error {
 // are stored in an installation log in the server's configuration directory.
 func (ip *InstallationProcess) Run() error {
 	ip.Server.Log().Debug("acquiring installation process lock")
-	if !ip.Server.installing.SwapIf(true) {
+	if !ip.Server.startLifecycle(ip.Server.installing) {
 		return errors.New("install: cannot obtain installation lock")
 	}
-	ip.Server.Sftp().CancelAll()
 	// We now have an exclusive lock on this installation process. Ensure that whenever this
 	// process is finished that the semaphore is released so that other processes and be executed
 	// without encountering a wait timeout.

@@ -80,3 +80,35 @@ func TestInstallerHasPidLimit(t *testing.T) {
 		}
 	}
 }
+
+// Restore and transfer each replace the server's files, so no two lifecycle
+// operations may start at once even when many requests race (GHSA-6pfj-adjacent).
+func TestLifecycleClaimsAreMutuallyExclusiveUnderRace(t *testing.T) {
+	for iter := 0; iter < 200; iter++ {
+		s := newConfiguredServer(t)
+		var wg sync.WaitGroup
+		var transfers, restores atomic.Int32
+		for i := 0; i < 8; i++ {
+			wg.Add(2)
+			go func() {
+				defer wg.Done()
+				if s.StartTransferring() {
+					transfers.Add(1)
+				}
+			}()
+			go func() {
+				defer wg.Done()
+				if s.StartRestoring() {
+					restores.Add(1)
+				}
+			}()
+		}
+		wg.Wait()
+		if transfers.Load()+restores.Load() != 1 {
+			t.Fatalf("iteration %d: expected exactly one lifecycle op to start, got %d transfers and %d restores", iter, transfers.Load(), restores.Load())
+		}
+		if s.IsTransferring() && s.IsRestoring() {
+			t.Fatalf("iteration %d: server is both transferring and restoring", iter)
+		}
+	}
+}

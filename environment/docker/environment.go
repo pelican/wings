@@ -57,6 +57,12 @@ type Environment struct {
 	// Tracks the environment state.
 	st *system.AtomicString
 
+	// sendMu serializes writes of commands to the container stream, so that
+	// concurrent commands cannot each push the shared write deadline forward and
+	// keep a blocked write alive indefinitely. Each write is bounded by
+	// commandWriteTimeout, so a waiting command blocks for at most that long.
+	sendMu sync.Mutex
+
 	// reattachedAt and reattachedCount track how often the attached stream has
 	// been lost for a running container, see reattach. Guarded by mu.
 	reattachedAt    time.Time

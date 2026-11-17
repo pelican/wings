@@ -110,7 +110,7 @@ func TestPostUpdateConfigurationIgnoresHostSettings(t *testing.T) {
 
 // An update with an invalid value is refused as a whole, and nothing is written.
 func TestPostUpdateConfigurationRejectsInvalidValues(t *testing.T) {
-	c, recorder, path := newUpdateConfigurationContext(t, `{"token_id":"new-id","token":"new-token","system":{"username":"pelican --uid 0"}}`)
+	c, recorder, path := newUpdateConfigurationContext(t, `{"token_id":"new-id","token":"new-token","docker":{"userns_mode":"not-a-mode"}}`)
 	before := config.Get()
 
 	postUpdateConfiguration(c)
@@ -119,8 +119,8 @@ func TestPostUpdateConfigurationRejectsInvalidValues(t *testing.T) {
 		t.Fatalf("expected the update to be rejected, got status %d", recorder.Code)
 	}
 	after := config.Get()
-	if after.System.Username != before.System.Username || after.Token.ID != "old-id" {
-		t.Fatalf("expected the configuration to be unchanged, got username %q and token id %q", after.System.Username, after.Token.ID)
+	if after.Docker.UsernsMode != before.Docker.UsernsMode || after.Token.ID != "old-id" {
+		t.Fatalf("expected the configuration to be unchanged, got userns_mode %q and token id %q", after.Docker.UsernsMode, after.Token.ID)
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("expected nothing to be written to disk, got %v", err)

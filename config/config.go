@@ -76,8 +76,9 @@ type SftpConfiguration struct {
 	ReadOnly bool `default:"false" yaml:"read_only"`
 	// If set to true users won't be able to login using their password.
 	KeyOnly bool `default:"false" yaml:"key_only"`
-	// The maximum number of connections a single user may have open at once, or
-	// zero to use the default of 32.
+	// The maximum number of connections a single user may have open to a single
+	// server at once, or zero to use the default of 32. A user with access to
+	// several servers may have this many to each of them.
 	MaxConnectionsPerUser int `json:"-" yaml:"max_connections_per_user"`
 	// The maximum number of connections from a single IP address, or IPv6 /64
 	// network, that may be authenticating at once, or zero to use the default of

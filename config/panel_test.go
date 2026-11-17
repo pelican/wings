@@ -73,11 +73,9 @@ func TestPanelConfigurationAppliesEveryPanelKey(t *testing.T) {
 		"api.trusted_proxies":                  []string{"10.0.0.0/8", "192.0.2.1"},
 		"api.remote_download.max_redirects":    3,
 		"remote_query.timeout":                 45,
-		"system.username":                      "gameserver",
 		"system.timezone":                      "UTC",
 		"system.quotas.enabled":                true,
 		"system.sftp.bind_address":             "127.0.0.1",
-		"system.user.rootless.enabled":         true,
 		"system.user.passwd.enable":            false,
 		"system.machine_id.enable":             false,
 		"docker.network.name":                  "custom_nw",
@@ -126,7 +124,8 @@ func TestPanelConfigurationIgnoresHostSettings(t *testing.T) {
 	bodies := []string{
 		`{"system":{"user":{"uid":0,"gid":0}}}`,
 		`{"system":{"user":{"passwd":{"directory":"/etc"}}}}`,
-		`{"system":{"user":{"rootless":{"container_uid":0}}}}`,
+		`{"system":{"username":"root"}}`,
+		`{"system":{"user":{"rootless":{"enabled":true,"container_uid":0}}}}`,
 		`{"system":{"machine_id":{"directory":"/etc"}}}`,
 		`{"system":{"root_directory":"/","data":"/","log_directory":"/","tmp_directory":"/","backup_directory":"/","archive_directory":"/"}}`,
 		`{"system":{"backups":{"restore_host_allowlist":["127.0.0.1"]}}}`,
@@ -153,7 +152,6 @@ func TestPanelConfigurationIgnoresHostSettings(t *testing.T) {
 
 func TestPanelConfigurationRejectsInvalidValues(t *testing.T) {
 	invalid := map[string]any{
-		"system.username":                      "pelican --uid 0",
 		"docker.userns_mode":                   "private",
 		"docker.network.name":                  "bad name",
 		"docker.network.interface":             "not-an-ip",

@@ -40,6 +40,12 @@ type Server struct {
 	emitterLock sync.Mutex
 	powerLock   *system.Locker
 
+	// lifecycleMu makes the check-and-set for the installing, transferring and
+	// restoring states one atomic step, so that only one of them can start at a
+	// time. Each replaces the server's files, so two starting at once could
+	// corrupt the server (GHSA-6pfj / restore-vs-transfer).
+	lifecycleMu sync.Mutex
+
 	// Maintains the configuration for the server. This is the data that gets returned by the Panel
 	// such as build settings and container images.
 	cfg    Configuration

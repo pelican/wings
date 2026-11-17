@@ -53,7 +53,6 @@ type PanelConfiguration struct {
 	} `json:"remote_query"`
 
 	System struct {
-		Username *string `json:"username"`
 		Timezone *string `json:"timezone"`
 		Quotas   struct {
 			Enabled *bool `json:"enabled"`
@@ -63,9 +62,6 @@ type PanelConfiguration struct {
 			Port    *int    `json:"bind_port"`
 		} `json:"sftp"`
 		User struct {
-			Rootless struct {
-				Enabled *bool `json:"enabled"`
-			} `json:"rootless"`
 			Passwd struct {
 				Enable *bool `json:"enable"`
 			} `json:"passwd"`
@@ -121,9 +117,6 @@ type PanelConfiguration struct {
 }
 
 var (
-	// A Linux user name, as accepted by useradd. The name is passed to useradd as
-	// an argument, so it must never contain spaces or start with a dash.
-	usernameRegex = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
 	// A Docker network or driver name.
 	dockerNameRegex = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$`)
 	// A Docker log driver, which may be a plugin such as "grafana/loki:latest".
@@ -181,9 +174,6 @@ func (p *PanelConfiguration) Validate() error {
 		check("remote_query.timeout", *v >= 0, "must not be negative")
 	}
 
-	if v := p.System.Username; v != nil {
-		check("system.username", usernameRegex.MatchString(*v), "must be a valid Linux user name")
-	}
 	if v := p.System.Timezone; v != nil && *v != "" {
 		_, err := time.LoadLocation(*v)
 		check("system.timezone", err == nil && !strings.ContainsAny(*v, `\`) && !strings.Contains(*v, ".."), "must be a valid time zone")
@@ -273,12 +263,10 @@ func (c *Configuration) ApplyPanelConfiguration(p PanelConfiguration) {
 	set(&c.Api.RemoteDownload.MaxRedirects, p.Api.RemoteDownload.MaxRedirects)
 	set(&c.RemoteQuery.Timeout, p.RemoteQuery.Timeout)
 
-	set(&c.System.Username, p.System.Username)
 	set(&c.System.Timezone, p.System.Timezone)
 	set(&c.System.Quotas.Enabled, p.System.Quotas.Enabled)
 	set(&c.System.Sftp.Address, p.System.Sftp.Address)
 	set(&c.System.Sftp.Port, p.System.Sftp.Port)
-	set(&c.System.User.Rootless.Enabled, p.System.User.Rootless.Enabled)
 	set(&c.System.User.Passwd.Enable, p.System.User.Passwd.Enable)
 	set(&c.System.MachineID.Enable, p.System.MachineID.Enable)
 

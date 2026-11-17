@@ -403,7 +403,10 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 	// Wings next starts.
 	signals := make(chan os.Signal, 1)
 	signal.Notify(signals, syscall.SIGINT, syscall.SIGTERM)
-	go shutdownOnSignal(signals, manager, s)
+	// Closed once the graceful shutdown has finished, so the process does not exit
+	// while requests are still being drained.
+	shutdownComplete := make(chan struct{})
+	go shutdownOnSignal(signals, manager, s, shutdownComplete)
 
 	profile, _ := cmd.Flags().GetBool("pprof")
 	if profile {
@@ -447,6 +450,7 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 		if err := s.ServeTLS(listener, "", ""); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.WithFields(log.Fields{"auto_tls": true, "tls_hostname": tlshostname, "error": err}).Fatal("failed to configure HTTP server using auto-tls")
 		}
+		<-shutdownComplete
 		return
 	}
 
@@ -456,17 +460,20 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 		if err := s.ServeTLS(listener, api.Ssl.CertificateFile, api.Ssl.KeyFile); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.WithFields(log.Fields{"auto_tls": false, "error": err}).Fatal("failed to configure HTTPS server")
 		}
+		<-shutdownComplete
 		return
 	}
 	s.TLSConfig = nil
 	if err := s.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.WithField("error", err).Fatal("failed to configure HTTP server")
 	}
+	<-shutdownComplete
 }
 
 // shutdownOnSignal waits for a signal, then saves the state of every server and
 // stops the HTTP server, which returns from Serve so that Wings can exit.
-func shutdownOnSignal(signals <-chan os.Signal, manager *server.Manager, srv *http.Server) {
+func shutdownOnSignal(signals <-chan os.Signal, manager *server.Manager, srv *http.Server, done chan<- struct{}) {
+	defer close(done)
 	sig := <-signals
 	log.WithField("signal", sig.String()).Info("received signal, shutting down")
 	if err := manager.PersistStates(); err != nil {
