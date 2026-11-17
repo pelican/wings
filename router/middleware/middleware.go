@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"strings"
+	"time"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -13,6 +15,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/pelican/wings/config"
+	"github.com/pelican/wings/internal/network"
 	"github.com/pelican/wings/remote"
 	"github.com/pelican/wings/router/tokens"
 	"github.com/pelican/wings/server"
@@ -181,6 +184,14 @@ func RequireAuthorization() gin.HandlerFunc {
 		// if it is rotated this value will never properly get updated.
 		auth := strings.SplitN(c.GetHeader("Authorization"), " ", 2)
 		c.Header("User-Agent", fmt.Sprintf("Pelican Wings/v%s (id:%s)", system.Version, config.Get().AuthenticationTokenId))
+
+		// When the operator has limited where the Panel connects from, the node token
+		// is only accepted from those addresses, so a leaked token is of no use
+		// anywhere else.
+		if allowlist := config.Get().Api.PanelAllowlist; len(allowlist) > 0 && !isPanelAddress(allowlist, c.ClientIP()) {
+			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "You are not authorized to access this endpoint."})
+			return
+		}
 		if len(auth) != 2 || auth[0] != "Bearer" {
 			c.Header("WWW-Authenticate", "Bearer")
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{"error": "The required authorization heads were not present in the request."})
@@ -194,8 +205,28 @@ func RequireAuthorization() gin.HandlerFunc {
 			c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "You are not authorized to access this endpoint."})
 			return
 		}
+		ClearDeadlines(c)
 		c.Next()
 	}
+}
+
+// isPanelAddress reports whether the client address is in the allowlist of
+// addresses the Panel connects from. Entries are IP addresses or CIDR ranges.
+func isPanelAddress(allowlist []string, clientIP string) bool {
+	addr, err := netip.ParseAddr(clientIP)
+	if err != nil {
+		return false
+	}
+	return network.IsAllowed(allowlist, "", addr)
+}
+
+// ClearDeadlines removes the deadlines the server applies to requests that have
+// not authenticated, so that an authenticated request is able to send and
+// receive large bodies, such as file uploads, downloads and server transfers.
+func ClearDeadlines(c *gin.Context) {
+	rc := http.NewResponseController(c.Writer)
+	_ = rc.SetReadDeadline(time.Time{})
+	_ = rc.SetWriteDeadline(time.Time{})
 }
 
 // RemoteDownloadEnabled checks if remote downloads are enabled for this instance

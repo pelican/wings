@@ -90,6 +90,7 @@ func postTransfers(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Forbidden."})
 		return
 	}
+	middleware.ClearDeadlines(c)
 
 	manager := middleware.ExtractManager(c)
 	u, err := uuid.Parse(token.Subject)
