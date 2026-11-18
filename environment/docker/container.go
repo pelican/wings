@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -32,6 +33,15 @@ var ErrNotAttached = errors.Sentinel("not attached to instance")
 // ErrCommandControlCharacters is returned when a command sent to a server
 // contains control characters.
 var ErrCommandControlCharacters = errors.Sentinel("environment/docker: command contains control characters")
+
+// ErrCommandWriteTimeout is returned when a command cannot be sent to a server
+// process in time, either because another command held the send lock for the
+// whole window or the write itself blocked on a process that never reads its
+// input. It wraps context.DeadlineExceeded so that a stop command that times
+// out here is still recognised by WaitForStop, which only runs its forced
+// SIGKILL fallback for a deadline-exceeded error; otherwise a stuck stop would
+// leave the container running in the stopping state and crash detection off.
+var ErrCommandWriteTimeout = fmt.Errorf("environment/docker: timed out waiting to send command to container: %w", context.DeadlineExceeded)
 
 // commandWriteTimeout is the amount of time allowed for a command to be written
 // to the input of a server process.
@@ -461,7 +471,7 @@ func (e *Environment) SendCommand(c string) error {
 	deadline := time.Now().Add(commandWriteTimeout)
 	for !e.sendMu.TryLock() {
 		if time.Now().After(deadline) {
-			return errors.New("environment/docker: timed out waiting to send command to container")
+			return ErrCommandWriteTimeout
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -485,9 +495,17 @@ func (e *Environment) SendCommand(c string) error {
 	// The process may never read its input, so don't wait forever for there to be
 	// room for the command.
 	_ = stream.Conn.SetWriteDeadline(time.Now().Add(commandWriteTimeout))
-	_, err := stream.Conn.Write([]byte(c + "\n"))
+	if _, err := stream.Conn.Write([]byte(c + "\n")); err != nil {
+		// A write that hit the deadline must carry the same timeout identity as
+		// the admission wait above, so that a stuck stop command still trips
+		// WaitForStop's forced-termination fallback.
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return ErrCommandWriteTimeout
+		}
+		return errors.Wrap(err, "environment/docker: could not write to container stream")
+	}
 
-	return errors.Wrap(err, "environment/docker: could not write to container stream")
+	return nil
 }
 
 // Readlog reads the log file for the server. This does not care if the server

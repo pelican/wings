@@ -1,10 +1,12 @@
 package docker
 
 import (
+	"context"
 	"net"
 	"testing"
 	"time"
 
+	"emperror.dev/errors"
 	"github.com/moby/moby/client"
 
 	"github.com/pelican/wings/environment"
@@ -70,4 +72,36 @@ func TestSendCommandDoesNotBlockForever(t *testing.T) {
 	case <-time.After(time.Second * 3):
 		t.Fatal("expected sending the command to time out")
 	}
+}
+
+// A command that times out, whether waiting for the send lock or on the write
+// itself, must report context.DeadlineExceeded. WaitForStop runs its forced
+// SIGKILL fallback only for that error, so without this identity a stuck stop
+// command would leave the container running in the stopping state.
+func TestSendCommandTimeoutIsDeadlineExceeded(t *testing.T) {
+	previous := commandWriteTimeout
+	commandWriteTimeout = time.Millisecond * 100
+	t.Cleanup(func() { commandWriteTimeout = previous })
+
+	t.Run("blocked write", func(t *testing.T) {
+		// Nothing reads the pipe, so the write blocks until its deadline.
+		e, _ := attachedEnvironment(t)
+		err := e.SendCommand("stop")
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected a deadline-exceeded error, got %v", err)
+		}
+	})
+
+	t.Run("contended send lock", func(t *testing.T) {
+		// Hold the send lock for longer than the timeout so the command cannot
+		// acquire it and times out while waiting to send.
+		e, _ := attachedEnvironment(t)
+		e.sendMu.Lock()
+		defer e.sendMu.Unlock()
+
+		err := e.SendCommand("stop")
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("expected a deadline-exceeded error, got %v", err)
+		}
+	})
 }

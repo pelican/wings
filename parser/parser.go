@@ -81,6 +81,66 @@ func xmlDepth(root *etree.Element) int {
 	return depth
 }
 
+// xmlIndentationExceeds reports whether indenting the tree rooted at root with
+// the given number of spaces per level would add more than max bytes of
+// whitespace. etree's Indent inserts, before every child element and before
+// each parent's closing tag, a newline followed by depth*spaces spaces. On a
+// crafted document (very many elements nested deeply) that indentation alone
+// can be orders of magnitude larger than the input, exhausting memory inside
+// Indent before the serialized output is ever size-checked. It walks the tree
+// iteratively, like xmlDepth, and stops as soon as the budget is exceeded, so
+// it never allocates the indentation it is estimating.
+func xmlIndentationExceeds(root *etree.Element, spaces int, max int64) bool {
+	if root == nil {
+		return false
+	}
+	type frame struct {
+		e *etree.Element
+		d int
+	}
+	stack := []frame{{root, 0}}
+	var total int64
+	for len(stack) > 0 {
+		f := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		children := f.e.ChildElements()
+		if len(children) > 0 {
+			// One indent token before each child, plus one before the closing
+			// tag; each is a newline and (d+1)*spaces spaces.
+			token := int64(1 + (f.d+1)*spaces)
+			total += token * int64(len(children)+1)
+			if total > max {
+				return true
+			}
+		}
+		for _, c := range children {
+			stack = append(stack, frame{c, f.d + 1})
+		}
+	}
+	return total > max
+}
+
+// limitedWriter writes through to w until more than max bytes have been
+// written, then fails with errConfigTooLarge rather than buffering an unbounded
+// amount. It lets a document be serialized without first materializing a copy
+// that could exhaust memory.
+type limitedWriter struct {
+	w   io.Writer
+	n   int64
+	max int64
+}
+
+var errConfigTooLarge = errors.Sentinel("parser: serialized configuration exceeds size limit")
+
+func (lw *limitedWriter) Write(p []byte) (int, error) {
+	if lw.n+int64(len(p)) > lw.max {
+		return 0, errConfigTooLarge
+	}
+	n, err := lw.w.Write(p)
+	lw.n += int64(n)
+	return n, err
+}
+
 // ValueType is the JSON type of a replacement value as written in the egg.
 type ValueType int
 
@@ -572,11 +632,25 @@ func (f *ConfigurationFile) parseXmlFile(file ConfigFile) error {
 		}
 	}
 
+	// Indenting the document inserts whitespace text nodes into the tree. On a
+	// crafted file with very many deeply nested elements that whitespace alone
+	// can be orders of magnitude larger than the input and exhaust memory, so
+	// refuse the rewrite before Indent allocates it. The server still boots with
+	// the file as it is, the same as for files over the size limit.
+	if xmlIndentationExceeds(doc.Root(), 2, maxConfigFileSize) {
+		return errors.Errorf("parser: refusing to write configuration file %q: indented result exceeds limit of %d bytes", file.Name(), maxConfigFileSize)
+	}
+
 	// Ensure the XML is indented properly.
 	doc.Indent(2)
 
+	// Serialize through a writer bounded to the size limit so a document that
+	// still expands past it cannot buffer an unbounded copy in memory.
 	var buf bytes.Buffer
-	if _, err := doc.WriteTo(&buf); err != nil {
+	if _, err := doc.WriteTo(&limitedWriter{w: &buf, max: maxConfigFileSize}); err != nil {
+		if errors.Is(err, errConfigTooLarge) {
+			return errors.Errorf("parser: refusing to write configuration file %q: result exceeds limit of %d bytes", file.Name(), maxConfigFileSize)
+		}
 		return err
 	}
 	return rewrite(file, buf.Bytes())
