@@ -83,13 +83,15 @@ func xmlDepth(root *etree.Element) int {
 
 // xmlIndentationExceeds reports whether indenting the tree rooted at root with
 // the given number of spaces per level would add more than max bytes of
-// whitespace. etree's Indent inserts, before every child element and before
-// each parent's closing tag, a newline followed by depth*spaces spaces. On a
-// crafted document (very many elements nested deeply) that indentation alone
-// can be orders of magnitude larger than the input, exhausting memory inside
-// Indent before the serialized output is ever size-checked. It walks the tree
-// iteratively, like xmlDepth, and stops as soon as the budget is exceeded, so
-// it never allocates the indentation it is estimating.
+// whitespace. etree's Indent inserts, before every non-character-data child
+// (elements, comments, directives and processing instructions) and before each
+// element's closing tag, a newline followed by depth*spaces spaces. On a
+// crafted document — very many such tokens nested deeply, for example a million
+// comments inside a deep element chain — that indentation alone can be orders
+// of magnitude larger than the input, exhausting memory inside Indent before
+// the serialized output is ever size-checked. It walks the tree iteratively,
+// like xmlDepth, and stops as soon as the budget is exceeded, so it never
+// allocates the indentation it is estimating.
 func xmlIndentationExceeds(root *etree.Element, spaces int, max int64) bool {
 	if root == nil {
 		return false
@@ -103,18 +105,28 @@ func xmlIndentationExceeds(root *etree.Element, spaces int, max int64) bool {
 	for len(stack) > 0 {
 		f := stack[len(stack)-1]
 		stack = stack[:len(stack)-1]
-		children := f.e.ChildElements()
-		if len(children) > 0 {
-			// One indent token before each child, plus one before the closing
-			// tag; each is a newline and (d+1)*spaces spaces.
+		// Count every child token Indent would indent, not just elements, so a
+		// document padded with another indented token (comments, directives or
+		// processing instructions) cannot slip past the estimate. Only elements
+		// have children of their own to recurse into.
+		var indentable int64
+		for _, c := range f.e.Child {
+			if _, isCharData := c.(*etree.CharData); isCharData {
+				continue
+			}
+			indentable++
+			if ce, ok := c.(*etree.Element); ok {
+				stack = append(stack, frame{ce, f.d + 1})
+			}
+		}
+		if indentable > 0 {
+			// One indent token before each counted child, plus one before the
+			// closing tag; each is a newline and (d+1)*spaces spaces.
 			token := int64(1 + (f.d+1)*spaces)
-			total += token * int64(len(children)+1)
+			total += token * (indentable + 1)
 			if total > max {
 				return true
 			}
-		}
-		for _, c := range children {
-			stack = append(stack, frame{c, f.d + 1})
 		}
 	}
 	return total > max
@@ -568,6 +580,15 @@ func (f *ConfigurationFile) parseXmlFile(file ConfigFile) error {
 	doc := etree.NewDocument()
 	if _, err := doc.ReadFrom(io.LimitReader(file, maxConfigFileSize)); err != nil {
 		return err
+	}
+	// A configuration file has a single root element. etree is lenient and will
+	// parse several top-level elements, but the depth and indentation guards
+	// below, like doc.Root(), only inspect the first one, while doc.Indent would
+	// still indent them all. Refuse a multi-root document so a second, oversized
+	// tree cannot be indented past those checks. The server still boots with the
+	// file as it is, the same as for files over the size or depth limits.
+	if roots := doc.ChildElements(); len(roots) > 1 {
+		return errors.Errorf("parser: refusing to parse configuration file %q: document has %d root elements, expected one", file.Name(), len(roots))
 	}
 	// The file is controlled by the server, and a deeply nested document could
 	// exhaust the stack while it is rewritten. The server still boots with the

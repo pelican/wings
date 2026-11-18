@@ -94,6 +94,85 @@ func TestXMLIndentationEstimate(t *testing.T) {
 		parent.CreateElement("x")
 	}
 	require.True(t, xmlIndentationExceeds(big.Root(), 2, maxConfigFileSize))
+
+	// Comments are indented too, so a deep chain full of them must also be over
+	// budget even though it contains no deep child elements.
+	comments := etree.NewDocument()
+	cparent := comments.CreateElement("root")
+	for i := 0; i < 300; i++ {
+		cparent = cparent.CreateElement("a")
+	}
+	for i := 0; i < 200000; i++ {
+		cparent.CreateComment("x")
+	}
+	require.True(t, xmlIndentationExceeds(comments.Root(), 2, maxConfigFileSize))
+}
+
+// Indentation whitespace from non-element tokens counts too: a small file whose
+// deep element chain holds a huge number of comments is refused before Indent
+// allocates that whitespace, and left unchanged.
+func TestXMLWithManyCommentsIsNotRewritten(t *testing.T) {
+	const (
+		depth    = 300
+		comments = 200000
+	)
+	content := strings.Repeat("<a>", depth) + strings.Repeat("<!--x-->", comments) + strings.Repeat("</a>", depth)
+	require.Less(t, len(content), maxConfigFileSize, "the crafted input must itself be under the size limit")
+
+	path := filepath.Join(t.TempDir(), "config.xml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	var cf ConfigurationFile
+	require.NoError(t, json.Unmarshal([]byte(`{"file":"config.xml","parser":"xml","replace":[{"match":"a","replace_with":"value"}]}`), &cf))
+	cf.configuration = []byte(`{}`)
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer f.Close()
+
+	start := time.Now()
+	err = cf.parseXmlFile(f)
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "indented result exceeds limit")
+	require.Less(t, time.Since(start), 5*time.Second)
+
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, content, string(b))
+}
+
+// A document with more than one root element is refused before the depth and
+// indentation guards (which only see the first root) and before Indent runs, so
+// a second oversized tree cannot be indented past them. The file is unchanged.
+func TestMultiRootXMLIsNotRewritten(t *testing.T) {
+	const (
+		depth    = 300
+		children = 200000
+	)
+	bigTree := strings.Repeat("<a>", depth) + strings.Repeat("<x/>", children) + strings.Repeat("</a>", depth)
+	content := "<safe/>" + bigTree
+
+	path := filepath.Join(t.TempDir(), "config.xml")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o644))
+
+	var cf ConfigurationFile
+	require.NoError(t, json.Unmarshal([]byte(`{"file":"config.xml","parser":"xml","replace":[{"match":"safe","replace_with":"value"}]}`), &cf))
+	cf.configuration = []byte(`{}`)
+
+	f, err := os.OpenFile(path, os.O_RDWR, 0)
+	require.NoError(t, err)
+	defer f.Close()
+
+	start := time.Now()
+	err = cf.parseXmlFile(f)
+	require.Error(t, err)
+	// Rejected by the multi-root guard, before any indentation work.
+	require.Contains(t, err.Error(), "root elements")
+	require.Less(t, time.Since(start), 5*time.Second)
+
+	b, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, content, string(b))
 }
 
 // quotaRejectingFile is a configuration file whose Write is refused before any
