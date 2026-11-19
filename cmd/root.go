@@ -19,9 +19,10 @@ import (
 	"github.com/NYTimes/logrotate"
 	"github.com/apex/log"
 	"github.com/apex/log/handlers/multi"
-	"github.com/docker/docker/client"
+	cerrdefs "github.com/containerd/errdefs"
 	"github.com/gammazero/workerpool"
 	"github.com/mitchellh/colorstring"
+	"github.com/moby/moby/client"
 	"github.com/pelican/wings/server/filesystem/quotas"
 	"github.com/spf13/cobra"
 	"golang.org/x/crypto/acme"
@@ -95,20 +96,20 @@ func init() {
 }
 
 func isDockerSnap() bool {
-	cli, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	cli, err := client.New(client.FromEnv)
 	if err != nil {
 		log.Fatalf("Unable to initialize Docker client: %s", err)
 	}
 
 	defer cli.Close() // Close the client when the function returns (should not be needed, but just to be safe)
 
-	info, err := cli.Info(context.Background())
+	info, err := cli.Info(context.Background(), client.InfoOptions{})
 	if err != nil {
 		log.Fatalf("Unable to get Docker info: %s", err)
 	}
 
 	// Check if Docker root directory contains '/var/snap/docker'
-	return strings.Contains(info.DockerRootDir, "/var/snap/docker")
+	return strings.Contains(info.Info.DockerRootDir, "/var/snap/docker")
 }
 
 func rootCmdRun(cmd *cobra.Command, _ []string) {
@@ -265,7 +266,7 @@ func rootCmdRun(cmd *cobra.Command, _ []string) {
 			// point. If we didn't do this, and you pruned all the images and then started wings you could
 			// end up waiting a long period of time for all the images to be re-pulled on Wings boot rather
 			// than when the server itself is started.
-			if err != nil && !client.IsErrNotFound(err) {
+			if err != nil && !cerrdefs.IsNotFound(err) {
 				s.Log().WithField("error", err).Error("error checking server environment status")
 			}
 

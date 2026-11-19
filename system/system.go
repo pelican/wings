@@ -10,15 +10,12 @@ import (
 	
 	"golang.org/x/sys/unix"
 
-	"github.com/docker/docker/api/types/filters"
-	"github.com/docker/docker/api/types/image"
+	"github.com/moby/moby/api/types/image"
 
 	"github.com/acobaugh/osrelease"
 
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/api/types/system"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/parsers/kernel"
+	"github.com/moby/moby/api/types/system"
+	"github.com/moby/moby/client"
 	"github.com/shirou/gopsutil/v3/cpu"
 	"github.com/shirou/gopsutil/v3/disk"
 	"github.com/shirou/gopsutil/v3/load"
@@ -104,7 +101,7 @@ type DockerDiskUsage struct {
 }
 
 func GetSystemInformation() (*Information, error) {
-	k, err := kernel.GetKernelVersion()
+	k, err := KernelVersion()
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +163,7 @@ func GetSystemInformation() (*Information, error) {
 			Architecture:  runtime.GOARCH,
 			CPUThreads:    runtime.NumCPU(),
 			MemoryBytes:   info.MemTotal,
-			KernelVersion: k.String(),
+			KernelVersion: k,
 			OS:            os,
 			OSType:        runtime.GOOS,
 		},
@@ -334,77 +331,62 @@ func GetSystemUtilization(root, logs, data, archive, backup, temp string) (*Util
 
 func GetDockerDiskUsage(ctx context.Context) (*DockerDiskUsage, error) {
 	// TODO: find a way to re-use the client from the docker environment.
-	c, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	c, err := client.New(client.FromEnv)
 	if err != nil {
 		return &DockerDiskUsage{}, err
 	}
 	defer c.Close()
 
-	d, err := c.DiskUsage(ctx, types.DiskUsageOptions{})
+	d, err := c.DiskUsage(ctx, client.DiskUsageOptions{
+		Containers: true,
+		Images:     true,
+		BuildCache: true,
+	})
 	if err != nil {
 		return &DockerDiskUsage{}, err
 	}
 
-	var bcs int64
-	for _, bc := range d.BuildCache {
-		if !bc.Shared {
-			bcs += bc.Size
-		}
-	}
-
-	var a int64
-	for _, i := range d.Images {
-		if i.Containers > 0 {
-			a++
-		}
-	}
-
-	var cs int64
-	for _, b := range d.Containers {
-		cs += b.SizeRootFs
-	}
-
 	return &DockerDiskUsage{
-		ImagesTotal:    len(d.Images),
-		ImagesActive:   a,
-		ImagesSize:     int64(d.LayersSize),
-		ContainersSize: int64(cs),
-		BuildCacheSize: bcs,
+		ImagesTotal:    int(d.Images.TotalCount),
+		ImagesActive:   d.Images.ActiveCount,
+		ImagesSize:     d.Images.TotalSize,
+		ContainersSize: d.Containers.TotalSize,
+		BuildCacheSize: d.BuildCache.TotalSize,
 	}, nil
 }
 
 func PruneDockerImages(ctx context.Context) (image.PruneReport, error) {
 	// TODO: find a way to re-use the client from the docker environment.
-	c, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	c, err := client.New(client.FromEnv)
 	if err != nil {
 		return image.PruneReport{}, err
 	}
 	defer c.Close()
 
-	prune, err := c.ImagesPrune(ctx, filters.Args{})
+	prune, err := c.ImagePrune(ctx, client.ImagePruneOptions{})
 	if err != nil {
 		return image.PruneReport{}, err
 	}
-	return prune, nil
+	return prune.Report, nil
 }
 
-func GetDockerInfo(ctx context.Context) (types.Version, system.Info, error) {
+func GetDockerInfo(ctx context.Context) (client.ServerVersionResult, system.Info, error) {
 	// TODO: find a way to re-use the client from the docker environment.
-	c, err := client.NewClientWithOpts(client.FromEnv, client.WithAPIVersionNegotiation())
+	c, err := client.New(client.FromEnv)
 	if err != nil {
-		return types.Version{}, system.Info{}, err
+		return client.ServerVersionResult{}, system.Info{}, err
 	}
 	defer c.Close()
 
-	dockerVersion, err := c.ServerVersion(ctx)
+	dockerVersion, err := c.ServerVersion(ctx, client.ServerVersionOptions{})
 	if err != nil {
-		return types.Version{}, system.Info{}, err
+		return client.ServerVersionResult{}, system.Info{}, err
 	}
 
-	dockerInfo, err := c.Info(ctx)
+	dockerInfo, err := c.Info(ctx, client.InfoOptions{})
 	if err != nil {
-		return types.Version{}, system.Info{}, err
+		return client.ServerVersionResult{}, system.Info{}, err
 	}
 
-	return dockerVersion, dockerInfo, nil
+	return dockerVersion, dockerInfo.Info, nil
 }

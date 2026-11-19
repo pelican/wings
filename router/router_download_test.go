@@ -109,7 +109,7 @@ func TestGetDownloadBackup_RepeatedRequests(t *testing.T) {
 		if got := w.Header().Get("Content-Disposition"); got != `attachment; filename="`+downloadTestBackup+`.tar.gz"` {
 			t.Errorf("unexpected Content-Disposition %q", got)
 		}
-		if got := w.Header().Get("Content-Type"); got != "application/octet-stream" {
+		if got := w.Header().Get("Content-Type"); got != "application/gzip" {
 			t.Errorf("unexpected Content-Type %q", got)
 		}
 	}

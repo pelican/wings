@@ -119,3 +119,12 @@ func TestDockerRegistryPathCredentialsDoNotMatchSiblingPath(t *testing.T) {
 		t.Fatalf("expected no registry credentials, got username %q", registry.Username)
 	}
 }
+func TestDnsAddrsSkipsInvalidEntries(t *testing.T) {
+	c := DockerNetworkConfiguration{Dns: []string{"1.1.1.1", " 2606:4700::1111 ", "dns.example.com", ""}}
+	for range 2 { // second call exercises the already-warned path
+		got := c.DnsAddrs()
+		if len(got) != 2 || got[0].String() != "1.1.1.1" || got[1].String() != "2606:4700::1111" {
+			t.Fatalf("unexpected DNS addresses: %v", got)
+		}
+	}
+}
