@@ -14,6 +14,7 @@ import (
 	"github.com/pelican/wings/system"
 
 	"github.com/pelican/wings/environment"
+	"github.com/pelican/wings/plugin"
 	"github.com/pelican/wings/remote"
 )
 
@@ -123,6 +124,21 @@ func (s *Server) StartEventListeners() {
 								limit.Trigger()
 							}
 							s.Events().Publish(StatsEvent, s.Proc())
+							// Mirror the sample onto the plugin event bus for any
+							// subscribed event-listener plugins (streaming).
+							u := s.Proc()
+							plugin.Emit(plugin.Event{
+								Type:   "server.stats",
+								Server: s.ID(),
+								Data: map[string]any{
+									"state":              u.State.Load(),
+									"memory_bytes":       u.Memory,
+									"memory_limit_bytes": u.MemoryLimit,
+									"cpu_absolute":       u.CpuAbsolute,
+									"disk_bytes":         u.Disk,
+									"uptime":             u.Uptime,
+								},
+							})
 						}
 					case environment.StateChangeEvent:
 						{
@@ -132,6 +148,14 @@ func (s *Server) StartEventListeners() {
 								s.Throttler().Reset()
 							}
 							s.OnStateChange()
+							// Fan the state change out to any subscribed event-listener
+							// plugins. Delivery is asynchronous and best-effort so a
+							// plugin cannot stall this listener.
+							plugin.Emit(plugin.Event{
+								Type:   "server.state",
+								Server: s.ID(),
+								Data:   map[string]any{"state": e.Data},
+							})
 						}
 					case environment.DockerImagePullStatus:
 						s.Events().Publish(InstallOutputEvent, e.Data)

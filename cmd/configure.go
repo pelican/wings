@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"github.com/charmbracelet/huh"
+	"github.com/creasty/defaults"
 	"github.com/goccy/go-json"
-	"github.com/pelican/wings/config"
 	"github.com/spf13/cobra"
+
+	"github.com/pelican/wings/config"
 )
 
 var configureArgs struct {
@@ -148,7 +150,14 @@ func configureCmdRun(cmd *cobra.Command, args []string) {
 	// Manually specify the Panel URL as it won't be decoded from JSON.
 	cfg.PanelLocation = configureArgs.PanelURL
 
-	if err = config.WriteToDisk(cfg); err != nil {
+	// Plugin policy is the node operator's, not the Panel's: ignore any
+	// plugins block in the answer, and keep the one already in the file.
+	var plugins config.PluginConfiguration
+	if err := defaults.Set(&plugins); err != nil {
+		panic(err)
+	}
+	cfg.Plugins = plugins
+	if err = config.WriteToDiskKeepingPlugins(cfg); err != nil {
 		panic(err)
 	}
 

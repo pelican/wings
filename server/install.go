@@ -24,6 +24,7 @@ import (
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
 	"github.com/pelican/wings/environment/docker"
+	"github.com/pelican/wings/plugin"
 	"github.com/pelican/wings/remote"
 	"github.com/pelican/wings/system"
 )
@@ -46,6 +47,7 @@ func (s *Server) install(reinstall bool) error {
 		// sorts of weird rapid UI behavior happens since there isn't an actual
 		// install process being executed.
 		s.Events().Publish(InstallStartedEvent, "")
+		plugin.Emit(plugin.Event{Type: "server.install", Server: s.ID(), Data: map[string]any{"status": "started"}})
 
 		err = s.internalInstall()
 	} else {
@@ -74,6 +76,7 @@ func (s *Server) install(reinstall bool) error {
 	// Push an event to the websocket, so we can auto-refresh the information in
 	// the panel once the installation is completed.
 	s.Events().Publish(InstallCompletedEvent, "")
+	plugin.Emit(plugin.Event{Type: "server.install", Server: s.ID(), Data: map[string]any{"status": "completed"}})
 
 	return errors.WithStackIf(err)
 }
