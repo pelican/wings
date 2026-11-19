@@ -15,16 +15,16 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
-	"github.com/docker/docker/api/types/container"
-	dockerImage "github.com/docker/docker/api/types/image"
-
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/parsers/kernel"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
+	"github.com/pelican/wings/environment/docker"
 	"github.com/pelican/wings/remote"
 	"github.com/pelican/wings/system"
 )
@@ -183,11 +183,11 @@ func (s *Server) IsInProtectedState() bool {
 
 // RemoveContainer removes the installation container for the server.
 func (ip *InstallationProcess) RemoveContainer() error {
-	err := ip.client.ContainerRemove(ip.Server.Context(), ip.Server.ID()+"_installer", container.RemoveOptions{
+	_, err := ip.client.ContainerRemove(ip.Server.Context(), ip.Server.ID()+"_installer", client.ContainerRemoveOptions{
 		RemoveVolumes: true,
 		Force:         true,
 	})
-	if err != nil && !client.IsErrNotFound(err) {
+	if err != nil && !cerrdefs.IsNotFound(err) {
 		return err
 	}
 	return nil
@@ -263,7 +263,10 @@ func (ip *InstallationProcess) pullInstallationImage() error {
 	}
 
 	// Get the ImagePullOptions.
-	imagePullOptions := dockerImage.PullOptions{All: false, Platform: runtime.GOOS + "/" + runtime.GOARCH}
+	imagePullOptions := client.ImagePullOptions{
+		All:       false,
+		Platforms: []ocispec.Platform{{OS: runtime.GOOS, Architecture: runtime.GOARCH}},
+	}
 	if registryAuth != nil {
 		b64, err := registryAuth.Base64()
 		if err != nil {
@@ -276,14 +279,14 @@ func (ip *InstallationProcess) pullInstallationImage() error {
 
 	r, err := ip.client.ImagePull(ip.Server.Context(), ip.Script.ContainerImage, imagePullOptions)
 	if err != nil {
-		images, ierr := ip.client.ImageList(ip.Server.Context(), dockerImage.ListOptions{})
+		images, ierr := ip.client.ImageList(ip.Server.Context(), client.ImageListOptions{})
 		if ierr != nil {
 			// Well damn, something has gone really wrong here, just go ahead and abort there
 			// isn't much anything we can do to try and self-recover from this.
 			return ierr
 		}
 
-		for _, img := range images {
+		for _, img := range images.Items {
 			for _, t := range img.RepoTags {
 				if t != ip.Script.ContainerImage {
 					continue
@@ -348,18 +351,23 @@ func (ip *InstallationProcess) AfterExecute(containerId string) error {
 	defer ip.RemoveContainer()
 
 	ip.Server.Log().WithField("container_id", containerId).Debug("pulling installation logs for server")
-	reader, err := ip.client.ContainerLogs(ip.Server.Context(), containerId, container.LogsOptions{
+	reader, err := ip.client.ContainerLogs(ip.Server.Context(), containerId, client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Follow:     false,
 	})
-
-	if err != nil && !client.IsErrNotFound(err) {
+	if err != nil {
+		// The container can be removed out from under us (for example by a
+		// "docker container prune"). There are no logs to save in that case.
+		if cerrdefs.IsNotFound(err) {
+			ip.Server.Log().WithField("container_id", containerId).Warn("installation container no longer exists, skipping installation log")
+			return nil
+		}
 		return err
 	}
+	defer reader.Close()
 
-	// Get kernel version using the kernel package
-	v, err := kernel.GetKernelVersion()
+	v, err := system.KernelVersion()
 	if err != nil {
 		return err
 	}
@@ -406,7 +414,7 @@ func (ip *InstallationProcess) AfterExecute(containerId string) error {
 		Environment   []string
 	}{
 		InstallationProcess: ip,
-		KernelVersion:       v.String(),
+		KernelVersion:       v,
 		Environment:         redactEnvironment(ip.Server.GetEnvironmentVariables()),
 	}
 
@@ -467,7 +475,7 @@ func (ip *InstallationProcess) Execute() (string, error) {
 		Tmpfs: map[string]string{
 			"/tmp": "rw,exec,nosuid,size=" + tmpfsSize + "M",
 		},
-		DNS:         cfg.Docker.Network.Dns,
+		DNS:         cfg.Docker.Network.DnsAddrs(),
 		LogConfig:   cfg.Docker.ContainerLogConfig(),
 		NetworkMode: container.NetworkMode(cfg.Docker.Network.Mode),
 		UsernsMode:  container.UsernsMode(cfg.Docker.UsernsMode),
@@ -476,8 +484,10 @@ func (ip *InstallationProcess) Execute() (string, error) {
 	// Ensure the root directory for the server exists properly before attempting
 	// to trigger the reinstall of the server. It is possible the directory would
 	// not exist when this runs if Wings boots with a missing directory and a user
-	// triggers a reinstall before trying to start the server.
-	if err := ip.Server.EnsureDataDirectoryExists(); err != nil {
+	// triggers a reinstall before trying to start the server, or if the folder was
+	// deleted while Wings was running. The server's Filesystem opens the new folder
+	// on its next call (see Filesystem.openRoot).
+	if _, err := ip.Server.EnsureDataDirectoryExists(); err != nil {
 		return "", err
 	}
 
@@ -491,33 +501,33 @@ func (ip *InstallationProcess) Execute() (string, error) {
 		}
 	}()
 
-	var netConf *network.NetworkingConfig = nil //In case when no networking config is needed set nil
-	var serverNetConfig = config.Get().Docker.Network
-	if "macvlan" == serverNetConfig.Driver { //Generate networking config for macvlan driver
-		var defaultMapping = ip.Server.Config().Allocations.DefaultMapping
+	var netConf *network.NetworkingConfig // nil when no networking config is needed
+	if serverNetConfig := config.Get().Docker.Network; serverNetConfig.Driver == "macvlan" {
+		defaultMapping := ip.Server.Config().Allocations.DefaultMapping
 		ip.Server.Log().Debug("Set macvlan " + serverNetConfig.Name + " IP to " + defaultMapping.Ip)
-		netConf = &network.NetworkingConfig{
-			EndpointsConfig: map[string]*network.EndpointSettings{
-				serverNetConfig.Name: { //Get network name from wings config
-					IPAMConfig: &network.EndpointIPAMConfig{
-						IPv4Address: defaultMapping.Ip,
-					},
-					IPAddress: defaultMapping.Ip, //Use default mapping ip address (wings support only one network per server)
-					Gateway:   serverNetConfig.Interfaces.V4.Gateway,
-				},
-			},
+		nc, err := docker.MacvlanNetworkingConfig(serverNetConfig.Name, defaultMapping.Ip, serverNetConfig.Interfaces.V4.Gateway)
+		if err != nil {
+			return "", err
 		}
+		netConf = nc
 	}
 	// Pass the networkings configuration or nil if none required
-	r, err := ip.client.ContainerCreate(ctx, conf, hostConf, netConf, nil, ip.Server.ID()+"_installer")
+	r, err := ip.client.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:           conf,
+		HostConfig:       hostConf,
+		NetworkingConfig: netConf,
+		Name:             ip.Server.ID() + "_installer",
+	})
 	if err != nil {
 		return "", err
 	}
 
 	ip.Server.Log().WithField("container_id", r.ID).Info("running installation script for server in container")
-	if err := ip.client.ContainerStart(ctx, r.ID, container.StartOptions{}); err != nil {
+	if _, err := ip.client.ContainerStart(ctx, r.ID, client.ContainerStartOptions{}); err != nil {
 		return "", err
 	}
+
+	docker.SetCpuBurst(ctx, ip.client, r.ID, hostConf.Resources.CPUQuota)
 
 	// Process the install event in the background by listening to the stream output until the
 	// container has stopped, at which point we'll disconnect from it.
@@ -531,8 +541,8 @@ func (ip *InstallationProcess) Execute() (string, error) {
 		}
 	}(r.ID)
 
-	sChan, eChan := ip.client.ContainerWait(ctx, r.ID, container.WaitConditionNotRunning)
-	if err := ip.waitForInstallationContainer(sChan, eChan); err != nil {
+	wait := ip.client.ContainerWait(ctx, r.ID, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
+	if err := ip.waitForInstallationContainer(wait.Result, wait.Error); err != nil {
 		return r.ID, err
 	}
 
@@ -575,7 +585,7 @@ func installationWaitError(response container.WaitResponse) error {
 // the server configuration directory, as well as to a websocket listener so
 // that the process can be viewed in the panel by administrators.
 func (ip *InstallationProcess) StreamOutput(ctx context.Context, id string) error {
-	opts := container.LogsOptions{ShowStdout: true, ShowStderr: true, Follow: true}
+	opts := client.ContainerLogsOptions{ShowStdout: true, ShowStderr: true, Follow: true}
 	reader, err := ip.client.ContainerLogs(ctx, id, opts)
 	if err != nil {
 		return err
