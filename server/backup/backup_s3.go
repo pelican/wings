@@ -59,7 +59,7 @@ func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ig
 	}
 	defer s.Remove()
 
-	a, err := fsys.NewArchive(".", filesystem.WithIgnored(ignore))
+	a, err := fsys.NewArchive(".", s.archiveOptions(ignore)...)
 	if err != nil {
 		return nil, errors.WrapIf(err, "backup: failed to create archive")
 	}

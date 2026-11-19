@@ -90,7 +90,7 @@ func (b *LocalBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem,
 	if err := b.validateIdentifier(); err != nil {
 		return nil, err
 	}
-	a, err := fsys.NewArchive(".", filesystem.WithIgnored(ignore))
+	a, err := fsys.NewArchive(".", b.archiveOptions(ignore)...)
 	if err != nil {
 		return nil, errors.WrapIf(err, "server/backup: failed to create archive")
 	}

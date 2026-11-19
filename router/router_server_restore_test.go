@@ -57,7 +57,7 @@ func TestRestoreOfMissingBackupKeepsFiles(t *testing.T) {
 
 	postServerRestoreBackup(c)
 
-	require.NotEmpty(t, c.Errors, "expected the restore to fail")
+	require.Equal(t, http.StatusNotFound, c.Writer.Status(), "expected the restore of a missing backup to be refused")
 	_, err = os.Stat(keep)
 	require.NoError(t, err, "the server's files were deleted although the backup could not be found")
 	require.False(t, s.IsRestoring())
