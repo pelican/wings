@@ -657,8 +657,8 @@ const minSearchedSecretLength = 6
 // whole part of it (RCON_PASS, API_KEY, STEAM_ACC for the Steam game server token), so names
 // like BYPASS_CHECK or MONKEY_MODE are kept.
 var (
-	sensitiveKeyWords = []string{"PASSWORD", "PASSWD", "TOKEN", "SECRET", "CREDENTIAL", "LICENSE", "PRIVATE", "APIKEY"}
-	sensitiveKeyParts = []string{"PASS", "PWD", "KEY", "AUTH", "ACC", "GSLT"}
+	sensitiveKeyWords = []string{"PASSWORD", "PASSWD", "TOKEN", "SECRET", "CREDENTIAL", "LICENSE", "PRIVATE", "APIKEY", "WEBHOOK", "RCONPASS"}
+	sensitiveKeyParts = []string{"PASS", "PW", "PWD", "KEY", "AUTH", "ACC", "GSLT"}
 )
 
 // isSensitiveVariable reports whether the value of the environment variable with this

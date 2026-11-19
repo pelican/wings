@@ -4,7 +4,7 @@ import (
 	"errors"
 	"testing"
 
-	"github.com/docker/docker/api/types/container"
+	"github.com/moby/moby/api/types/container"
 
 	"github.com/pelican/wings/events"
 )
@@ -100,14 +100,14 @@ func TestWaitForInstallationContainerPublishesWaitFailure(t *testing.T) {
 }
 
 func TestIsSensitiveVariable(t *testing.T) {
-	sensitive := []string{"RCON_PASSWORD", "SERVER_PASSWORD", "STEAM_PASS", "STEAM_AUTH", "SRCDS_TOKEN", "API_KEY", "FIVEM_LICENSE", "DB_PWD", "client_secret", "SERVERPASSWORD", "STEAM_WEBAPIKEY", "STEAM_ACC", "GSLT"}
+	sensitive := []string{"RCON_PASSWORD", "SERVER_PASSWORD", "STEAM_PASS", "STEAM_AUTH", "SRCDS_TOKEN", "API_KEY", "FIVEM_LICENSE", "DB_PWD", "client_secret", "SERVERPASSWORD", "STEAM_WEBAPIKEY", "STEAM_ACC", "GSLT", "RCONPASS", "DISCORD_WEBHOOK", "ADMIN_PW"}
 	for _, name := range sensitive {
 		if !isSensitiveVariable(name) {
 			t.Errorf("isSensitiveVariable(%q) = false, expected true", name)
 		}
 	}
 
-	kept := []string{"SERVER_MEMORY", "SERVER_PORT", "STARTUP", "BYPASS_CHECK", "MONKEY_MODE", "MAX_PLAYERS", "PASSIVE_MODE", "ACCESS_MODE", "TZ"}
+	kept := []string{"SERVER_MEMORY", "SERVER_PORT", "STARTUP", "BYPASS_CHECK", "MONKEY_MODE", "MAX_PLAYERS", "PASSIVE_MODE", "ACCESS_MODE", "TZ", "POWER_MODE"}
 	for _, name := range kept {
 		if isSensitiveVariable(name) {
 			t.Errorf("isSensitiveVariable(%q) = true, expected false", name)
@@ -125,6 +125,7 @@ func TestRedactEnvironment(t *testing.T) {
 		"SRCDS_TOKEN=ABCD1234TOKEN",
 		"SERVER_PASSWORD=",
 		"MAX_PLAYERS=16",
+		"DISCORD_WEBHOOK=https://discord.com/api/webhooks/1/abc",
 	}
 
 	got := redactEnvironment(env)
@@ -137,6 +138,7 @@ func TestRedactEnvironment(t *testing.T) {
 		"SRCDS_TOKEN=********",
 		"SERVER_PASSWORD=",
 		"MAX_PLAYERS=16",
+		"DISCORD_WEBHOOK=********",
 	}
 
 	if len(got) != len(want) {
