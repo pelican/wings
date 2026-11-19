@@ -15,6 +15,7 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
+	"github.com/asaskevich/govalidator"
 	"github.com/creasty/defaults"
 	"github.com/goccy/go-json"
 	"github.com/pelican/wings/server/filesystem/quotas"
@@ -38,6 +39,12 @@ type Server struct {
 
 	emitterLock sync.Mutex
 	powerLock   *system.Locker
+
+	// lifecycleMu makes the check-and-set for the installing, transferring and
+	// restoring states one atomic step, so that only one of them can start at a
+	// time. Each replaces the server's files, so two starting at once could
+	// corrupt the server (GHSA-6pfj / restore-vs-transfer).
+	lifecycleMu sync.Mutex
 
 	// Maintains the configuration for the server. This is the data that gets returned by the Panel
 	// such as build settings and container images.
@@ -119,6 +126,16 @@ func (s *Server) CleanupForDestroy() {
 	s.DestroyAllSinks()
 	s.Websockets().CancelAll()
 	s.powerLock.Destroy()
+}
+
+// Discard releases the resources held by a server that was initialized but
+// never added to the manager, such as a duplicate. Unlike deleting a server, it
+// leaves the server's files and container in place.
+func (s *Server) Discard() {
+	s.CleanupForDestroy()
+	if s.fs != nil {
+		_ = s.fs.Close()
+	}
 }
 
 // ID returns the UUID for the server instance.
@@ -296,24 +313,29 @@ func (s *Server) Sync() error {
 // can be called from scoped where the server may not be fully initialized,
 // therefore other things like the filesystem and environment may not exist yet.
 func (s *Server) SyncWithConfiguration(cfg remote.ServerConfigurationResponse) error {
-	c := Configuration{
+	c := configurationData{
 		CrashDetectionEnabled: config.Get().System.CrashDetection.CrashDetectionEnabled,
 	}
 	if err := json.Unmarshal(cfg.Settings, &c); err != nil {
 		return errors.WithStackIf(err)
 	}
 
+	// The UUID is used to build paths on the host (data, install, backup and
+	// machine-id directories), so only accept a real UUID from the Panel and
+	// never allow it to change once the server has been created.
+	if !govalidator.IsUUID(c.Uuid) {
+		return errors.New("server: configuration returned by the Panel contains an invalid server uuid")
+	}
+	if id := s.ID(); id != "" && id != c.Uuid {
+		return errors.New("server: configuration returned by the Panel is for a different server")
+	}
+
 	s.cfg.mu.Lock()
 	defer s.cfg.mu.Unlock()
 
-	// Lock the new configuration. Since we have the deferred Unlock above we need
-	// to make sure that the NEW configuration object is already locked since that
-	// defer is running on the memory address for "s.cfg.mu" which we're explicitly
-	// changing on the next line.
-	c.mu.Lock()
-
-	//goland:noinspection GoVetCopyLock
-	s.cfg = c
+	// Only replace the values, never the mutex, since other goroutines may be
+	// waiting to acquire it and would never be woken if it were overwritten.
+	s.cfg.configurationData = c
 
 	s.Lock()
 	s.procConfig = cfg.ProcessConfiguration
@@ -481,7 +503,7 @@ func (s *Server) ToAPIResponse() APIResponse {
 		State:         s.Environment.State(),
 		IsSuspended:   s.IsSuspended(),
 		Utilization:   s.Proc(),
-		Configuration: *s.Config(),
+		Configuration: s.cfg.snapshot(),
 	}
 }
 

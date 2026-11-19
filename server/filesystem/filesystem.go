@@ -3,6 +3,7 @@ package filesystem
 import (
 	"io"
 	fs2 "io/fs"
+	"math/rand/v2"
 	"os"
 	"path"
 	"path/filepath"
@@ -33,6 +34,10 @@ type Filesystem struct {
 	// hasDenylist is false when the egg has no denylist, so that checks against it
 	// can skip resolving symlinks.
 	hasDenylist bool
+
+	// replaceMu is held while replaceFile opens the file it replaces and renames
+	// over it, so that two replacements cannot both credit the same file.
+	replaceMu sync.Mutex
 
 	// quota tracks the disk space used by this Filesystem instance along with
 	// the maximum amount of disk space (in bytes) that it is allowed to use.
@@ -214,27 +219,33 @@ func (fs *Filesystem) File(p string) (*os.File, Stat, error) {
 // Writes made through the returned handle are accounted against the disk quota of
 // the server, and will fail once the server runs out of space.
 func (fs *Filesystem) Touch(p string, flag int, mode os.FileMode) (File, error) {
-	root, err := fs.openRoot()
-	if err != nil {
+	if _, err := fs.openRoot(); err != nil {
 		return nil, err
 	}
 	p = normalize(p)
-	var currentSize int64
-	st, err := root.Stat(p)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		return nil, errors.Wrap(err, "server/filesystem: touch: failed to stat file")
-	} else if err == nil && st.Mode().IsRegular() {
-		currentSize = st.Size()
-	}
 
-	f, err := fs.touch(p, flag, mode)
+	// Open the file without truncating it, so that its size is read from the file
+	// that was actually opened rather than from whatever was at the path before.
+	// A server could otherwise swap the file in between, and Wings would credit
+	// back space that was never freed.
+	f, err := fs.touch(p, flag&^os.O_TRUNC, mode)
 	if err != nil {
 		return nil, err
 	}
+	st, err := f.Stat()
+	if err != nil {
+		_ = f.Close()
+		return nil, errors.Wrap(err, "server/filesystem: touch: failed to stat file handle")
+	}
+	currentSize := st.Size()
 
-	// If the file was truncated when it was opened the space it was using has
-	// been freed already.
 	if flag&os.O_TRUNC != 0 && currentSize > 0 {
+		if err := f.Truncate(0); err != nil {
+			_ = f.Close()
+			return nil, errors.Wrap(err, "server/filesystem: touch: failed to truncate file")
+		}
+		// Truncating changes the file in place, which frees its space even when it
+		// has other hard links.
 		fs.addDisk(-currentSize)
 		currentSize = 0
 	}
@@ -312,17 +323,8 @@ func (fs *Filesystem) touch(p string, flag int, mode os.FileMode) (*os.File, err
 // Deprecated: prefer the use of [Filesystem.Write], which checks that the file
 // fits within the disk limit before writing anything.
 func (fs *Filesystem) Writefile(p string, r io.Reader) error {
-	file, err := fs.Touch(p, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-
-	_, err = io.Copy(file, r)
-	if cerr := file.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		return errors.Wrap(err, "server/filesystem: writefile: failed to write file")
+	if _, err := fs.replaceFile(p, r, -1); err != nil {
+		return errors.WrapIf(err, "server/filesystem: writefile: failed to write file")
 	}
 	return nil
 }
@@ -391,6 +393,9 @@ func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode os.FileMo
 		}
 	}
 
+	// Refuse early, before creating anything, when the file clearly cannot fit.
+	// This is only a quick check; the space is reserved once the file is open.
+	created := err != nil
 	var c int64
 	if err == nil {
 		if st.IsDir() {
@@ -398,22 +403,61 @@ func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode os.FileMo
 		}
 		c = st.Size()
 	}
-
-	// Check that the new size we're writing to the disk can fit. If there is currently
-	// a file we'll subtract that current file size from the size of the buffer to determine
-	// the amount of new data we're writing (or amount we're removing if smaller).
 	if err := fs.HasSpaceFor(newSize - c); err != nil {
 		return err
 	}
 
-	f, err := fs.touch(p, os.O_RDWR|os.O_CREATE|os.O_TRUNC, mode)
+	// Open the file without truncating it, so that the size of the file that is
+	// replaced is read from the file that was actually opened. A server could
+	// otherwise swap the file after the check above, and Wings would credit back
+	// space that was never freed.
+	f, err := fs.touch(p, os.O_RDWR|os.O_CREATE, mode)
 	if err != nil {
 		return errors.Wrap(err, "server/filesystem: write: failed to touch file")
 	}
 	defer f.Close()
 
+	st, err = f.Stat()
+	if err != nil {
+		return errors.Wrap(err, "server/filesystem: write: failed to stat file handle")
+	}
+	// The file is truncated in place, which frees its space even when it has
+	// other hard links.
+	c = st.Size()
+	freed := c
+
+	// Reserve the space before writing, so that concurrent writes cannot all use
+	// the space that is left.
+	growth := newSize - freed
+	if growth > 0 {
+		if err := fs.reserveDisk(growth); err != nil {
+			if created && c == 0 {
+				_ = root.Remove(p)
+			}
+			return err
+		}
+	}
+	// settle replaces the reservation with the change that was actually made.
+	settle := func(written int64) {
+		change := written - freed
+		if growth > 0 {
+			fs.adjustDisk(change - growth)
+		} else {
+			fs.adjustDisk(change)
+		}
+	}
+
+	if c > 0 {
+		if err := f.Truncate(0); err != nil {
+			if growth > 0 {
+				fs.adjustDisk(-growth)
+			}
+			return errors.Wrap(err, "server/filesystem: write: failed to truncate file")
+		}
+	}
+
 	if newSize == 0 {
-		fs.addDisk(-c)
+		settle(0)
 		return nil
 	}
 
@@ -422,11 +466,266 @@ func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode os.FileMo
 	n, err := io.Copy(f, io.LimitReader(r, newSize))
 	// Always adjust the disk to account for cases where a partial copy occurs
 	// and there is some new content on the disk.
-	fs.addDisk(n - c)
+	settle(n)
 	if err != nil {
 		return errors.Wrap(err, "server/filesystem: write: failed to write file")
 	}
 	return nil
+}
+
+// ErrWriteTooLarge is returned by WriteFrom when more than the allowed number of
+// bytes are read.
+var ErrWriteTooLarge = errors.Sentinel("server/filesystem: write is larger than the allowed size")
+
+// WriteFrom writes everything read from r to the file at p, replacing it if it
+// exists, and returns the number of bytes written. Unlike Write the size does not
+// need to be known up front: every write is checked against the disk limit as it
+// is made. If limit is zero or more and r holds more than limit bytes,
+// ErrWriteTooLarge is returned.
+//
+// The data is written to a temporary file that only replaces the file at p once
+// it has been written in full. If writing fails, the existing file is kept.
+func (fs *Filesystem) WriteFrom(p string, r io.Reader, limit int64) (int64, error) {
+	return fs.replaceFile(p, r, limit)
+}
+
+// replaceFile writes r to a temporary file next to p and renames it over p once
+// it has been written in full, so that a failed write never leaves p truncated
+// or removed. If limit is zero or more, more than limit bytes is a failure;
+// a negative limit means there is none.
+//
+// While the new file is written, both it and the file it replaces count against
+// the disk limit, since both are on the disk. The replaced file's space is
+// released once it has been unlinked by the rename.
+func (fs *Filesystem) replaceFile(p string, r io.Reader, limit int64) (int64, error) {
+	root, err := fs.openRoot()
+	if err != nil {
+		return 0, err
+	}
+	p = normalize(p)
+	if p == "." {
+		return 0, &Error{code: ErrCodeIsDirectory, resolved: p}
+	}
+
+	target := p
+	st, err := root.Lstat(p)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		// Create the directories leading up to the file, so the temporary file
+		// can be made beside it.
+		if err := fs.mkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return 0, errors.WrapIf(err, "server/filesystem: write: failed to create directory tree")
+		}
+	case err != nil:
+		return 0, errors.Wrap(err, "server/filesystem: write: failed to stat file")
+	case st.Mode()&os.ModeSymlink != 0:
+		// A symlink is written through, as before, so the file it points to is
+		// replaced rather than the link itself.
+		resolved, ok := fs.resolveLink(p)
+		if !ok {
+			// Leave errors such as a link that leaves the server directory, or one
+			// whose target does not exist, to the in-place write, which reports
+			// them and has no existing file to lose.
+			return fs.writeInPlace(p, r, limit)
+		}
+		target = resolved
+	case st.IsDir():
+		return 0, &Error{code: ErrCodeIsDirectory, resolved: p}
+	case !st.Mode().IsRegular():
+		return 0, &Error{code: ErrCodeNotRegular, resolved: p}
+	}
+
+	// Keep the mode of the file being replaced.
+	mode := os.FileMode(0o644)
+	if tst, err := root.Stat(target); err == nil && tst.Mode().IsRegular() {
+		mode = tst.Mode().Perm()
+	}
+
+	tmp, f, err := fs.createTemp(filepath.Dir(target), mode)
+	if err != nil {
+		return 0, err
+	}
+	// The mode is applied after creation so the umask does not change it.
+	_ = f.Chmod(mode)
+	ino := fileIno(f)
+	qf := newQuotaFile(fs, f, 0)
+	src := r
+	if limit >= 0 {
+		src = io.LimitReader(r, limit+1)
+	}
+	n, err := io.Copy(qf, src)
+	if cerr := qf.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil && limit >= 0 && n > limit {
+		err = ErrWriteTooLarge
+	}
+	if err == nil {
+		err = fs.renameOver(tmp, target)
+	}
+	if err != nil {
+		fs.removeWritten(tmp, ino, qf.size)
+		return n, err
+	}
+	return n, nil
+}
+
+// renameOver renames tmp over target and releases the space of the file it
+// replaced, if the rename freed it. The replaced file is opened just before the
+// rename, under replaceMu, so the space released is that of the file this rename
+// actually unlinked, and two replacements never both release the same file.
+func (fs *Filesystem) renameOver(tmp, target string) error {
+	root, err := fs.openRoot()
+	if err != nil {
+		return err
+	}
+	fs.replaceMu.Lock()
+	defer fs.replaceMu.Unlock()
+
+	// Anything that cannot be opened as a regular file, including nothing at
+	// all, has no space to release.
+	old, oerr := fs.openRegular(target)
+	if oerr == nil {
+		defer old.Close()
+	}
+	if err := root.Rename(tmp, target); err != nil {
+		return errors.Wrap(err, "server/filesystem: write: failed to replace file")
+	}
+	if oerr == nil {
+		if ost, err := old.Stat(); err == nil {
+			if s, ok := ost.Sys().(*syscall.Stat_t); ok && s.Nlink == 0 {
+				fs.adjustDisk(-ost.Size())
+			}
+		}
+	}
+	return nil
+}
+
+// removeWritten removes a file that Wings wrote, at name, and releases the
+// counted bytes. They are only released if name still refers to that file,
+// identified by its inode, and removing it freed the file. If the server added
+// another link to it, or put something else at name, its space stays counted.
+func (fs *Filesystem) removeWritten(name string, ino uint64, counted int64) {
+	root, err := fs.openRoot()
+	if err != nil {
+		return
+	}
+	f, oerr := fs.openRegular(name)
+	if oerr == nil {
+		defer f.Close()
+	}
+	if err := root.Remove(name); err != nil || oerr != nil {
+		return
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return
+	}
+	if s, ok := st.Sys().(*syscall.Stat_t); ok && s.Ino == ino && s.Nlink == 0 {
+		fs.adjustDisk(-counted)
+	}
+}
+
+// fileIno returns the inode number of an open file, or zero if it is unknown.
+func fileIno(f *os.File) uint64 {
+	st, err := f.Stat()
+	if err != nil {
+		return 0
+	}
+	if s, ok := st.Sys().(*syscall.Stat_t); ok {
+		return s.Ino
+	}
+	return 0
+}
+
+// createTemp exclusively creates a new, uniquely named temporary file in dir.
+func (fs *Filesystem) createTemp(dir string, mode os.FileMode) (string, *os.File, error) {
+	for attempt := 0; ; attempt++ {
+		name := path.Join(dir, ".wings-write-"+strconv.FormatUint(rand.Uint64(), 36)+".tmp")
+		f, err := fs.touch(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, mode)
+		if err == nil {
+			return name, f, nil
+		}
+		if !errors.Is(err, os.ErrExist) || attempt >= 10 {
+			return "", nil, errors.WrapIf(err, "server/filesystem: write: failed to create temporary file")
+		}
+	}
+}
+
+// resolveLink returns the path, relative to the server directory, of the
+// regular file that the symlink at p points to. It returns false if the link
+// cannot be followed, or does not lead to a regular file inside the server
+// directory.
+func (fs *Filesystem) resolveLink(p string) (string, bool) {
+	f, err := fs.openRegular(p)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	root, err := fs.openRoot()
+	if err != nil {
+		return "", false
+	}
+	dir, err := root.Open(".")
+	if err != nil {
+		return "", false
+	}
+	defer dir.Close()
+
+	// Both are read from the open handles, so the result is right even if the
+	// server directory was moved since it was opened.
+	real, err := os.Readlink("/proc/self/fd/" + strconv.FormatUint(uint64(f.Fd()), 10))
+	if err != nil {
+		return "", false
+	}
+	base, err := os.Readlink("/proc/self/fd/" + strconv.FormatUint(uint64(dir.Fd()), 10))
+	if err != nil {
+		return "", false
+	}
+	rel, err := filepath.Rel(base, real)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, "../") || filepath.IsAbs(rel) {
+		return "", false
+	}
+	return rel, true
+}
+
+// writeInPlace truncates and writes the file at p. It is only used when p is a
+// symlink that cannot be resolved, so there is no existing file to lose, and
+// its errors are the ones Touch reports for such links.
+func (fs *Filesystem) writeInPlace(p string, r io.Reader, limit int64) (int64, error) {
+	f, err := fs.Touch(p, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	if err != nil {
+		return 0, err
+	}
+	src := r
+	if limit >= 0 {
+		src = io.LimitReader(r, limit+1)
+	}
+	n, err := io.Copy(f, src)
+	if cerr := f.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil && limit >= 0 && n > limit {
+		err = ErrWriteTooLarge
+	}
+	if err != nil {
+		_ = fs.Delete(p)
+		return n, err
+	}
+	return n, nil
+}
+
+// freedBy returns the space freed by removing the file. A regular file with
+// other hard links keeps using its space, so nothing is freed. Truncating a file
+// is different: it changes the file in place, which frees its space either way.
+func freedBy(st os.FileInfo) int64 {
+	if !st.Mode().IsRegular() {
+		return 0
+	}
+	if s, ok := st.Sys().(*syscall.Stat_t); ok && s.Nlink > 1 {
+		return 0
+	}
+	return st.Size()
 }
 
 // CreateDirectory creates a new directory ("name") at a specified path ("p") for the server.
@@ -553,12 +852,35 @@ func (fs *Filesystem) Copy(p string) error {
 	}
 	defer source.Close()
 
-	n, err := fs.findCopySuffix(dir, name, extension)
-	if err != nil {
-		return err
+	// Create the copy exclusively, so that it can never be written through a
+	// file or symlink the server put at that name after it was chosen.
+	for attempt := 0; ; attempt++ {
+		n, err := fs.findCopySuffix(dir, name, extension)
+		if err != nil {
+			return err
+		}
+		dst := path.Join(dir, n)
+		f, err := fs.touch(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, s.Mode().Perm())
+		if err != nil {
+			if errors.Is(err, os.ErrExist) && attempt < 10 {
+				continue
+			}
+			return err
+		}
+		ino := fileIno(f)
+		qf := newQuotaFile(fs, f, 0)
+		_, err = io.Copy(qf, io.LimitReader(source, s.Size()))
+		if cerr := qf.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			// The partial copy was counted against the quota as it was written, so
+			// release that space once it has been removed.
+			fs.removeWritten(dst, ino, qf.size)
+			return errors.Wrap(err, "server/filesystem: copy: failed to write file")
+		}
+		return nil
 	}
-
-	return fs.Write(path.Join(dir, n), source, s.Size(), s.Mode().Perm())
 }
 
 // Symlink creates a symbolic link at "target" pointing to "source". "target" is
@@ -716,8 +1038,9 @@ func (fs *Filesystem) TruncateRootDirectory() error {
 	if err != nil {
 		go func() {
 			// If there was an error, re-calculate the disk usage right away to account
-			// for any partially removed files.
-			_, _ = fs.updateCachedDiskUsage()
+			// for any partially removed files. The cached value may still look fresh,
+			// so the recount is forced.
+			_, _ = fs.recalculateDiskUsage(true)
 		}()
 
 		return errors.Wrap(err, "server/filesystem: truncate: failed to remove root directory contents")
@@ -751,9 +1074,9 @@ func (fs *Filesystem) Delete(p string) error {
 
 	var size int64
 	if st.IsDir() {
-		size, _ = fs.DirectorySize(p)
-	} else if st.Mode().IsRegular() {
-		size = st.Size()
+		size, _ = fs.freedByDirectory(p)
+	} else {
+		size = freedBy(st)
 	}
 
 	if err := root.RemoveAll(p); err != nil {
@@ -762,9 +1085,9 @@ func (fs *Filesystem) Delete(p string) error {
 		var remaining int64
 		if st, serr := root.Lstat(p); serr == nil {
 			if st.IsDir() {
-				remaining, _ = fs.DirectorySize(p)
-			} else if st.Mode().IsRegular() {
-				remaining = st.Size()
+				remaining, _ = fs.freedByDirectory(p)
+			} else {
+				remaining = freedBy(st)
 			}
 		}
 		if remaining < size {

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/netip"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -28,6 +29,23 @@ import (
 )
 
 var ErrNotAttached = errors.Sentinel("not attached to instance")
+
+// ErrCommandControlCharacters is returned when a command sent to a server
+// contains control characters.
+var ErrCommandControlCharacters = errors.Sentinel("environment/docker: command contains control characters")
+
+// ErrCommandWriteTimeout is returned when a command cannot be sent to a server
+// process in time, either because another command held the send lock for the
+// whole window or the write itself blocked on a process that never reads its
+// input. It wraps context.DeadlineExceeded so that a stop command that times
+// out here is still recognised by WaitForStop, which only runs its forced
+// SIGKILL fallback for a deadline-exceeded error; otherwise a stuck stop would
+// leave the container running in the stopping state and crash detection off.
+var ErrCommandWriteTimeout = fmt.Errorf("environment/docker: timed out waiting to send command to container: %w", context.DeadlineExceeded)
+
+// commandWriteTimeout is the amount of time allowed for a command to be written
+// to the input of a server process.
+var commandWriteTimeout = time.Second * 10
 
 // A custom console writer that allows us to keep a function blocked until the
 // given stream is properly closed. This does nothing special, only exists to
@@ -76,8 +94,15 @@ func (e *Environment) Attach(ctx context.Context) error {
 		defer cancel()
 		defer e.stream.Close()
 		defer func() {
-			e.SetState(environment.ProcessOfflineState)
 			e.SetStream(nil)
+			// The stream can end without the container stopping, in which case it is
+			// attached to again rather than treating the server as stopped. A server
+			// marked as stopped while its container keeps running would no longer be
+			// managed, and its disk limit would not be enforced.
+			if e.reattach() {
+				return
+			}
+			e.SetState(environment.ProcessOfflineState)
 		}()
 
 		go func() {
@@ -101,6 +126,109 @@ func (e *Environment) Attach(ctx context.Context) error {
 	}()
 
 	return nil
+}
+
+// reattach is called when the attached stream ends, and attaches to the
+// container again if it is still running, returning true if the container is
+// still running. If that keeps happening, or attaching fails, the container is
+// terminated rather than left running without being managed. Once it is known
+// to have stopped, false is returned so that the server is marked offline. This
+// also covers a container that disappeared, for which Terminate leaves the state
+// unchanged.
+func (e *Environment) reattach() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancel()
+
+	c, err := e.inspectForReattach(ctx)
+	if err != nil {
+		// The container is gone, so the server really did stop.
+		if errdefs.IsNotFound(err) {
+			return false
+		}
+		// The inspect kept failing, so whether the container is running is unknown.
+		// Terminating it is safer than marking a possibly-running container offline,
+		// which would stop its disk limit from being enforced.
+		e.log().WithField("error", err).Error("could not inspect container after losing its stream, terminating it")
+		e.terminateUnmanaged()
+		return false
+	}
+	if c.State == nil || !c.State.Running {
+		return false
+	}
+
+	e.mu.Lock()
+	if time.Since(e.reattachedAt) > time.Minute*5 {
+		e.reattachedAt = time.Now()
+		e.reattachedCount = 0
+	}
+	e.reattachedCount++
+	count := e.reattachedCount
+	e.mu.Unlock()
+
+	if count <= 3 {
+		e.log().Warn("lost the attached stream for a running container, attaching again")
+		err := e.Attach(ctx)
+		if err == nil {
+			return true
+		}
+		// The container may have only just stopped, or been removed, in which case
+		// it is handled like any other stop so that crash detection still applies.
+		if c, ierr := e.ContainerInspect(ctx); errdefs.IsNotFound(ierr) || (ierr == nil && c.State != nil && !c.State.Running) {
+			return false
+		}
+		e.log().WithField("error", err).Error("failed to attach to running container")
+	}
+
+	e.log().Error("unable to stay attached to running container, terminating it")
+	e.terminateUnmanaged()
+	return false
+}
+
+// inspectForReattach inspects the container, retrying a transient error a few
+// times so that a single failed inspect does not decide the container stopped.
+func (e *Environment) inspectForReattach(ctx context.Context) (container.InspectResponse, error) {
+	var c container.InspectResponse
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if c, err = e.ContainerInspect(ctx); err == nil || errdefs.IsNotFound(err) {
+			return c, err
+		}
+		select {
+		case <-ctx.Done():
+			return c, err
+		case <-time.After(time.Second):
+		}
+	}
+	return c, err
+}
+
+// terminateUnmanagedMaxBackoff is the longest terminateUnmanaged waits between
+// attempts to kill the container.
+const terminateUnmanagedMaxBackoff = 30 * time.Second
+
+// terminateUnmanaged SIGKILLs a container that can no longer be managed, and
+// only returns once the container is known to have stopped or to no longer
+// exist. Docker may be unresponsive for a while, so the kill is retried with a
+// backoff, each attempt with a fresh timeout since attaching may have used up
+// the time allowed by the caller's context.
+//
+// It never gives up: marking the server offline while its container may still
+// be running would leave it without a console, stats or disk limit, and treating
+// it as running would do the same. Until the kill succeeds, the server stays in
+// the stopping state that Terminate sets before it sends the signal.
+func (e *Environment) terminateUnmanaged() {
+	backoff := time.Second
+	for attempt := 1; ; attempt++ {
+		tctx, tcancel := context.WithTimeout(context.Background(), time.Second*30)
+		err := e.Terminate(tctx, "SIGKILL")
+		tcancel()
+		if err == nil {
+			return
+		}
+		e.log().WithField("error", err).WithField("attempt", attempt).Error("failed to terminate container that could not be managed, retrying")
+		time.Sleep(backoff)
+		backoff = min(backoff*2, terminateUnmanagedMaxBackoff)
+	}
 }
 
 // InSituUpdate performs an in-place update of the Docker container's resource
@@ -343,23 +471,80 @@ func (e *Environment) Destroy() error {
 // instance. There is no confirmation that this data is sent successfully, only
 // that it gets pushed into the stdin.
 func (e *Environment) SendCommand(c string) error {
-	if !e.IsAttached() {
-		return errors.Wrap(ErrNotAttached, "environment/docker: cannot send command to container")
+	// The container has a TTY, so control characters are interpreted rather than
+	// passed to the process: ^C, ^\ and ^Z would signal the process directly.
+	// Commands may not contain them, other than tabs and line endings.
+	if strings.ContainsFunc(c, func(r rune) bool {
+		return (r < 0x20 && r != '\t' && r != '\n' && r != '\r') || r == 0x7f
+	}) {
+		return ErrCommandControlCharacters
 	}
 
+	// Only one command may set the deadline and write at a time; otherwise a
+	// second command could push the deadline forward for a write that is already
+	// blocked, keeping it alive indefinitely. Bound how long a command waits for
+	// its turn, so that commands do not queue without limit behind a write that is
+	// stuck because the process never reads its input (the HTTP command and stop
+	// paths are not rate limited like the websocket). Taking the lock before
+	// reading the stream also means a command that waited here, for example while
+	// the stream was being replaced during console recovery, writes to the current
+	// stream rather than one that has since been closed.
+	deadline := time.Now().Add(commandWriteTimeout)
+	for !e.sendMu.TryLock() {
+		if time.Now().After(deadline) {
+			return ErrCommandWriteTimeout
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	defer e.sendMu.Unlock()
+
 	e.mu.RLock()
-	defer e.mu.RUnlock()
+	stream := e.stream
+	stop := e.meta.Stop
+	e.mu.RUnlock()
+	if stream == nil {
+		return errors.Wrap(ErrNotAttached, "environment/docker: cannot send command to container")
+	}
 
 	// If the command being processed is the same as the process stop command then we
 	// want to mark the server as entering the stopping state otherwise the process will
 	// stop and Wings will think it has crashed and attempt to restart it.
-	if e.meta.Stop.Type == "command" && c == e.meta.Stop.Value {
+	if stop.Type == "command" && containsStopCommand(c, stop.Value) {
 		e.SetState(environment.ProcessStoppingState)
 	}
 
-	_, err := e.stream.Conn.Write([]byte(c + "\n"))
+	// The process may never read its input, so don't wait forever for there to be
+	// room for the command.
+	_ = stream.Conn.SetWriteDeadline(time.Now().Add(commandWriteTimeout))
+	if _, err := stream.Conn.Write([]byte(c + "\n")); err != nil {
+		// A write that hit the deadline must carry the same timeout identity as
+		// the admission wait above, so that a stuck stop command still trips
+		// WaitForStop's forced-termination fallback.
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return ErrCommandWriteTimeout
+		}
+		return errors.Wrap(err, "environment/docker: could not write to container stream")
+	}
 
-	return errors.Wrap(err, "environment/docker: could not write to container stream")
+	return nil
+}
+
+// containsStopCommand reports whether any line of the command is the stop
+// command. A command can hold several lines, each of which the process reads as
+// its own command, so "x\nstop" stops the server just as "stop" does.
+func containsStopCommand(c, stop string) bool {
+	if stop == "" {
+		return false
+	}
+	if c == stop {
+		return true
+	}
+	for _, line := range strings.FieldsFunc(c, func(r rune) bool { return r == '\n' || r == '\r' }) {
+		if line == stop {
+			return true
+		}
+	}
+	return false
 }
 
 // Readlog reads the log file for the server. This does not care if the server

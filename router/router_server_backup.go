@@ -22,6 +22,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/pelican/wings/config"
+	wnet "github.com/pelican/wings/internal/network"
 	"github.com/pelican/wings/router/middleware"
 	"github.com/pelican/wings/server"
 	"github.com/pelican/wings/server/backup"
@@ -29,13 +30,9 @@ import (
 )
 
 // sharedAddressSpace is the carrier-grade NAT range, which nodes on some private
-// networks (such as Tailscale) are reached over.
+// networks (such as Tailscale) are reached over. Like every other internal
+// range it is blocked by wnet.IsInternal, unless private addresses are allowed.
 var sharedAddressSpace = netip.MustParsePrefix("100.64.0.0/10")
-
-var blockedBackupRestorePrefixes = []netip.Prefix{
-	sharedAddressSpace,
-	netip.MustParsePrefix("198.18.0.0/15"),
-}
 
 type backupDownloadError string
 
@@ -183,8 +180,13 @@ func postServerRestoreBackup(c *gin.Context) {
 		}
 	}
 
+	// Mark the server as restoring. This fails if a restore is already in
+	// progress, or if the server is being installed or transferred, which must
+	// never have their files replaced from under them. RestoreBackup clears it.
 	if !s.StartRestoring() {
-		c.AbortWithStatusJSON(http.StatusConflict, gin.H{"error": "A backup is already being restored to this server."})
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "This server is already restoring a backup, or is being installed or transferred.",
+		})
 		return
 	}
 	hasError := true
@@ -197,14 +199,17 @@ func postServerRestoreBackup(c *gin.Context) {
 	}()
 
 	logger.Info("processing server backup restore request")
+	if data.TruncateDirectory {
+		// The files are only deleted by RestoreBackup, once the server has stopped
+		// and the whole backup was read without error, so that a restore that
+		// cannot happen, or a corrupt backup, leaves them alone.
+		logger.Info("received \"truncate_directory\" flag in request: server files will be deleted before restoring")
+	}
 
 	if local != nil {
-		if !truncateForRestore(c, s, data.TruncateDirectory, logger) {
-			return
-		}
 		go func(s *server.Server, b backup.BackupInterface, logger *log.Entry) {
 			logger.Info("starting restoration process for server backup using local driver")
-			if err := s.RestoreBackup(b, nil); err != nil {
+			if err := s.RestoreBackup(b, nil, data.TruncateDirectory); err != nil {
 				logger.WithField("error", err).Error("failed to restore local backup to server")
 			}
 			s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from local backup.")
@@ -254,18 +259,11 @@ func postServerRestoreBackup(c *gin.Context) {
 		return
 	}
 
-	// The server's files are only removed once the backup could be downloaded, so a
-	// broken link does not leave the server empty.
-	if !truncateForRestore(c, s, data.TruncateDirectory, logger) {
-		_ = archive.Close()
-		return
-	}
-
 	go func(s *server.Server, uuid string, logger *log.Entry) {
 		logger.Info("starting restoration process for server backup from remote location")
 		// Any link is streamed the same way, the S3 adapter only reads the archive.
 		// The Panel is notified with the identifier it gave.
-		if err := s.RestoreBackup(backup.NewS3(client, uuid, s.ID(), ""), archive); err != nil {
+		if err := s.RestoreBackup(backup.NewS3(client, uuid, s.ID(), ""), archive, data.TruncateDirectory); err != nil {
 			logger.WithField("error", errors.WithStack(err)).Error("failed to restore remote backup to server")
 		}
 		s.Events().Publish(server.DaemonMessageEvent, "Completed server restoration from remote backup.")
@@ -275,20 +273,6 @@ func postServerRestoreBackup(c *gin.Context) {
 
 	hasError = false
 	c.Status(http.StatusAccepted)
-}
-
-// truncateForRestore deletes the server's files when the restore request asks
-// for it. It aborts the request and returns false if that fails.
-func truncateForRestore(c *gin.Context, s *server.Server, truncate bool, logger *log.Entry) bool {
-	if !truncate {
-		return true
-	}
-	logger.Info("received \"truncate_directory\" flag in request: deleting server files")
-	if err := s.Filesystem().TruncateRootDirectory(); err != nil {
-		middleware.CaptureAndAbort(c, err)
-		return false
-	}
-	return true
 }
 
 // deleteKeptBackup deletes a local backup of a server that no longer exists on
@@ -466,40 +450,10 @@ func isBlockedBackupRestoreIP(host string, ip net.IP) bool {
 	if !ok {
 		return true
 	}
-	addr = addr.Unmap()
-	if !addr.IsGlobalUnicast() || addr.IsPrivate() || addr.IsLoopback() || addr.IsLinkLocalUnicast() || isExplicitlyBlockedBackupRestoreIP(addr) {
-		return !isAllowedBackupRestoreDestination(host, addr)
-	}
-	return false
-}
-
-func isExplicitlyBlockedBackupRestoreIP(addr netip.Addr) bool {
-	for _, prefix := range blockedBackupRestorePrefixes {
-		if prefix.Contains(addr) {
-			return true
-		}
-	}
-	return false
-}
-
-func isAllowedBackupRestoreDestination(host string, addr netip.Addr) bool {
-	host = strings.TrimSuffix(strings.ToLower(host), ".")
-	for _, entry := range config.Get().System.Backups.RestoreHostAllowlist {
-		entry = strings.TrimSuffix(strings.ToLower(strings.TrimSpace(entry)), ".")
-		if entry == "" {
-			continue
-		}
-		if entry == host {
-			return true
-		}
-		if allowedAddr, err := netip.ParseAddr(entry); err == nil && allowedAddr.Unmap() == addr {
-			return true
-		}
-		if prefix, err := netip.ParsePrefix(entry); err == nil && prefix.Contains(addr) {
-			return true
-		}
-	}
-	return false
+	// Anything other than a globally reachable unicast address is blocked, unless
+	// the operator allowed it. This includes 0.0.0.0/8, which reaches the node
+	// itself on Linux, and NAT64 addresses embedding an internal IPv4 address.
+	return wnet.IsInternal(addr) && !wnet.IsAllowed(config.Get().System.Backups.RestoreHostAllowlist, host, addr)
 }
 
 // openRestoreArchive returns the body of a backup download, if it is a gzip

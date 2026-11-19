@@ -77,7 +77,7 @@ func TestRestoreBackupUnsuspendsBeforeNotifyingPanel(t *testing.T) {
 
 	// The restore request marks the server as restoring before it restores.
 	s.SetRestoring(true)
-	if err := s.RestoreBackup(b, nil); err != nil {
+	if err := s.RestoreBackup(b, nil, false); err != nil {
 		t.Fatal(err)
 	}
 

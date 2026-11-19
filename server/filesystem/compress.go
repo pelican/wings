@@ -317,6 +317,9 @@ func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir st
 
 	var total int64
 	err = ex.Extract(ctx, input, func(_ context.Context, fi archives.FileInfo) error {
+		if err := checkArchiveEntryName(fi.NameInArchive); err != nil {
+			return err
+		}
 		size := fi.Size()
 		if size <= 0 || !fi.Mode().IsRegular() {
 			return nil
@@ -335,6 +338,21 @@ func (fs *Filesystem) SpaceAvailableForDecompression(ctx context.Context, dir st
 			return err
 		}
 		return errors.Wrap(err, "server/filesystem: decompress: failed to read archive")
+	}
+	return nil
+}
+
+// maxArchiveEntryNameLength is the longest name an entry in an archive can have,
+// the same as the longest path Linux accepts. Very long, deeply nested names
+// make indexing an archive expensive (GHSA-wpxm-mwmr-j622), and could never be
+// extracted anyway.
+const maxArchiveEntryNameLength = 4096
+
+// checkArchiveEntryName returns an error if the name of an entry in an archive
+// is too long to be extracted.
+func checkArchiveEntryName(name string) error {
+	if len(name) > maxArchiveEntryNameLength {
+		return errors.New("server/filesystem: archive contains an entry with a name that is too long")
 	}
 	return nil
 }
@@ -419,6 +437,9 @@ func (fs *Filesystem) extractStream(ctx context.Context, opts extractOptions) er
 
 	// Decompress and extract archive
 	return ex.Extract(ctx, opts.r, func(ctx context.Context, f archives.FileInfo) error {
+		if err := checkArchiveEntryName(f.NameInArchive); err != nil {
+			return err
+		}
 		p := filepath.Join(opts.dir, f.NameInArchive)
 		if err := fs.IsIgnored(p); err != nil {
 			return nil

@@ -123,7 +123,7 @@ func TestBackupStoresPelicanConfigAsFirstEntry(t *testing.T) {
 	if err := s.Filesystem().TruncateRootDirectory(); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RestoreBackup(b, nil); err != nil {
+	if err := s.RestoreBackup(b, nil, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -170,7 +170,7 @@ func TestBackupWithoutPelicanConfig(t *testing.T) {
 	if err := s.Filesystem().TruncateRootDirectory(); err != nil {
 		t.Fatal(err)
 	}
-	if err := s.RestoreBackup(b, nil); err != nil {
+	if err := s.RestoreBackup(b, nil, false); err != nil {
 		t.Fatal(err)
 	}
 

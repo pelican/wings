@@ -43,6 +43,7 @@ func getDownloadBackup(c *gin.Context) {
 		})
 		return
 	}
+	middleware.ClearDeadlines(c)
 
 	// Validate that the BackupUuid and ServerUuid fields are actually UUIDs and not some
 	// random characters or a file path, the server UUID is part of the backup's path.
@@ -101,6 +102,7 @@ func getDownloadFile(c *gin.Context) {
 		})
 		return
 	}
+	middleware.ClearDeadlines(c)
 
 	if err := s.Filesystem().IsIgnored(token.FilePath); err != nil {
 		middleware.CaptureAndAbort(c, err)

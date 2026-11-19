@@ -8,6 +8,7 @@ import (
 	"mime/multipart"
 	"net/http"
 	"net/url"
+	"time"
 
 	"github.com/apex/log"
 	"github.com/charmbracelet/huh"
@@ -99,19 +100,24 @@ func diagnosticsCmdRun(*cobra.Command, []string) {
 	fmt.Println(report)
 	fmt.Print("---------------   end of report    ---------------\n\n")
 
-	if diagnosticsArgs.ReviewBeforeUpload {
-		upload := false
-		huh.NewConfirm().Title("Upload to " + diagnosticsArgs.HastebinURL + "?").Value(&upload).Run()
-		if !upload {
-			return
-		}
+	// Always ask before uploading, defaulting to no. Answering no to reviewing the
+	// report must not upload it without asking.
+	upload := false
+	if err := huh.NewConfirm().Title("Upload to " + diagnosticsArgs.HastebinURL + "?").Value(&upload).Run(); err != nil || !upload {
+		return
 	}
 
 	u, err := uploadToHastebin(diagnosticsArgs.HastebinURL, report)
-	if err == nil {
-		fmt.Println("Your report is available here: ", u)
+	if err != nil {
+		fmt.Println("Failed to upload report:", err)
+		return
 	}
+	fmt.Println("Your report is available here: ", u)
 }
+
+// maxHastebinResponseSize is the most that is read of the response from the
+// hastebin instance.
+const maxHastebinResponseSize = 1 << 20
 
 func uploadToHastebin(hbUrl, content string) (string, error) {
 	u, err := url.Parse(hbUrl)
@@ -125,15 +131,18 @@ func uploadToHastebin(hbUrl, content string) (string, error) {
 	formWriter.WriteField("e", "14d")
 	formWriter.Close()
 
-	res, err := http.Post(u.String(), formWriter.FormDataContentType(), formData)
-	if err != nil || res.StatusCode != 200 {
-		fmt.Println("Failed to upload report to ", u.String(), err, res.StatusCode)
-		myb, _ := io.ReadAll(res.Body)
-		fmt.Println(string(myb))
+	c := &http.Client{Timeout: 30 * time.Second}
+	res, err := c.Post(u.String(), formWriter.FormDataContentType(), formData)
+	if err != nil {
 		return "", err
 	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		myb, _ := io.ReadAll(io.LimitReader(res.Body, maxHastebinResponseSize))
+		return "", fmt.Errorf("unexpected response status %s from %s: %s", res.Status, u.String(), string(myb))
+	}
 	pres := make(map[string]interface{})
-	body, err := io.ReadAll(res.Body)
+	body, err := io.ReadAll(io.LimitReader(res.Body, maxHastebinResponseSize))
 	if err != nil {
 		fmt.Println("Failed to parse response.", err)
 		return "", err
