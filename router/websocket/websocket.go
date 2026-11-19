@@ -20,7 +20,6 @@ import (
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
-	"github.com/pelican/wings/environment/docker"
 	"github.com/pelican/wings/internal/models"
 	"github.com/pelican/wings/router/tokens"
 	"github.com/pelican/wings/server"
@@ -442,7 +441,7 @@ func (h *Handler) HandleInbound(ctx context.Context, m Message) error {
 			//
 			//  Or maybe just an IsBooted function?
 			if h.server.Environment.State() == environment.ProcessStartingState {
-				if e, ok := h.server.Environment.(*docker.Environment); ok {
+				if e, ok := h.server.Environment.(server.Attachable); ok {
 					if !e.IsAttached() {
 						return nil
 					}
