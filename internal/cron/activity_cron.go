@@ -16,6 +16,11 @@ type activityCron struct {
 	mu      *system.AtomicBool
 	manager *server.Manager
 	max     int
+	// after is the ID of the last row read. Rows the Panel refuses stay stored,
+	// so reading carries on from here, across runs, rather than from the oldest
+	// row. It goes back to zero once the end is reached, so refused rows are
+	// still retried.
+	after int
 }
 
 // Run executes the cronjob and ensures we fetch and send all the stored activity to the
@@ -37,16 +42,21 @@ func (ac *activityCron) Run(ctx context.Context) error {
 	// Keep sending batches until the stored activity has been sent, so that it is
 	// sent as quickly as it is created.
 	// Activity the Panel refuses stays stored, so each batch starts after the
-	// last row read rather than at the oldest row. Otherwise a batch full of
-	// refused activity would be read again and again, and newer activity never
-	// sent. The next run starts from the beginning to retry what was refused.
-	var after int
+	// last row read rather than at the oldest row. Otherwise refused activity
+	// would be read again and again, and newer activity never sent, even across
+	// runs once there is more refused activity than one run sends.
 	for i := 0; i < maxBatchesPerRun; i++ {
-		n, last, err := ac.sendBatch(ctx, after)
-		if err != nil || n < ac.batchSize() {
+		n, last, err := ac.sendBatch(ctx, ac.after)
+		if err != nil {
 			return err
 		}
-		after = last
+		if n < ac.batchSize() {
+			// Everything has been read, so start from the oldest row next time to
+			// retry what was refused.
+			ac.after = 0
+			return nil
+		}
+		ac.after = last
 	}
 	return nil
 }

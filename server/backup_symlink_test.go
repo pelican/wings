@@ -7,8 +7,10 @@ import (
 	"context"
 	"crypto/rand"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"slices"
 	"testing"
 
 	"github.com/pelican/wings/config"
@@ -239,5 +241,64 @@ func TestRestoreBackupRemoteVerifiesThenRestores(t *testing.T) {
 	}
 	if left, _ := filepath.Glob(filepath.Join(backupDir, ".restore-*")); len(left) != 0 {
 		t.Errorf("expected the temporary download to be removed, found %v", left)
+	}
+}
+
+// A local backup checked before deleting the server's files is restored from
+// the same open file, so deleting the backup in between cannot take it away.
+func TestRestoreBackupLocalSurvivesDeletionAfterVerify(t *testing.T) {
+	serverDir := t.TempDir()
+	cfg := &config.Configuration{
+		AuthenticationToken: "abc",
+		System: config.SystemConfiguration{
+			RootDirectory:     filepath.Dir(serverDir),
+			BackupDirectory:   t.TempDir(),
+			DiskCheckInterval: 150,
+		},
+	}
+	cfg.System.User.Uid = os.Getuid()
+	cfg.System.User.Gid = os.Getgid()
+	config.Set(cfg)
+
+	if err := os.WriteFile(filepath.Join(serverDir, "world.dat"), []byte("world"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(restoreTestClient{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(s.CtxCancel)
+	s.cfg.Uuid = "ce6ee345-6729-4aed-8fed-c866c535a69d"
+	s.fs, err = filesystem.New(serverDir, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = s.fs.Close() })
+
+	b := backup.NewLocal(restoreTestClient{}, "44444444-4444-4444-8444-444444444444", s.ID(), "")
+	if _, err := b.Generate(context.Background(), s.Filesystem(), ""); err != nil {
+		t.Fatal(err)
+	}
+
+	source, cleanup, err := s.verifyRestoreArchive(b, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cleanup()
+	if err := os.Remove(b.Path()); err != nil {
+		t.Fatal(err)
+	}
+
+	var names []string
+	err = b.Restore(context.Background(), source, func(file string, _ fs.FileInfo, r io.ReadCloser) error {
+		defer r.Close()
+		names = append(names, file)
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("expected the restore to read the open backup after it was deleted: %v", err)
+	}
+	if !slices.Contains(names, "world.dat") {
+		t.Errorf("expected world.dat in the backup, got %v", names)
 	}
 }

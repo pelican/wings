@@ -268,17 +268,26 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser, t
 // verifyRestoreArchive reads every entry in the backup to check that it can be
 // restored in full, and returns the reader to restore it from.
 //
-// A local backup is read from its file each time it is restored, so reader is
-// nil and is returned as it is. A remote backup arrives as a download that can
-// only be read once, so it is saved to a temporary file in the backup directory
+// A local backup is opened once and held open for both passes, so that deleting
+// the backup after it was checked cannot leave the server's files deleted and
+// nothing to restore from. A remote backup arrives as a download that can only
+// be read once, so it is saved to a temporary file in the backup directory
 // first, and that file is returned to restore from. The returned function
-// removes the file and must always be called.
+// closes the file, removing it if it is temporary, and must always be called.
 func (s *Server) verifyRestoreArchive(b backup.BackupInterface, reader io.Reader) (io.Reader, func(), error) {
 	noop := func() {}
 	var source io.Reader = reader
 	var spool *os.File
 	cleanup := noop
-	if reader != nil {
+	if local, ok := b.(*backup.LocalBackup); ok && reader == nil {
+		f, err := local.Open()
+		if err != nil {
+			return nil, noop, errors.Wrap(err, "server/backup: restore: failed to open backup")
+		}
+		cleanup = func() { _ = f.Close() }
+		spool = f
+		source = f
+	} else if reader != nil {
 		f, err := os.CreateTemp(config.Get().System.BackupDirectory, ".restore-*.tmp")
 		if err != nil {
 			return nil, noop, errors.Wrap(err, "server/backup: restore: failed to create temporary file for backup")

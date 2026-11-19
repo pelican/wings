@@ -35,6 +35,10 @@ type Filesystem struct {
 	// can skip resolving symlinks.
 	hasDenylist bool
 
+	// replaceMu is held while replaceFile opens the file it replaces and renames
+	// over it, so that two replacements cannot both credit the same file.
+	replaceMu sync.Mutex
+
 	// quota tracks the disk space used by this Filesystem instance along with
 	// the maximum amount of disk space (in bytes) that it is allowed to use.
 	quota diskQuota
@@ -531,18 +535,10 @@ func (fs *Filesystem) replaceFile(p string, r io.Reader, limit int64) (int64, er
 		return 0, &Error{code: ErrCodeNotRegular, resolved: p}
 	}
 
-	// Hold the file that is being replaced open, so the space it frees can be
-	// read from the file the rename actually unlinked.
-	var old *os.File
+	// Keep the mode of the file being replaced.
 	mode := os.FileMode(0o644)
-	if f, err := fs.openRegular(target); err == nil {
-		old = f
-		defer old.Close()
-		if ost, err := old.Stat(); err == nil {
-			mode = ost.Mode().Perm()
-		}
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return 0, errors.WithStackIf(err)
+	if tst, err := root.Stat(target); err == nil && tst.Mode().IsRegular() {
+		mode = tst.Mode().Perm()
 	}
 
 	tmp, f, err := fs.createTemp(filepath.Dir(target), mode)
@@ -551,6 +547,7 @@ func (fs *Filesystem) replaceFile(p string, r io.Reader, limit int64) (int64, er
 	}
 	// The mode is applied after creation so the umask does not change it.
 	_ = f.Chmod(mode)
+	ino := fileIno(f)
 	qf := newQuotaFile(fs, f, 0)
 	src := r
 	if limit >= 0 {
@@ -564,23 +561,81 @@ func (fs *Filesystem) replaceFile(p string, r io.Reader, limit int64) (int64, er
 		err = ErrWriteTooLarge
 	}
 	if err == nil {
-		err = root.Rename(tmp, target)
+		err = fs.renameOver(tmp, target)
 	}
 	if err != nil {
-		if rerr := root.Remove(tmp); rerr == nil {
-			fs.adjustDisk(-qf.size)
-		}
+		fs.removeWritten(tmp, ino, qf.size)
 		return n, err
 	}
+	return n, nil
+}
 
-	if old != nil {
+// renameOver renames tmp over target and releases the space of the file it
+// replaced, if the rename freed it. The replaced file is opened just before the
+// rename, under replaceMu, so the space released is that of the file this rename
+// actually unlinked, and two replacements never both release the same file.
+func (fs *Filesystem) renameOver(tmp, target string) error {
+	root, err := fs.openRoot()
+	if err != nil {
+		return err
+	}
+	fs.replaceMu.Lock()
+	defer fs.replaceMu.Unlock()
+
+	// Anything that cannot be opened as a regular file, including nothing at
+	// all, has no space to release.
+	old, oerr := fs.openRegular(target)
+	if oerr == nil {
+		defer old.Close()
+	}
+	if err := root.Rename(tmp, target); err != nil {
+		return errors.Wrap(err, "server/filesystem: write: failed to replace file")
+	}
+	if oerr == nil {
 		if ost, err := old.Stat(); err == nil {
 			if s, ok := ost.Sys().(*syscall.Stat_t); ok && s.Nlink == 0 {
 				fs.adjustDisk(-ost.Size())
 			}
 		}
 	}
-	return n, nil
+	return nil
+}
+
+// removeWritten removes a file that Wings wrote, at name, and releases the
+// counted bytes. They are only released if name still refers to that file,
+// identified by its inode, and removing it freed the file. If the server added
+// another link to it, or put something else at name, its space stays counted.
+func (fs *Filesystem) removeWritten(name string, ino uint64, counted int64) {
+	root, err := fs.openRoot()
+	if err != nil {
+		return
+	}
+	f, oerr := fs.openRegular(name)
+	if oerr == nil {
+		defer f.Close()
+	}
+	if err := root.Remove(name); err != nil || oerr != nil {
+		return
+	}
+	st, err := f.Stat()
+	if err != nil {
+		return
+	}
+	if s, ok := st.Sys().(*syscall.Stat_t); ok && s.Ino == ino && s.Nlink == 0 {
+		fs.adjustDisk(-counted)
+	}
+}
+
+// fileIno returns the inode number of an open file, or zero if it is unknown.
+func fileIno(f *os.File) uint64 {
+	st, err := f.Stat()
+	if err != nil {
+		return 0
+	}
+	if s, ok := st.Sys().(*syscall.Stat_t); ok {
+		return s.Ino
+	}
+	return 0
 }
 
 // createTemp exclusively creates a new, uniquely named temporary file in dir.
@@ -812,6 +867,7 @@ func (fs *Filesystem) Copy(p string) error {
 			}
 			return err
 		}
+		ino := fileIno(f)
 		qf := newQuotaFile(fs, f, 0)
 		_, err = io.Copy(qf, io.LimitReader(source, s.Size()))
 		if cerr := qf.Close(); err == nil {
@@ -820,9 +876,7 @@ func (fs *Filesystem) Copy(p string) error {
 		if err != nil {
 			// The partial copy was counted against the quota as it was written, so
 			// release that space once it has been removed.
-			if rerr := root.Remove(dst); rerr == nil {
-				fs.adjustDisk(-qf.size)
-			}
+			fs.removeWritten(dst, ino, qf.size)
 			return errors.Wrap(err, "server/filesystem: copy: failed to write file")
 		}
 		return nil

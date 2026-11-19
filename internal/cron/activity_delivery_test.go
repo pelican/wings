@@ -94,11 +94,6 @@ func (p *fakePanel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = json.Unmarshal(raw, &body)
 
-	if p.status != 0 {
-		w.WriteHeader(p.status)
-		return
-	}
-
 	ips := make([]string, 0, len(body.Data))
 	valid := true
 	for _, row := range body.Data {
@@ -109,6 +104,24 @@ func (p *fakePanel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if row.Metadata["command"] == "refused" {
 			valid = false
 		}
+		if files, ok := row.Metadata["files"].([]any); ok {
+			for _, f := range files {
+				if f == "/refused" {
+					valid = false
+				}
+			}
+		}
+	}
+
+	p.mu.Lock()
+	status := p.status
+	p.mu.Unlock()
+	if status != 0 {
+		p.mu.Lock()
+		p.attempts = append(p.attempts, ips)
+		p.mu.Unlock()
+		w.WriteHeader(status)
+		return
 	}
 
 	p.mu.Lock()
@@ -206,7 +219,8 @@ func TestRefusedBatchDoesNotHoldBackNewerActivity(t *testing.T) {
 	assert.Equal(t, int64(150), storedActivity(t))
 }
 
-// SFTP activity the Panel refuses is kept rather than deleted.
+// SFTP activity the Panel refuses is kept rather than deleted, and is sent once
+// the Panel accepts it.
 func TestRefusedSftpActivityIsKept(t *testing.T) {
 	setupDatabase(t)
 	panel := &fakePanel{status: http.StatusRequestEntityTooLarge}
@@ -215,8 +229,54 @@ func TestRefusedSftpActivityIsKept(t *testing.T) {
 
 	require.NoError(t, sc.Run(context.Background()))
 
+	assert.Contains(t, panel.sentIPs(), validIP, "expected the activity to have been sent and refused")
 	assert.Empty(t, panel.deliveredIPs())
 	assert.Equal(t, int64(1), storedActivity(t))
+
+	panel.mu.Lock()
+	panel.status = 0
+	panel.mu.Unlock()
+	require.NoError(t, sc.Run(context.Background()))
+
+	assert.Equal(t, []string{validIP}, panel.deliveredIPs())
+	assert.Zero(t, storedActivity(t))
+}
+
+// Once more refused activity is stored than one run reads, later runs carry on
+// past it rather than reading the same refused activity again.
+func TestRefusedActivityBeyondOneRunDoesNotHoldBackNewerActivity(t *testing.T) {
+	setupDatabase(t)
+	panel := &fakePanel{}
+	ac, _ := newCrons(t, panel)
+	// Two rows a batch, so one run reads 2 * maxBatchesPerRun rows.
+	ac.max = 2
+	insertMany(t, 2*maxBatchesPerRun+50, "server:console.command", models.ActivityMeta{"command": "refused"})
+	insertMany(t, 5, "server:console.command", models.ActivityMeta{"command": "say hi"})
+
+	require.NoError(t, ac.Run(context.Background()))
+	assert.Empty(t, panel.deliveredIPs())
+	require.NoError(t, ac.Run(context.Background()))
+
+	assert.Len(t, panel.deliveredIPs(), 5)
+	assert.Equal(t, int64(2*maxBatchesPerRun+50), storedActivity(t))
+}
+
+// SFTP groups the Panel refuses do not stop later SFTP activity from being sent.
+func TestRefusedSftpGroupsDoNotHoldBackLaterActivity(t *testing.T) {
+	setupDatabase(t)
+	panel := &fakePanel{}
+	_, sc := newCrons(t, panel)
+	// Two groups a request, so the refused groups fill the first request.
+	sc.max = 2
+	for _, event := range []models.Event{"server:sftp.write", "server:sftp.delete", "server:sftp.rename"} {
+		insertActivity(t, event, validIP, "/refused")
+	}
+	insertActivity(t, "server:sftp.create", validIP, "/ok.txt")
+
+	require.NoError(t, sc.Run(context.Background()))
+
+	assert.Equal(t, []string{validIP}, panel.deliveredIPs())
+	assert.Equal(t, int64(3), storedActivity(t))
 }
 
 // The non-SFTP cron drops activity with an address that does not parse, and

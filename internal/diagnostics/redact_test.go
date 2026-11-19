@@ -1,6 +1,7 @@
 package diagnostics
 
 import (
+	"encoding/base64"
 	"strings"
 	"testing"
 
@@ -45,20 +46,25 @@ func TestRedactReportRemovesEndpointsEverywhere(t *testing.T) {
 
 // Tokens passed in request URLs, and JWTs anywhere else, are never included.
 func TestRedactReportRemovesQueryTokens(t *testing.T) {
-	jwt := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzZXJ2ZXJfdXVpZCI6IngifQ.c2lnbmF0dXJl"
+	// Built from its parts so that it is not mistaken for a leaked credential.
+	enc := base64.RawURLEncoding.EncodeToString
+	jwt := enc([]byte(`{"alg":"HS256","typ":"JWT"}`)) + "." + enc([]byte(`{"server_uuid":"x"}`)) + "." + enc([]byte("signature"))
 	report := strings.Join([]string{
 		`GET /api/servers/x/ws?token=` + jwt + `&foo=1 200`,
 		`GET /download/backup?a=b&token=opaque-value-123 200`,
+		// The key is percent-encoded, which the download handler decodes.
+		`GET /download/file?%74oken=%65yJencoded.value.sig&x=2 200`,
+		`GET /download/file?TOKEN=upper-value 200`,
 		`bearer ` + jwt,
 	}, "\n")
 	for _, include := range []bool{true, false} {
 		got := redactReport(report, redactTestConfig(), include)
-		for _, s := range []string{jwt, "opaque-value-123", "eyJ"} {
+		for _, s := range []string{jwt, "opaque-value-123", "eyJ", "%65yJ", "upper-value"} {
 			if strings.Contains(got, s) {
 				t.Errorf("includeEndpoints=%v: expected %q to be redacted, got:\n%s", include, s, got)
 			}
 		}
-		for _, s := range []string{"&foo=1 200", "?a=b&token={redacted} 200"} {
+		for _, s := range []string{"&foo=1 200", "?a=b&token={redacted} 200", "?%74oken={redacted}&x=2 200"} {
 			if !strings.Contains(got, s) {
 				t.Errorf("includeEndpoints=%v: expected %q to be kept, got:\n%s", include, s, got)
 			}

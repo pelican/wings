@@ -26,6 +26,11 @@ type sftpCron struct {
 	mu      *system.AtomicBool
 	manager *server.Manager
 	max     int
+	// after is the ID before the next row to read. Rows the Panel refuses stay
+	// stored, so reading carries on from here, across runs, rather than from the
+	// first row. It goes back to zero once the end is reached, so refused rows
+	// are still retried.
+	after int
 }
 
 type mapKey struct {
@@ -63,15 +68,22 @@ func (sc *sftpCron) Run(ctx context.Context) error {
 
 	for i := 0; i < maxBatchesPerRun; i++ {
 		more, err := sc.sendBatch(ctx)
-		if err != nil || !more {
+		if err != nil {
 			return err
+		}
+		if !more {
+			// Everything has been read, so start from the first row next time to
+			// retry what was refused.
+			sc.after = 0
+			return nil
 		}
 	}
 	return nil
 }
 
-// sendBatch merges as many stored SFTP events as fit in one request and sends
-// them to the Panel. It reports whether there were more events than fit.
+// sendBatch merges as many stored SFTP events as fit in one request, starting
+// after sc.after, and sends them to the Panel. It reports whether there were
+// more events than fit.
 func (sc *sftpCron) sendBatch(ctx context.Context) (bool, error) {
 	events := &eventMap{m: map[mapKey]*eventGroup{}, max: sc.max}
 	if events.max <= 0 {
@@ -80,16 +92,18 @@ func (sc *sftpCron) sendBatch(ctx context.Context) (bool, error) {
 
 	// ids of activity to delete without sending it.
 	var invalid []int
-	var full bool
-	for o := 0; ; {
-		activity, err := sc.fetchRecords(ctx, o, events.max)
+	// The ID of the first row that did not fit, which the next batch starts at.
+	firstLeft := 0
+	last := sc.after
+	for {
+		activity, err := sc.fetchRecords(ctx, last, events.max)
 		if err != nil {
 			return false, err
 		}
 		if len(activity) == 0 {
 			break
 		}
-		o += len(activity)
+		last = activity[len(activity)-1].ID
 
 		added := false
 		for _, a := range activity {
@@ -100,8 +114,8 @@ func (sc *sftpCron) sendBatch(ctx context.Context) (bool, error) {
 			}
 			if events.Push(a) {
 				added = true
-			} else {
-				full = true
+			} else if firstLeft == 0 {
+				firstLeft = a.ID
 			}
 		}
 		// Stop once a page adds nothing, since every later event belongs in
@@ -118,19 +132,26 @@ func (sc *sftpCron) sendBatch(ctx context.Context) (bool, error) {
 	if err != nil {
 		return false, errors.Wrap(err, "failed to send sftp activity logs to Panel")
 	}
-	return full && len(done) > 0, nil
+	// Carry on after everything that was sent, or refused and kept, so that the
+	// next batch reaches later activity. The first row always fits, so this
+	// always moves forward.
+	if firstLeft == 0 {
+		sc.after = last
+		return false, nil
+	}
+	sc.after = firstLeft - 1
+	return true, nil
 }
 
-// fetchRecords returns a group of activity events starting at the given offset. This is used
-// since we might need to make multiple database queries to select enough events to properly
-// fill up our request to the given maximum. This is due to the fact that this cron merges any
-// activity that line up across user, server, ip, and event into a single activity record when
-// sending the data to the Panel.
-func (sc *sftpCron) fetchRecords(ctx context.Context, offset int, limit int) (activity []models.Activity, err error) {
+// fetchRecords returns up to limit SFTP activity events with an ID greater than
+// after, oldest first. Several queries may be needed to fill a request, since
+// this cron merges any activity that lines up across user, server, ip, and event
+// into a single activity record when sending the data to the Panel.
+func (sc *sftpCron) fetchRecords(ctx context.Context, after int, limit int) (activity []models.Activity, err error) {
 	tx := database.Instance().WithContext(ctx).
 		Where("event LIKE ?", "server:sftp.%").
-		Order("event DESC").
-		Offset(offset).
+		Where("id > ?", after).
+		Order("id ASC").
 		Limit(limit).
 		Find(&activity)
 	if tx.Error != nil {

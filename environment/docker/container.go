@@ -131,8 +131,10 @@ func (e *Environment) Attach(ctx context.Context) error {
 // reattach is called when the attached stream ends, and attaches to the
 // container again if it is still running, returning true if the container is
 // still running. If that keeps happening, or attaching fails, the container is
-// terminated rather than left running without being managed. In that case it
-// returns true only if the container was actually terminated.
+// terminated rather than left running without being managed. Once it is known
+// to have stopped, false is returned so that the server is marked offline. This
+// also covers a container that disappeared, for which Terminate leaves the state
+// unchanged.
 func (e *Environment) reattach() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer cancel()
@@ -147,7 +149,8 @@ func (e *Environment) reattach() bool {
 		// Terminating it is safer than marking a possibly-running container offline,
 		// which would stop its disk limit from being enforced.
 		e.log().WithField("error", err).Error("could not inspect container after losing its stream, terminating it")
-		return e.terminateUnmanaged()
+		e.terminateUnmanaged()
+		return false
 	}
 	if c.State == nil || !c.State.Running {
 		return false
@@ -177,7 +180,8 @@ func (e *Environment) reattach() bool {
 	}
 
 	e.log().Error("unable to stay attached to running container, terminating it")
-	return e.terminateUnmanaged()
+	e.terminateUnmanaged()
+	return false
 }
 
 // inspectForReattach inspects the container, retrying a transient error a few
@@ -198,35 +202,32 @@ func (e *Environment) inspectForReattach(ctx context.Context) (container.Inspect
 	return c, err
 }
 
-// terminateUnmanagedAttempts is how many times terminateUnmanaged tries to kill
-// the container before giving up.
-const terminateUnmanagedAttempts = 5
+// terminateUnmanagedMaxBackoff is the longest terminateUnmanaged waits between
+// attempts to kill the container.
+const terminateUnmanagedMaxBackoff = 30 * time.Second
 
 // terminateUnmanaged SIGKILLs a container that can no longer be managed, and
-// returns true once it is known to have stopped. Docker may be briefly
-// unresponsive, so the kill is retried with a backoff, each attempt with a fresh
-// timeout since attaching may have used up the time allowed by the caller's
-// context.
+// only returns once the container is known to have stopped or to no longer
+// exist. Docker may be unresponsive for a while, so the kill is retried with a
+// backoff, each attempt with a fresh timeout since attaching may have used up
+// the time allowed by the caller's context.
 //
-// When every attempt fails it returns false, so the server is marked offline
-// rather than shown as running with no console, stats or disk limit. The
-// container may still be running at that point, which is logged.
-func (e *Environment) terminateUnmanaged() bool {
+// It never gives up: marking the server offline while its container may still
+// be running would leave it without a console, stats or disk limit, and treating
+// it as running would do the same. Until the kill succeeds, the server stays in
+// the stopping state that Terminate sets before it sends the signal.
+func (e *Environment) terminateUnmanaged() {
 	backoff := time.Second
 	for attempt := 1; ; attempt++ {
 		tctx, tcancel := context.WithTimeout(context.Background(), time.Second*30)
 		err := e.Terminate(tctx, "SIGKILL")
 		tcancel()
 		if err == nil {
-			return true
+			return
 		}
-		if attempt >= terminateUnmanagedAttempts {
-			e.log().WithField("error", err).Error("failed to terminate container that could not be managed, it may still be running")
-			return false
-		}
-		e.log().WithField("error", err).WithField("attempt", attempt).Warn("failed to terminate container, retrying")
+		e.log().WithField("error", err).WithField("attempt", attempt).Error("failed to terminate container that could not be managed, retrying")
 		time.Sleep(backoff)
-		backoff *= 2
+		backoff = min(backoff*2, terminateUnmanagedMaxBackoff)
 	}
 }
 

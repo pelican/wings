@@ -179,3 +179,69 @@ func TestFilesystem_WriteFromThroughSymlink(t *testing.T) {
 	}
 	noTempFiles(t, filepath.Join(fs.rootPath, "config"))
 }
+
+// linkingReader returns some data, then links the temporary file being written
+// to another name, as a process in the server could, and then fails.
+type linkingReader struct {
+	t    *testing.T
+	dir  string
+	sent bool
+}
+
+func (r *linkingReader) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(p, strings.Repeat("x", 4096)), nil
+	}
+	tmp, _ := filepath.Glob(filepath.Join(r.dir, ".wings-write-*"))
+	if len(tmp) != 1 {
+		r.t.Fatalf("expected one temporary file, found %v", tmp)
+	}
+	if err := os.Link(tmp[0], filepath.Join(r.dir, "kept.bin")); err != nil {
+		r.t.Fatal(err)
+	}
+	return 0, errors.New("connection dropped")
+}
+
+// A failed write only releases the space of its temporary file once the file
+// is actually freed. If the server linked it elsewhere, it is still counted.
+func TestFilesystem_WriteFromFailureKeepsLinkedTempCounted(t *testing.T) {
+	fs := NewFs()
+	defer fs.reset()
+
+	before, err := fs.updateCachedDiskUsage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fs.WriteFrom("upload.bin", &linkingReader{t: t, dir: fs.rootPath}, -1); err == nil {
+		t.Fatal("expected the failed upload to be reported")
+	}
+	if _, err := os.Stat(filepath.Join(fs.rootPath, "kept.bin")); err != nil {
+		t.Fatalf("expected the linked copy to remain: %v", err)
+	}
+	if got, want := fs.CachedUsage(), before+4096; got != want {
+		t.Errorf("expected the linked file to stay counted at %d, got %d", want, got)
+	}
+	noTempFiles(t, fs.rootPath)
+}
+
+// Replacing the same file one write after another releases the space of each
+// file replaced exactly once.
+func TestFilesystem_WriteFromRepeatedReplaceAccounting(t *testing.T) {
+	fs := NewFs()
+	defer fs.reset()
+
+	fs.write("other.bin", make([]byte, 1000))
+	fs.write("target.bin", make([]byte, 100))
+	if _, err := fs.updateCachedDiskUsage(); err != nil {
+		t.Fatal(err)
+	}
+	for _, size := range []int{20, 30} {
+		if _, err := fs.WriteFrom("target.bin", strings.NewReader(strings.Repeat("y", size)), -1); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := fs.CachedUsage(); got != 1030 {
+		t.Errorf("expected usage 1030, got %d", got)
+	}
+}
