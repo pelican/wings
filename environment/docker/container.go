@@ -300,7 +300,7 @@ func (e *Environment) Create() error {
 	if err != nil {
 		return errors.WithStackIf(err)
 	}
-	// DockerBindings never drops a port key, so its keys are the exposed ports.
+	// Ports DockerBindings removes (ISPN loopback-only) are not exposed either.
 	exposedPorts := network.PortSet{}
 	for port := range portBindings {
 		exposedPorts[port] = struct{}{}
