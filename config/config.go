@@ -60,6 +60,12 @@ var (
 // in areas that might already be locked, so we don't want to crash the process.
 var _writeLock sync.Mutex
 
+// ErrTokenEnvMismatch is returned by ResolveToken in strict mode when the
+// WINGS_TOKEN / WINGS_TOKEN_ID environment override differs from the token in
+// the configuration. The environment values are still resolved into c.Token,
+// so the override keeps winning at runtime.
+var ErrTokenEnvMismatch = errors.New("config: token does not match environment override")
+
 // SftpConfiguration defines the configuration of the internal SFTP server.
 type SftpConfiguration struct {
 	// The bind address of the SFTP server.
@@ -70,6 +76,15 @@ type SftpConfiguration struct {
 	ReadOnly bool `default:"false" yaml:"read_only"`
 	// If set to true users won't be able to login using their password.
 	KeyOnly bool `default:"false" yaml:"key_only"`
+	// The maximum number of connections a single user may have open to a single
+	// server at once, or zero to use the default of 32. A user with access to
+	// several servers may have this many to each of them.
+	MaxConnectionsPerUser int `json:"-" yaml:"max_connections_per_user"`
+	// The maximum number of connections from a single IP address, or IPv6 /64
+	// network, that may be authenticating at once, or zero to use the default of
+	// 16. Raise this if clients connect through a proxy, since they then all
+	// appear to come from the address of the proxy.
+	MaxAuthenticatingConnectionsPerIP int `json:"-" yaml:"max_authenticating_connections_per_ip"`
 }
 
 // ApiConfiguration defines the configuration for the internal API that is
@@ -97,6 +112,10 @@ type ApiConfiguration struct {
 	RemoteDownload struct {
 		// MaxRedirects controls how many HTTP redirects are followed when performing a remote download.
 		MaxRedirects int `default:"10" json:"max_redirects" yaml:"max_redirects"`
+		// Allowlist allows remote downloads to connect to otherwise blocked private
+		// or internal destinations. Entries may be hostnames, IP addresses or CIDR
+		// ranges. It can only be set in config.yml.
+		Allowlist []string `json:"-" yaml:"allowlist"`
 	} `json:"remote_download" yaml:"remote_download"`
 
 	// The maximum size for files uploaded through the Panel in MiB.
@@ -104,6 +123,13 @@ type ApiConfiguration struct {
 
 	// A list of IP address of proxies that may send a X-Forwarded-For header to set the true clients IP
 	TrustedProxies []string `json:"trusted_proxies" yaml:"trusted_proxies"`
+
+	// PanelAllowlist limits requests made with the node token, which only the Panel
+	// has, to these IP addresses or CIDR ranges. When it is empty, the default, the
+	// token is accepted from any address. When Wings is behind a reverse proxy, the
+	// proxy must be listed in trusted_proxies so that the Panel's own address is
+	// checked. It can only be set in config.yml.
+	PanelAllowlist []string `json:"-" yaml:"panel_allowlist"`
 }
 
 // RemoteQueryConfiguration defines the configuration settings for remote requests
@@ -250,8 +276,6 @@ type SystemConfiguration struct {
 	Backups Backups `yaml:"backups"`
 
 	Transfers Transfers `yaml:"transfers"`
-
-	OpenatMode string `default:"auto" yaml:"openat_mode"`
 }
 
 type CrashDetection struct {
@@ -284,11 +308,10 @@ type Backups struct {
 	//
 	// "none" -> no compression will be applied
 	// "best_speed" -> uses gzip level 1 for fast speed
-	// "best_compression" -> uses gzip level 9 for minimal disk space useage
+	// "best_compression" -> uses gzip level 9 for minimal disk space usage
 	//
 	// Defaults to "best_speed" (level 1)
 	CompressionLevel string `default:"best_speed" yaml:"compression_level"`
-
 
 	// RestoreHostAllowlist allows backup restore downloads to connect to otherwise blocked
 	// private/internal destinations. Entries may be hostnames, IP addresses, or CIDR ranges.
@@ -393,7 +416,7 @@ type Configuration struct {
 	// additional origins.
 	AllowedOrigins []string `json:"allowed_origins" yaml:"allowed_origins"`
 
-	// AllowCORSPrivateNetwork sets the `Access-Control-Request-Private-Network` header which
+	// AllowCORSPrivateNetwork sets the `Access-Control-Allow-Private-Network` header which
 	// allows client browsers to make requests to internal IP addresses over HTTP.  This setting
 	// is only required by users running Wings without SSL certificates and using internal IP
 	// addresses in order to connect. Most users should NOT enable this setting.
@@ -442,6 +465,45 @@ func Set(c *Configuration) {
 		_jwtAlgo = jwt.NewHS256([]byte(token))
 	}
 	_config = c
+}
+
+// ResolveToken populates the derived Token field, preferring values pinned
+// through the environment over those in the configuration itself.
+//
+// Set remote when the values came from the Panel. Local values may use
+// "file://" or "$VAR" indirection; expanding one sent over the network would
+// leak files and environment variables back out through the token we attach to
+// every request. Environment overrides must already match remote values so a
+// configuration update cannot leave Wings and the Panel using different keys.
+func (c *Configuration) ResolveToken(remote bool) error {
+	resolve := func(name, env, local string) (string, error) {
+		if remote && (strings.Contains(local, "$") || strings.HasPrefix(local, "file://")) {
+			return "", fmt.Errorf("config: remote %s cannot use token indirection", name)
+		}
+		if env != "" {
+			value, err := Expand(env)
+			if err != nil {
+				return "", err
+			}
+			if remote && value != local {
+				return "", fmt.Errorf("config: remote %s does not match environment override", name)
+			}
+			return value, nil
+		}
+		if remote {
+			return local, nil
+		}
+		return Expand(local)
+	}
+
+	var err error
+	if c.Token.ID, err = resolve("token ID", os.Getenv("WINGS_TOKEN_ID"), c.AuthenticationTokenId); err != nil {
+		return err
+	}
+	if c.Token.Token, err = resolve("token", os.Getenv("WINGS_TOKEN"), c.AuthenticationToken); err != nil {
+		return err
+	}
+	return nil
 }
 
 // SetDebugViaFlag tracks if the application is running in debug mode because of
@@ -614,23 +676,7 @@ func FromFile(path string) error {
 		return err
 	}
 
-	c.Token = Token{
-		ID:    os.Getenv("WINGS_TOKEN_ID"),
-		Token: os.Getenv("WINGS_TOKEN"),
-	}
-	if c.Token.ID == "" {
-		c.Token.ID = c.AuthenticationTokenId
-	}
-	if c.Token.Token == "" {
-		c.Token.Token = c.AuthenticationToken
-	}
-
-	c.Token.ID, err = Expand(c.Token.ID)
-	if err != nil {
-		return err
-	}
-	c.Token.Token, err = Expand(c.Token.Token)
-	if err != nil {
+	if err := c.ResolveToken(false); err != nil {
 		return err
 	}
 
@@ -863,7 +909,7 @@ func Expand(v string) (string, error) {
 
 		b, err := os.ReadFile(p)
 		if err != nil {
-			return "", nil
+			return "", err
 		}
 		v = string(bytes.TrimRight(bytes.TrimRight(b, "\r"), "\n"))
 	}

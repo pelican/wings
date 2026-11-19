@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"archive/tar"
 	"context"
 	"crypto/sha1"
 	"encoding/hex"
@@ -33,6 +34,26 @@ const (
 	LocalBackupAdapter AdapterType = "wings"
 	S3BackupAdapter    AdapterType = "s3"
 )
+
+const (
+	// PelicanConfigFile is the name of the server configuration stored as the
+	// first entry of a backup archive.
+	PelicanConfigFile = ".pelicanconfig"
+	// MaxPelicanConfigSize is the largest server configuration that is stored, the
+	// Panel does not read a larger one.
+	MaxPelicanConfigSize = 64 * 1024
+)
+
+// IsPelicanConfigEntry reports whether an archive entry is the server
+// configuration written by Wings, rather than a file from the server's directory.
+func IsPelicanConfigEntry(info fs.FileInfo) bool {
+	fi, ok := info.(archives.FileInfo)
+	if !ok {
+		return false
+	}
+	header, ok := fi.Header.(*tar.Header)
+	return ok && filesystem.IsPreludeHeader(header, PelicanConfigFile)
+}
 
 // RestoreCallback is a generic restoration callback that exists for both local
 // and remote backups allowing the files to be restored.
@@ -85,6 +106,10 @@ type Backup struct {
 	// compatible with a standard .gitignore structure.
 	Ignore string `json:"ignore"`
 
+	// The server configuration sent by the Panel, stored as the first entry of
+	// the archive so a new server can be created from the backup.
+	pelicanConfig []byte
+
 	client     remote.Client
 	adapter    AdapterType
 	logContext map[string]interface{}
@@ -92,6 +117,21 @@ type Backup struct {
 
 func (b *Backup) SetClient(c remote.Client) {
 	b.client = c
+}
+
+// SetPelicanConfig sets the server configuration stored as the first entry of the
+// archive. Nothing is stored when it is empty.
+func (b *Backup) SetPelicanConfig(config []byte) {
+	b.pelicanConfig = config
+}
+
+// archiveOptions returns the options used to create this backup's archive.
+func (b *Backup) archiveOptions(ignore string) []filesystem.ArchiveOption {
+	opts := []filesystem.ArchiveOption{filesystem.WithIgnored(ignore)}
+	if len(b.pelicanConfig) > 0 {
+		opts = append(opts, filesystem.WithPrelude(PelicanConfigFile, b.pelicanConfig))
+	}
+	return opts
 }
 
 func (b *Backup) Identifier() string {
@@ -111,7 +151,11 @@ func (b *Backup) validateIdentifier() error {
 	if err != nil {
 		return err
 	}
-	b.Uuid = identifier
+	// Only write when normalizing changes the identifier: Details validates it
+	// from two goroutines at once.
+	if b.Uuid != identifier {
+		b.Uuid = identifier
+	}
 	return nil
 }
 
@@ -163,6 +207,10 @@ func (b *Backup) Checksum() ([]byte, error) {
 // Details returns both the checksum and size of the archive currently stored on
 // the disk to the caller.
 func (b *Backup) Details(ctx context.Context, parts []remote.BackupPart) (*ArchiveDetails, error) {
+	// Normalize the identifier before Checksum and Size read it concurrently.
+	if err := b.validateIdentifier(); err != nil {
+		return nil, err
+	}
 	ad := ArchiveDetails{ChecksumType: "sha1", Parts: parts}
 	g, ctx := errgroup.WithContext(ctx)
 

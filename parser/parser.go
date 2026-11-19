@@ -3,7 +3,10 @@ package parser
 import (
 	"bufio"
 	"bytes"
+	"encoding/json/jsontext"
+	jsonv2 "encoding/json/v2"
 	"io"
+	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -11,18 +14,26 @@ import (
 	"emperror.dev/errors"
 	"github.com/apex/log"
 	"github.com/beevik/etree"
-	"github.com/buger/jsonparser"
 	"github.com/goccy/go-json"
 	"github.com/icza/dyno"
 	"github.com/magiconair/properties"
 	"github.com/pelletier/go-toml/v2"
 	"github.com/tidwall/pretty"
 	"gopkg.in/ini.v1"
-	"gopkg.in/yaml.v3"
 
 	"github.com/pelican/wings/config"
-	"github.com/pelican/wings/internal/ufs"
 )
+
+// ConfigFile is the handle to a configuration file that is parsed and then rewritten
+// in place. It is satisfied by both *os.File and filesystem.File.
+type ConfigFile interface {
+	io.Reader
+	io.Writer
+	io.Seeker
+	Name() string
+	Stat() (os.FileInfo, error)
+	Truncate(size int64) error
+}
 
 // The file parsing options that are available for a server configuration file.
 const (
@@ -41,45 +52,181 @@ const maxTextScanTokenSize = 64 * 1024 * 1024
 // maxConfigFileSize caps how large a configuration file we'll attempt to parse.
 const maxConfigFileSize = 64 * 1024 * 1024
 
-type ReplaceValue struct {
-	value     []byte
-	valueType jsonparser.ValueType
+// maxXMLDepth is the deepest element nesting of an XML configuration file that
+// is rewritten. Real configuration files are far shallower than this.
+const maxXMLDepth = 512
+
+// xmlDepth returns the element nesting depth of the tree rooted at root,
+// without recursing, so that it cannot itself exhaust the stack.
+func xmlDepth(root *etree.Element) int {
+	if root == nil {
+		return 0
+	}
+	type frame struct {
+		e *etree.Element
+		d int
+	}
+	stack := []frame{{root, 1}}
+	depth := 0
+	for len(stack) > 0 {
+		f := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if f.d > depth {
+			depth = f.d
+		}
+		for _, c := range f.e.ChildElements() {
+			stack = append(stack, frame{c, f.d + 1})
+		}
+	}
+	return depth
 }
 
-// Value returns the underlying value of the replacement. Be aware that this
-// can include escaped UTF-8 sequences that will need to be handled by the caller
-// in order to avoid accidentally injecting invalid sequences into the running
-// process.
-//
-// For example the expected value may be "§Foo" but you'll be working directly
-// with "\u00a7FOo" for this value. This will cause user pain if not solved since
-// that is clearly not the value they were expecting to be using.
+// xmlIndentationExceeds reports whether indenting the tree rooted at root with
+// the given number of spaces per level would add more than max bytes of
+// whitespace. etree's Indent inserts, before every non-character-data child
+// (elements, comments, directives and processing instructions) and before each
+// element's closing tag, a newline followed by depth*spaces spaces. On a
+// crafted document — very many such tokens nested deeply, for example a million
+// comments inside a deep element chain — that indentation alone can be orders
+// of magnitude larger than the input, exhausting memory inside Indent before
+// the serialized output is ever size-checked. It walks the tree iteratively,
+// like xmlDepth, and stops as soon as the budget is exceeded, so it never
+// allocates the indentation it is estimating.
+func xmlIndentationExceeds(root *etree.Element, spaces int, max int64) bool {
+	if root == nil {
+		return false
+	}
+	type frame struct {
+		e *etree.Element
+		d int
+	}
+	stack := []frame{{root, 0}}
+	var total int64
+	for len(stack) > 0 {
+		f := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		// Count every child token Indent would indent, not just elements, so a
+		// document padded with another indented token (comments, directives or
+		// processing instructions) cannot slip past the estimate. Only elements
+		// have children of their own to recurse into.
+		var indentable int64
+		for _, c := range f.e.Child {
+			if _, isCharData := c.(*etree.CharData); isCharData {
+				continue
+			}
+			indentable++
+			if ce, ok := c.(*etree.Element); ok {
+				stack = append(stack, frame{ce, f.d + 1})
+			}
+		}
+		if indentable > 0 {
+			// One indent token before each counted child, plus one before the
+			// closing tag; each is a newline and (d+1)*spaces spaces.
+			token := int64(1 + (f.d+1)*spaces)
+			total += token * (indentable + 1)
+			if total > max {
+				return true
+			}
+		}
+	}
+	return total > max
+}
+
+// limitedWriter writes through to w until more than max bytes have been
+// written, then fails with errConfigTooLarge rather than buffering an unbounded
+// amount. It lets a document be serialized without first materializing a copy
+// that could exhaust memory.
+type limitedWriter struct {
+	w   io.Writer
+	n   int64
+	max int64
+}
+
+var errConfigTooLarge = errors.Sentinel("parser: serialized configuration exceeds size limit")
+
+func (lw *limitedWriter) Write(p []byte) (int, error) {
+	if lw.n+int64(len(p)) > lw.max {
+		return 0, errConfigTooLarge
+	}
+	n, err := lw.w.Write(p)
+	lw.n += int64(n)
+	return n, err
+}
+
+// ValueType is the JSON type of a replacement value as written in the egg.
+type ValueType int
+
+const (
+	InvalidValue ValueType = iota
+	StringValue
+	NumberValue
+	BooleanValue
+	NullValue
+	ObjectValue
+	ArrayValue
+)
+
+// valueTypeOf maps a JSON value's kind to its ValueType.
+func valueTypeOf(k jsontext.Kind) ValueType {
+	switch k {
+	case '"':
+		return StringValue
+	case '0':
+		return NumberValue
+	case 't', 'f':
+		return BooleanValue
+	case 'n':
+		return NullValue
+	case '{':
+		return ObjectValue
+	case '[':
+		return ArrayValue
+	default:
+		return InvalidValue
+	}
+}
+
+type ReplaceValue struct {
+	value     []byte
+	valueType ValueType
+}
+
+// newReplaceValue builds a ReplaceValue from a raw JSON value. Strings are
+// unescaped up front, so an escaped section sign is stored as "§Foo"; every
+// other type keeps its raw JSON bytes.
+func newReplaceValue(v jsontext.Value) ReplaceValue {
+	rv := ReplaceValue{valueType: valueTypeOf(v.Kind())}
+	if rv.valueType == StringValue {
+		// The decoder has already checked v's syntax, so the only error
+		// AppendUnquote can still report is invalid UTF-8, which it has
+		// already replaced with U+FFFD. (The old jsonparser path passed the
+		// raw bytes through instead.)
+		rv.value, _ = jsontext.AppendUnquote(nil, v)
+	} else {
+		rv.value = bytes.Clone(v)
+	}
+	return rv
+}
+
+// Value returns the underlying value of the replacement. Strings are already
+// unescaped, so a section sign sent as a JSON escape comes back as "§Foo".
+// Other types are returned as their raw JSON text.
 func (cv *ReplaceValue) Value() []byte {
 	return cv.value
 }
 
 // Type returns the underlying data type for the Value field.
-func (cv *ReplaceValue) Type() jsonparser.ValueType {
+func (cv *ReplaceValue) Type() ValueType {
 	return cv.valueType
 }
 
-// String returns the value as a string representation. This will automatically
-// handle casting the UTF-8 sequence into the expected value, switching something
-// like "\u00a7Foo" into "§Foo".
+// String returns the value as a string representation.
 func (cv *ReplaceValue) String() string {
 	switch cv.Type() {
-	case jsonparser.String:
-		str, err := jsonparser.ParseString(cv.value)
-		if err != nil {
-			panic(errors.Wrap(err, "parser: could not parse value"))
-		}
-		return str
-	case jsonparser.Null:
+	case StringValue, BooleanValue, NumberValue:
+		return string(cv.value)
+	case NullValue:
 		return "<nil>"
-	case jsonparser.Boolean:
-		return string(cv.value)
-	case jsonparser.Number:
-		return string(cv.value)
 	default:
 		return "<invalid>"
 	}
@@ -87,19 +234,10 @@ func (cv *ReplaceValue) String() string {
 
 func (cv *ReplaceValue) Bytes() []byte {
 	switch cv.Type() {
-	case jsonparser.String:
-		var stackbuf [64]byte
-		bU, err := jsonparser.Unescape(cv.value, stackbuf[:])
-		if err != nil {
-			panic(errors.Wrap(err, "parser: could not parse value"))
-		}
-		return bU
-	case jsonparser.Null:
+	case StringValue, BooleanValue, NumberValue:
+		return cv.value
+	case NullValue:
 		return []byte("<nil>")
-	case jsonparser.Boolean:
-		return cv.value
-	case jsonparser.Number:
-		return cv.value
 	default:
 		return []byte("<invalid>")
 	}
@@ -124,48 +262,186 @@ type ConfigurationFile struct {
 	configuration []byte
 }
 
-// UnmarshalJSON is a custom unmarshaler for configuration files. If there is an
-// error while parsing out the replacements, don't fail the entire operation,
-// just log a global warning so someone can find the issue, and return an empty
-// array of replacements.
+// UnmarshalJSON is a custom unmarshaler for configuration files. A replacement
+// that fails to decode doesn't fail the entire operation: it is logged so
+// someone can find the issue and skipped, and the other replacements are kept.
 func (f *ConfigurationFile) UnmarshalJSON(data []byte) error {
-	var m map[string]*json.RawMessage
-	if err := json.Unmarshal(data, &m); err != nil {
+	return jsonv2.Unmarshal(data, f, legacyDecodeOptions)
+}
+
+// legacyDecodeOptions keeps encoding/json v1 behaviour for egg JSON coming
+// from the Panel: the last of any duplicate keys wins and invalid UTF-8 is
+// accepted instead of failing the whole server configuration.
+var legacyDecodeOptions = jsonv2.JoinOptions(
+	jsontext.AllowDuplicateNames(true),
+	jsontext.AllowInvalidUTF8(true),
+)
+
+// readObject reads a JSON object from dec in a single pass, calling fn with
+// each member's name. fn must consume exactly one value from dec. A null
+// object is treated as empty.
+func readObject(dec *jsontext.Decoder, fn func(key string) error) error {
+	tok, err := dec.ReadToken()
+	if err != nil {
+		return err
+	}
+	switch tok.Kind() {
+	case 'n':
+		return nil
+	case '{':
+	default:
+		return errors.Errorf("parser: expected a JSON object, got %s", tok.Kind())
+	}
+	for dec.PeekKind() != '}' {
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		// tok is voided by the next decoder call, so the name is copied out
+		// before fn reads the value.
+		if err := fn(tok.String()); err != nil {
+			return err
+		}
+	}
+	_, err = dec.ReadToken()
+	return err
+}
+
+// stringField holds the last value seen for a string member. A wrong type is
+// recorded rather than returned straight away, so a later duplicate of the key
+// can still replace it: the last occurrence wins, as with encoding/json v1.
+type stringField struct {
+	s   string
+	set bool // false when the member was missing or null
+	err error
+}
+
+// read consumes one value from dec into f, replacing anything read before.
+func (f *stringField) read(dec *jsontext.Decoder, key string) error {
+	*f = stringField{}
+	switch k := dec.PeekKind(); k {
+	case '"':
+		tok, err := dec.ReadToken()
+		if err != nil {
+			return err
+		}
+		f.s, f.set = tok.String(), true
+	case 'n':
+		_, err := dec.ReadToken()
+		return err
+	default:
+		f.err = errors.Errorf("parser: '%s' must be a string, got %s", key, k)
+		return dec.SkipValue()
+	}
+	return nil
+}
+
+// UnmarshalJSONFrom decodes a configuration file in a single pass. A key whose
+// value is null is treated as missing.
+func (f *ConfigurationFile) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	var file, parser stringField
+	var haveCreate bool
+	var replace []ConfigurationFileReplacement
+	var replaceErrs []error
+	var createErr error
+	f.AllowCreateFile = true
+	err := readObject(dec, func(key string) error {
+		switch key {
+		case "file":
+			return file.read(dec, key)
+		case "parser":
+			return parser.read(dec, key)
+		case "replace":
+			replace, replaceErrs = nil, nil
+			switch k := dec.PeekKind(); k {
+			case 'n':
+				_, err := dec.ReadToken()
+				return err
+			case '[':
+			default:
+				replaceErrs = []error{errors.Errorf("parser: 'replace' must be an array, got %s", k)}
+				return dec.SkipValue()
+			}
+			if _, err := dec.ReadToken(); err != nil {
+				return err
+			}
+			// Each replacement is decoded from its own already-read value, so
+			// a bad one is skipped and reported after the loop without
+			// desyncing the decoder or dropping the good ones around it.
+			replace = []ConfigurationFileReplacement{}
+			for i := 0; dec.PeekKind() != ']'; i++ {
+				val, err := dec.ReadValue()
+				if err != nil {
+					return err
+				}
+				if val.Kind() == 'n' {
+					replaceErrs = append(replaceErrs, errors.Errorf("replace[%d]: replacement is null", i))
+					continue
+				}
+				var r ConfigurationFileReplacement
+				if err := jsonv2.Unmarshal(val, &r, dec.Options()); err != nil {
+					replaceErrs = append(replaceErrs, errors.Wrapf(err, "replace[%d]", i))
+					continue
+				}
+				replace = append(replace, r)
+			}
+			if _, err := dec.ReadToken(); err != nil {
+				return err
+			}
+		case "create_file":
+			val, err := dec.ReadValue()
+			if err != nil {
+				return err
+			}
+			haveCreate, createErr = true, nil
+			switch val.Kind() {
+			case 't':
+				f.AllowCreateFile = true
+			case 'f':
+				f.AllowCreateFile = false
+			case 'n':
+				haveCreate, f.AllowCreateFile = false, true
+			default:
+				f.AllowCreateFile = true
+				createErr = errors.Errorf("expected a boolean, got %s", val.Kind())
+			}
+		default:
+			return dec.SkipValue()
+		}
+		return nil
+	})
+	if err != nil {
 		return err
 	}
 
-	fileRaw, ok := m["file"]
-	if !ok || fileRaw == nil {
+	if file.err != nil {
+		return file.err
+	}
+	if !file.set {
 		return errors.New("parser: configuration file missing required 'file' key")
 	}
-	if err := json.Unmarshal(*fileRaw, &f.FileName); err != nil {
-		return err
+	if parser.err != nil {
+		return parser.err
 	}
-
-	parserRaw, ok := m["parser"]
-	if !ok || parserRaw == nil {
+	if !parser.set {
 		return errors.New("parser: configuration file missing required 'parser' key")
 	}
-	if err := json.Unmarshal(*parserRaw, &f.Parser); err != nil {
-		return err
+	f.FileName, f.Parser = file.s, ConfigurationParser(parser.s)
+
+	// Bad replacements are logged and skipped; the rest still apply.
+	for _, err := range replaceErrs {
+		log.WithField("file", f.FileName).WithField("error", err).Warn("failed to unmarshal configuration file replacement")
+	}
+	f.Replace = replace
+	if f.Replace == nil {
+		f.Replace = []ConfigurationFileReplacement{}
 	}
 
-	f.Replace = []ConfigurationFileReplacement{}
-	if replaceRaw, ok := m["replace"]; ok && replaceRaw != nil {
-		if err := json.Unmarshal(*replaceRaw, &f.Replace); err != nil {
-			log.WithField("file", f.FileName).WithField("error", err).Warn("failed to unmarshal configuration file replacement")
-		}
-	}
-
-	// test if "create_file" exists, if not just assume true
-	if val, exists := m["create_file"]; exists && val != nil {
-		if err := json.Unmarshal(*val, &f.AllowCreateFile); err != nil {
-			log.WithField("file", f.FileName).WithField("error", err).Warn("create_file unmarshal failed")
-			f.AllowCreateFile = true
-		}
-	} else {
+	// create_file is assumed true when it is missing or invalid.
+	if createErr != nil {
+		log.WithField("file", f.FileName).WithField("error", createErr).Warn("create_file unmarshal failed")
+	} else if !haveCreate {
 		log.WithField("file", f.FileName).Debug("create_file not specified assumed true")
-		f.AllowCreateFile = true
 	}
 
 	return nil
@@ -182,38 +458,59 @@ type ConfigurationFileReplacement struct {
 // UnmarshalJSON handles unmarshaling the JSON representation into a struct that
 // provides more useful data to this functionality.
 func (cfr *ConfigurationFileReplacement) UnmarshalJSON(data []byte) error {
-	m, err := jsonparser.GetString(data, "match")
+	return jsonv2.Unmarshal(data, cfr, legacyDecodeOptions)
+}
+
+// UnmarshalJSONFrom decodes a single replacement in one pass. "match" and
+// "replace_with" are required; "if_value" is optional. Eggs that predate
+// "replace_with" use the old "value" key, which is accepted as a fallback.
+func (cfr *ConfigurationFileReplacement) UnmarshalJSONFrom(dec *jsontext.Decoder) error {
+	var match, ifValue stringField
+	var haveReplace, haveLegacy bool
+	var replaceWith, legacyValue ReplaceValue
+	err := readObject(dec, func(key string) error {
+		switch key {
+		case "match":
+			return match.read(dec, key)
+		case "if_value":
+			return ifValue.read(dec, key)
+		case "replace_with", "value":
+			val, err := dec.ReadValue()
+			if err != nil {
+				return err
+			}
+			if key == "replace_with" {
+				replaceWith, haveReplace = newReplaceValue(val), true
+			} else {
+				legacyValue, haveLegacy = newReplaceValue(val), true
+			}
+		default:
+			return dec.SkipValue()
+		}
+		return nil
+	})
 	if err != nil {
 		return err
 	}
 
-	cfr.Match = m
-
-	iv, err := jsonparser.GetString(data, "if_value")
-	// We only check keypath here since match & replace_with should be present on all of
-	// them, however if_value is optional.
-	if err != nil && err != jsonparser.KeyPathNotFoundError {
-		return err
+	if match.err != nil {
+		return match.err
 	}
-	cfr.IfValue = iv
-
-	rw, dt, _, err := jsonparser.Get(data, "replace_with")
-	if err != nil {
-		if err != jsonparser.KeyPathNotFoundError {
-			return err
-		}
-
-		// Okay, likely dealing with someone who forgot to upgrade their eggs, so in
-		// that case, fallback to using the old key which was "value".
-		rw, dt, _, err = jsonparser.Get(data, "value")
-		if err != nil {
-			return err
-		}
+	if !match.set {
+		return errors.New("parser: replacement missing required 'match' key")
 	}
-
-	cfr.ReplaceWith = ReplaceValue{
-		value:     rw,
-		valueType: dt,
+	// if_value is optional, and null means it is not set.
+	if ifValue.err != nil {
+		return ifValue.err
+	}
+	cfr.Match, cfr.IfValue = match.s, ifValue.s
+	switch {
+	case haveReplace:
+		cfr.ReplaceWith = replaceWith
+	case haveLegacy:
+		cfr.ReplaceWith = legacyValue
+	default:
+		return errors.New("parser: replacement missing required 'replace_with' key")
 	}
 
 	return nil
@@ -237,7 +534,7 @@ func newTemplatableConfig(c *config.Configuration) templatableConfig {
 
 // Parse parses a given configuration file and updates all the values within
 // as defined in the API response from the Panel.
-func (f *ConfigurationFile) Parse(file ufs.File) error {
+func (f *ConfigurationFile) Parse(file ConfigFile) error {
 	//log.WithField("path", path).WithField("parser", f.Parser.String()).Debug("parsing server configuration file")
 
 	// Refuse to parse files larger than the cap. Every parser below buffers the
@@ -279,10 +576,25 @@ func (f *ConfigurationFile) Parse(file ufs.File) error {
 }
 
 // Parses an xml file.
-func (f *ConfigurationFile) parseXmlFile(file ufs.File) error {
+func (f *ConfigurationFile) parseXmlFile(file ConfigFile) error {
 	doc := etree.NewDocument()
 	if _, err := doc.ReadFrom(io.LimitReader(file, maxConfigFileSize)); err != nil {
 		return err
+	}
+	// A configuration file has a single root element. etree is lenient and will
+	// parse several top-level elements, but the depth and indentation guards
+	// below, like doc.Root(), only inspect the first one, while doc.Indent would
+	// still indent them all. Refuse a multi-root document so a second, oversized
+	// tree cannot be indented past those checks. The server still boots with the
+	// file as it is, the same as for files over the size or depth limits.
+	if roots := doc.ChildElements(); len(roots) > 1 {
+		return errors.Errorf("parser: refusing to parse configuration file %q: document has %d root elements, expected one", file.Name(), len(roots))
+	}
+	// The file is controlled by the server, and a deeply nested document could
+	// exhaust the stack while it is rewritten. The server still boots with the
+	// file as it is, the same as for files over the size limit.
+	if depth := xmlDepth(doc.Root()); depth > maxXMLDepth {
+		return errors.Errorf("parser: refusing to parse configuration file %q: element nesting depth %d exceeds limit of %d", file.Name(), depth, maxXMLDepth)
 	}
 
 	// If there is no root we should create a basic start to the file. This isn't required though,
@@ -341,25 +653,32 @@ func (f *ConfigurationFile) parseXmlFile(file ufs.File) error {
 		}
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
+	// Indenting the document inserts whitespace text nodes into the tree. On a
+	// crafted file with very many deeply nested elements that whitespace alone
+	// can be orders of magnitude larger than the input and exhaust memory, so
+	// refuse the rewrite before Indent allocates it. The server still boots with
+	// the file as it is, the same as for files over the size limit.
+	if xmlIndentationExceeds(doc.Root(), 2, maxConfigFileSize) {
+		return errors.Errorf("parser: refusing to write configuration file %q: indented result exceeds limit of %d bytes", file.Name(), maxConfigFileSize)
 	}
 
 	// Ensure the XML is indented properly.
 	doc.Indent(2)
 
-	// Write the XML to the file.
-	if _, err := doc.WriteTo(file); err != nil {
+	// Serialize through a writer bounded to the size limit so a document that
+	// still expands past it cannot buffer an unbounded copy in memory.
+	var buf bytes.Buffer
+	if _, err := doc.WriteTo(&limitedWriter{w: &buf, max: maxConfigFileSize}); err != nil {
+		if errors.Is(err, errConfigTooLarge) {
+			return errors.Errorf("parser: refusing to write configuration file %q: result exceeds limit of %d bytes", file.Name(), maxConfigFileSize)
+		}
 		return err
 	}
-	return nil
+	return rewrite(file, buf.Bytes())
 }
 
 // Parses an ini file.
-func (f *ConfigurationFile) parseIniFile(file ufs.File) error {
+func (f *ConfigurationFile) parseIniFile(file ConfigFile) error {
 	// Wrap the file in a NopCloser so the ini package doesn't close the file.
 	cfg, err := ini.Load(io.NopCloser(io.LimitReader(file, maxConfigFileSize)))
 	if err != nil {
@@ -428,23 +747,17 @@ func (f *ConfigurationFile) parseIniFile(file ufs.File) error {
 		}
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
+	var buf bytes.Buffer
+	if _, err := cfg.WriteTo(&buf); err != nil {
 		return err
 	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
-	if _, err := cfg.WriteTo(file); err != nil {
-		return err
-	}
-	return nil
+	return rewrite(file, buf.Bytes())
 }
 
 // Parses a json file updating any matching key/value pairs. If a match is not found, the
 // value is set regardless in the file. See the commentary in parseYamlFile for more details
 // about what is happening during this process.
-func (f *ConfigurationFile) parseJsonFile(file ufs.File) error {
+func (f *ConfigurationFile) parseJsonFile(file ConfigFile) error {
 	b, err := io.ReadAll(io.LimitReader(file, maxConfigFileSize))
 	if err != nil {
 		return err
@@ -455,13 +768,6 @@ func (f *ConfigurationFile) parseJsonFile(file ufs.File) error {
 		return err
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
 	prettified := pretty.PrettyOptions(data, &pretty.Options{
 		Width:    80,
 		Prefix:   "",
@@ -469,70 +775,36 @@ func (f *ConfigurationFile) parseJsonFile(file ufs.File) error {
 		SortKeys: false,
 	})
 
-	if _, err := io.Copy(file, bytes.NewReader(prettified)); err != nil {
-		return errors.Wrap(err, "parser: failed to write properties file to disk")
+	if err := rewrite(file, prettified); err != nil {
+		return err
 	}
 	return nil
 }
 
 // Parses a yaml file and updates any matching key/value pairs before persisting
 // it back to the disk.
-func (f *ConfigurationFile) parseYamlFile(file ufs.File) error {
+func (f *ConfigurationFile) parseYamlFile(file ConfigFile) error {
 	b, err := io.ReadAll(io.LimitReader(file, maxConfigFileSize))
 	if err != nil {
 		return err
 	}
 
-	i := make(map[string]interface{})
-	if err := yaml.Unmarshal(b, &i); err != nil {
-		return err
-	}
-
-	// Unmarshal the yaml data into a JSON interface such that we can work with
-	// any arbitrary data structure. This allows us to use gjson/sjson for
-	// working with unknown JSON significantly easier.
-	jsonBytes, err := json.Marshal(dyno.ConvertMapI2MapS(i))
+	// Apply the replacements while preserving the layout, comments and key order
+	// of the original file. See updateYaml for details.
+	marshaled, changed, err := f.updateYaml(b)
 	if err != nil {
 		return err
 	}
-
-	// Now that the data is converted, treat it just like JSON and pass it to the
-	// iterator function to update values as necessary.
-	data, err := f.IterateOverJson(jsonBytes)
-	if err != nil {
-		return err
+	if !changed {
+		return nil
 	}
 
-	var jsonData interface{}
-	yamlDecoder := json.NewDecoder(bytes.NewReader(data))
-	yamlDecoder.UseNumber()
-	if err := yamlDecoder.Decode(&jsonData); err != nil {
-		return err
-	}
-	jsonData = normalizeYamlTypes(jsonData)
-
-	marshaled, err := yaml.Marshal(jsonData)
-	if err != nil {
-		return err
-	}
-
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
-	// Write the data to the file.
-	if _, err := io.Copy(file, bytes.NewReader(marshaled)); err != nil {
-		return errors.Wrap(err, "parser: failed to write properties file to disk")
-	}
-	return nil
+	return rewrite(file, marshaled)
 }
 
 // Parses a toml file and updates any matching key/value pairs before persisting
 // it back to the disk.
-func (f *ConfigurationFile) parseTomlFile(file ufs.File) error {
+func (f *ConfigurationFile) parseTomlFile(file ConfigFile) error {
 	b, err := io.ReadAll(io.LimitReader(file, maxConfigFileSize))
 	if err != nil {
 		return err
@@ -568,17 +840,7 @@ func (f *ConfigurationFile) parseTomlFile(file ufs.File) error {
 		return err
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
-	if _, err := io.Copy(file, bytes.NewReader(marshaled)); err != nil {
-		return errors.Wrap(err, "parser: failed to write toml file to disk")
-	}
-	return nil
+	return rewrite(file, marshaled)
 }
 
 // normalizeYamlTypes converts json.Number values (produced by UseNumber()) into
@@ -654,7 +916,7 @@ func normalizeTomlTypes(value interface{}) interface{} {
 // Parses a text file using basic find and replace. This is a highly inefficient method of
 // scanning a file and performing a replacement. You should attempt to use anything other
 // than this function where possible.
-func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
+func (f *ConfigurationFile) parseTextFile(file ConfigFile) error {
 	b := bytes.NewBuffer(nil)
 	s := bufio.NewScanner(io.LimitReader(file, maxConfigFileSize))
 	s.Buffer(make([]byte, 0, 64*1024), maxTextScanTokenSize)
@@ -675,23 +937,17 @@ func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
 			b.Write(line)
 		}
 		b.WriteByte('\n')
+		// Replacements can make the result much larger than the file that was
+		// read, so apply the same limit while building it.
+		if b.Len() > maxConfigFileSize {
+			return errors.Errorf("parser: refusing to write configuration file %q: result exceeds limit of %d bytes", file.Name(), maxConfigFileSize)
+		}
 	}
 	if err := s.Err(); err != nil {
 		return errors.Wrap(err, "parser: failed to scan text file for configuration update")
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
-	// Write the data to the file.
-	if _, err := io.Copy(file, b); err != nil {
-		return errors.Wrap(err, "parser: failed to write properties file to disk")
-	}
-	return nil
+	return rewrite(file, b.Bytes())
 }
 
 // parsePropertiesFile parses a properties file and updates the values within it
@@ -720,7 +976,7 @@ func (f *ConfigurationFile) parseTextFile(file ufs.File) error {
 //
 // @see https://github.com/pterodactyl/panel/issues/2308 (original)
 // @see https://github.com/pterodactyl/panel/issues/3009 ("bug" introduced as result)
-func (f *ConfigurationFile) parsePropertiesFile(file ufs.File) error {
+func (f *ConfigurationFile) parsePropertiesFile(file ConfigFile) error {
 	b, err := io.ReadAll(io.LimitReader(file, maxConfigFileSize))
 	if err != nil {
 		return err
@@ -780,16 +1036,30 @@ func (f *ConfigurationFile) parsePropertiesFile(file ufs.File) error {
 		s.WriteString(key + "=" + strings.Trim(strconv.QuoteToASCII(value), "\"") + "\n")
 	}
 
+	return rewrite(file, s.Bytes())
+}
+
+// rewrite replaces the contents of file with data. The new contents are written
+// first and the old tail is trimmed afterwards, rather than truncating first, so
+// that a write the quota-tracked handle refuses (because the result would not fit
+// in the server's disk limit) leaves the original file intact instead of emptying
+// it. A shrinking replacement never needs to reserve space, so it cannot fail
+// that way either.
+func rewrite(file ConfigFile, data []byte) error {
+	if len(data) > maxConfigFileSize {
+		return errors.Errorf("parser: refusing to write configuration file %q: result exceeds limit of %d bytes", file.Name(), maxConfigFileSize)
+	}
+
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	if err := file.Truncate(0); err != nil {
-		return err
+	n, err := file.Write(data)
+	if err != nil {
+		return errors.Wrap(err, "parser: failed to write configuration file to disk")
 	}
-
-	// Write the data to the file.
-	if _, err := io.Copy(file, s); err != nil {
-		return errors.Wrap(err, "parser: failed to write properties file to disk")
+	// Remove any bytes of the old, longer contents left after the new ones.
+	if err := file.Truncate(int64(n)); err != nil {
+		return errors.Wrap(err, "parser: failed to trim configuration file on disk")
 	}
 	return nil
 }

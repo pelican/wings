@@ -1,6 +1,8 @@
 package tokens
 
 import (
+	"time"
+
 	"github.com/gbrlsnchs/jwt/v3"
 )
 
@@ -19,16 +21,21 @@ func (p *BackupPayload) GetPayload() *jwt.Payload {
 	return &p.Payload
 }
 
-// Determines if this JWT is valid for the given request cycle. If the
-// unique ID passed in the token has already been seen before this will
-// return false. This allows us to use this JWT as a one-time token that
-// validates all of the request.
-func (p *BackupPayload) IsUniqueRequest() bool {
-	return getTokenStore().IsValidToken(p.UniqueId)
-}
-
 // Denylisted returns true if this token was issued before the user's access to
 // the server was revoked.
+//
+// The Panel issues tokens without a user when one node downloads a backup from
+// another, to restore it into a new server. Those are not tied to a user's
+// access, so only the time they were issued and the JTI denylist are checked.
 func (p *BackupPayload) Denylisted() bool {
+	if p.UserUuid == "" {
+		if p.IssuedAt == nil || p.ServerUuid == "" || p.IssuedAt.Time.Before(wingsBootTime) {
+			return true
+		}
+		if t, ok := denylist.Load(p.JWTID); ok && !p.IssuedAt.Time.After(t.(time.Time)) {
+			return true
+		}
+		return false
+	}
 	return isDenylisted(&p.Payload, p.ServerUuid, p.UserUuid)
 }

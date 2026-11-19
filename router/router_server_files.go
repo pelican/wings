@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"io"
-	"mime/multipart"
 	"net/http"
 	"net/url"
 	"os"
@@ -12,6 +11,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -20,7 +20,6 @@ import (
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/internal/models"
-	"github.com/pelican/wings/internal/ufs"
 	"github.com/pelican/wings/router/downloader"
 	"github.com/pelican/wings/router/middleware"
 	"github.com/pelican/wings/router/tokens"
@@ -36,13 +35,18 @@ func getServerFileContents(c *gin.Context) {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
+	// Open the same path that was checked against the denylist above.
 	f, st, err := s.Filesystem().File(p)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
 				"error":      "The requested resources was not found on the system.",
 				"request_id": c.Writer.Header().Get("X-Request-Id")})
-		} else if strings.Contains(err.Error(), "filesystem: is a directory") {
+		} else if filesystem.IsErrorCode(err, filesystem.ErrCodeNotRegular) {
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"error": "Cannot open files of this type.",
+			})
+		} else if filesystem.IsErrorCode(err, filesystem.ErrCodeIsDirectory) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 				"error":      "Cannot perform that action: file is a directory.",
 				"request_id": c.Writer.Header().Get("X-Request-Id"),
@@ -147,11 +151,12 @@ func putServerRenameFiles(c *gin.Context) {
 				fs := s.Filesystem()
 				// Ignore renames on a file that is on the denylist (both as the rename from or
 				// the rename to value).
-				if err := fs.IsIgnored(pf, pt); err != nil {
+				if err := fs.IsIgnoredNoFollow(pf, pt); err != nil {
 					return err
 				}
 				if err := fs.Rename(pf, pt); err != nil {
 					// Return nil if the error is an is not exists.
+					// NOTE: os.IsNotExist() does not work if the error is wrapped.
 					if errors.Is(err, os.ErrNotExist) {
 						s.Log().WithField("error", err).
 							WithField("from_path", pf).
@@ -240,7 +245,6 @@ func postServerDeleteFiles(c *gin.Context) {
 				return s.Filesystem().SafeDeleteRecursively(pi)
 			}
 		})
-
 	}
 
 	if err := g.Wait(); err != nil {
@@ -355,7 +359,9 @@ func postServerPullRemoteFile(c *gin.Context) {
 	download := func() error {
 		s.Log().WithField("download_id", dl.Identifier).WithField("url", u.String()).Info("starting pull of remote file to disk")
 		if err := dl.Execute(); err != nil {
-			s.Log().WithField("download_id", dl.Identifier).WithField("error", err).Error("failed to pull remote file")
+			if !downloader.IsDownloadError(err) {
+				s.Log().WithField("download_id", dl.Identifier).WithField("error", err).Error("failed to pull remote file")
+			}
 			return err
 		} else {
 			s.Log().WithField("download_id", dl.Identifier).Info("completed pull of remote file")
@@ -373,6 +379,18 @@ func postServerPullRemoteFile(c *gin.Context) {
 	}
 
 	if err := download(); err != nil {
+		if downloader.IsDownloadError(err) {
+			message := "The URL or IP address provided could not be resolved to a valid destination."
+			if errors.Is(err, downloader.ErrDownloadFailed) {
+				s.Log().WithField("identifier", dl.Identifier).WithField("error", err).Warn("failed to download remote file")
+				message = "An error was encountered while trying to download this file. Please try again later."
+			}
+			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+				"identifier": dl.Identifier,
+				"message":    message,
+			})
+			return
+		}
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
@@ -408,12 +426,13 @@ func postServerCreateDirectory(c *gin.Context) {
 	}
 
 	if err := s.Filesystem().CreateDirectory(data.Name, data.Path); err != nil {
-		if errors.Is(err, ufs.ErrNotDirectory) {
+		if errors.Is(err, syscall.ENOTDIR) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 				"error": "Part of the path being created is not a directory (ENOTDIR).",
 			})
 			return
 		}
+
 		if errors.Is(err, os.ErrExist) {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 				"error": "Cannot create directory, name conflicts with an existing file by the same name.",
@@ -462,9 +481,15 @@ func postServerCompressFiles(c *gin.Context) {
 	// The extention comes from the panel
 	// Supported are: zip, tar.gz, tar.bz2, tar.xz
 	// No need to check if it is empty or wrong as if data.Extention is wrong the function falls back to tar.gz
-	f, mimetype, err := s.Filesystem().CompressFiles(data.RootPath, data.Name, data.Files, data.Extension)
+	f, mimetype, err := s.Filesystem().CompressFiles(context.Background(), data.RootPath, data.Name, data.Files, data.Extension)
 	if err != nil {
-		middleware.CaptureAndAbort(c, err)
+		if errors.Is(err, filesystem.ErrNoSpaceAvailable) {
+			c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+				"error": "This server does not have enough available disk space to generate a compressed archive.",
+			})
+		} else {
+			middleware.CaptureAndAbort(c, err)
+		}
 		return
 	}
 
@@ -488,14 +513,11 @@ func postServerDecompressFiles(c *gin.Context) {
 
 	s := middleware.ExtractServer(c)
 	lg := middleware.ExtractLogger(c).WithFields(log.Fields{"root_path": data.RootPath, "file": data.File})
+
+	// Refuse an archive that does not fit before writing anything, as main does,
+	// rather than stopping at the limit with part of it extracted.
 	lg.Debug("checking if space is available for file decompression")
-	err := s.Filesystem().SpaceAvailableForDecompression(context.Background(), data.RootPath, data.File)
-	if err != nil {
-		if filesystem.IsErrorCode(err, filesystem.ErrCodeUnknownArchive) {
-			lg.WithField("error", err).Warn("failed to decompress file: unknown archive format")
-			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{"error": "The archive provided is in a format Wings does not understand."})
-			return
-		}
+	if err := s.Filesystem().SpaceAvailableForDecompression(context.Background(), data.RootPath, data.File); err != nil {
 		middleware.CaptureAndAbort(c, err)
 		return
 	}
@@ -554,12 +576,11 @@ func postServerChmodFile(c *gin.Context) {
 			case <-ctx.Done():
 				return ctx.Err()
 			default:
-				mode, err := strconv.ParseUint(p.Mode, 8, 32)
+				m, err := strconv.ParseUint(p.Mode, 8, 32)
 				if err != nil {
 					return errInvalidFileMode
 				}
-
-				if err := s.Filesystem().Chmod(path.Join(data.Root, p.File), os.FileMode(mode)); err != nil {
+				if err := s.Filesystem().Chmod(path.Join(data.Root, p.File), filesystem.FileModeFromUnix(m)); err != nil {
 					// Return nil if the error is an is not exists.
 					// NOTE: os.IsNotExist() does not work if the error is wrapped.
 					if errors.Is(err, os.ErrNotExist) {
@@ -605,19 +626,15 @@ func postServerUploadFiles(c *gin.Context) {
 		})
 		return
 	}
+	middleware.ClearDeadlines(c)
 
-	form, err := c.MultipartForm()
+	// Read the files one part at a time and write each straight to the server's
+	// disk. Parsing the whole form first would store every file in a temporary
+	// location before any size limit is checked.
+	reader, err := c.Request.MultipartReader()
 	if err != nil {
 		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
 			"error": "Failed to get multipart form data from request.",
-		})
-		return
-	}
-
-	headers, ok := form.File["files"]
-	if !ok {
-		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-			"error": "No files were found on the request body.",
 		})
 		return
 	}
@@ -626,44 +643,62 @@ func postServerUploadFiles(c *gin.Context) {
 
 	maxFileSize := config.Get().Api.UploadLimit
 	maxFileSizeBytes := maxFileSize * 1024 * 1024
-	var totalSize int64
-	for _, header := range headers {
-		if header.Size > maxFileSizeBytes {
+	var found bool
+	for {
+		part, err := reader.NextPart()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
 			c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
-				"error": "File " + header.Filename + " is larger than the maximum file upload size of " + strconv.FormatInt(maxFileSize, 10) + " MB.",
+				"error": "Failed to get multipart form data from request.",
 			})
 			return
 		}
-		totalSize += header.Size
-	}
+		// FileName only returns the last element of the name sent by the client.
+		if part.FormName() != "files" || part.FileName() == "" {
+			continue
+		}
+		found = true
 
-	for _, header := range headers {
-		// We run this in a different method so I can use defer without any of
-		// the consequences caused by calling it in a loop.
-		if err := handleFileUpload(filepath.Join(directory, header.Filename), s, header); err != nil {
+		name := part.FileName()
+		if err := handleFileUpload(filepath.Join(directory, name), s, part, maxFileSizeBytes); err != nil {
+			if errors.Is(err, errUploadTooLarge) {
+				c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+					"error": "File " + name + " is larger than the maximum file upload size of " + strconv.FormatInt(maxFileSize, 10) + " MB.",
+				})
+				return
+			}
 			middleware.CaptureAndAbort(c, err)
 			return
-		} else {
-			s.SaveActivity(s.NewRequestActivity(token.UserUuid, c.ClientIP()), server.ActivityFileUploaded, models.ActivityMeta{
-				"file":      header.Filename,
-				"directory": filepath.Clean(directory),
-			})
 		}
+		s.SaveActivity(s.NewRequestActivity(token.UserUuid, c.ClientIP()), server.ActivityFileUploaded, models.ActivityMeta{
+			"file":      name,
+			"directory": filepath.Clean(directory),
+		})
+	}
+
+	if !found {
+		c.AbortWithStatusJSON(http.StatusBadRequest, gin.H{
+			"error": "No files were found on the request body.",
+		})
 	}
 }
 
-func handleFileUpload(p string, s *server.Server, header *multipart.FileHeader) error {
-	file, err := header.Open()
-	if err != nil {
-		return err
-	}
-	defer file.Close()
+var errUploadTooLarge = errors.New("router: uploaded file is larger than the upload limit")
 
+// handleFileUpload writes an uploaded file to p, refusing it if it is larger
+// than limit bytes.
+func handleFileUpload(p string, s *server.Server, r io.Reader, limit int64) error {
 	if err := s.Filesystem().IsIgnored(p); err != nil {
 		return err
 	}
 
-	if err := s.Filesystem().Write(p, file, header.Size, 0o644); err != nil {
+	// A refused or failed upload never replaces the existing file.
+	if _, err := s.Filesystem().WriteFrom(p, r, limit); err != nil {
+		if errors.Is(err, filesystem.ErrWriteTooLarge) {
+			return errUploadTooLarge
+		}
 		return err
 	}
 	return nil

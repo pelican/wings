@@ -11,6 +11,7 @@ import (
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
 	"github.com/pelican/wings/server/filesystem/quotas"
+	"github.com/pelican/wings/system"
 )
 
 type PowerAction string
@@ -39,6 +40,18 @@ func (pa PowerAction) IsValid() bool {
 
 func (pa PowerAction) IsStart() bool {
 	return pa == PowerActionStart || pa == PowerActionRestart
+}
+
+// terminateBootWait is how long a termination event waits for a start or restart
+// that is still booting the server before terminating without the power lock.
+var terminateBootWait = 30 * time.Second
+
+// isBooting reports whether the server process is offline or starting. When the
+// power lock is held in one of these states, a start or restart is running its
+// pre-boot steps or creating and starting the container.
+func (s *Server) isBooting() bool {
+	st := s.Environment.State()
+	return st == environment.ProcessOfflineState || st == environment.ProcessStartingState
 }
 
 // ExecutingPowerAction checks if there is currently a power action being
@@ -113,9 +126,28 @@ func (s *Server) HandlePowerAction(action PowerAction, waitSeconds ...int) error
 		//
 		// If we did successfully acquire the lock, make sure we release it once we're done
 		// executiong the power actions.
-		if err := s.powerLock.Acquire(); err == nil {
+		err := s.powerLock.Acquire()
+
+		// If the lock is held while the server is offline or starting, a start or restart is
+		// running its pre-boot steps or creating and starting the container. Terminating now
+		// races that boot: the kill is either lost because there is no container to kill yet,
+		// or the server is marked offline right before the boot starts the container, leaving
+		// a running server that reports itself as offline. Wait for the boot to finish and
+		// then terminate the process it started. If the boot does not finish in time, fall
+		// back to terminating without the lock so a stuck process can still be killed.
+		if err != nil && s.isBooting() {
+			log.Info("waiting for the server to finish booting before processing termination event")
+			ctx, cancel := context.WithTimeout(s.ctx, terminateBootWait)
+			defer cancel()
+			err = s.powerLock.TryAcquire(ctx)
+		}
+
+		if err == nil {
 			log.Info("acquired exclusive lock on power actions, processing event...")
 			defer cleanup()
+		} else if errors.Is(err, system.ErrLockerDestroyed) {
+			// The server is being deleted, which already stops its container.
+			return err
 		} else {
 			log.Warn("failed to acquire exclusive lock, ignoring failure for termination event")
 		}

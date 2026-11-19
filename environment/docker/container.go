@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/netip"
+	"os"
 	"runtime"
 	"strconv"
 	"strings"
@@ -12,12 +14,14 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
-	"github.com/buger/jsonparser"
-	"github.com/docker/docker/api/types/container"
-	dockerImage "github.com/docker/docker/api/types/image"
-	"github.com/docker/docker/api/types/mount"
-	"github.com/docker/docker/api/types/network"
-	"github.com/docker/docker/client"
+	"github.com/containerd/errdefs"
+	"github.com/dustin/go-humanize"
+	"github.com/goccy/go-json"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/mount"
+	"github.com/moby/moby/api/types/network"
+	"github.com/moby/moby/client"
+	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
@@ -25,6 +29,23 @@ import (
 )
 
 var ErrNotAttached = errors.Sentinel("not attached to instance")
+
+// ErrCommandControlCharacters is returned when a command sent to a server
+// contains control characters.
+var ErrCommandControlCharacters = errors.Sentinel("environment/docker: command contains control characters")
+
+// ErrCommandWriteTimeout is returned when a command cannot be sent to a server
+// process in time, either because another command held the send lock for the
+// whole window or the write itself blocked on a process that never reads its
+// input. It wraps context.DeadlineExceeded so that a stop command that times
+// out here is still recognised by WaitForStop, which only runs its forced
+// SIGKILL fallback for a deadline-exceeded error; otherwise a stuck stop would
+// leave the container running in the stopping state and crash detection off.
+var ErrCommandWriteTimeout = fmt.Errorf("environment/docker: timed out waiting to send command to container: %w", context.DeadlineExceeded)
+
+// commandWriteTimeout is the amount of time allowed for a command to be written
+// to the input of a server process.
+var commandWriteTimeout = time.Second * 10
 
 // A custom console writer that allows us to keep a function blocked until the
 // given stream is properly closed. This does nothing special, only exists to
@@ -51,7 +72,7 @@ func (e *Environment) Attach(ctx context.Context) error {
 		return nil
 	}
 
-	opts := container.AttachOptions{
+	opts := client.ContainerAttachOptions{
 		Stdin:  true,
 		Stdout: true,
 		Stderr: true,
@@ -62,7 +83,7 @@ func (e *Environment) Attach(ctx context.Context) error {
 	if st, err := e.client.ContainerAttach(ctx, e.Id, opts); err != nil {
 		return errors.WrapIf(err, "environment/docker: error while attaching to container")
 	} else {
-		e.SetStream(&st)
+		e.SetStream(&st.HijackedResponse)
 	}
 
 	go func() {
@@ -73,8 +94,15 @@ func (e *Environment) Attach(ctx context.Context) error {
 		defer cancel()
 		defer e.stream.Close()
 		defer func() {
-			e.SetState(environment.ProcessOfflineState)
 			e.SetStream(nil)
+			// The stream can end without the container stopping, in which case it is
+			// attached to again rather than treating the server as stopped. A server
+			// marked as stopped while its container keeps running would no longer be
+			// managed, and its disk limit would not be enforced.
+			if e.reattach() {
+				return
+			}
+			e.SetState(environment.ProcessOfflineState)
 		}()
 
 		go func() {
@@ -100,6 +128,109 @@ func (e *Environment) Attach(ctx context.Context) error {
 	return nil
 }
 
+// reattach is called when the attached stream ends, and attaches to the
+// container again if it is still running, returning true if the container is
+// still running. If that keeps happening, or attaching fails, the container is
+// terminated rather than left running without being managed. Once it is known
+// to have stopped, false is returned so that the server is marked offline. This
+// also covers a container that disappeared, for which Terminate leaves the state
+// unchanged.
+func (e *Environment) reattach() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
+	defer cancel()
+
+	c, err := e.inspectForReattach(ctx)
+	if err != nil {
+		// The container is gone, so the server really did stop.
+		if errdefs.IsNotFound(err) {
+			return false
+		}
+		// The inspect kept failing, so whether the container is running is unknown.
+		// Terminating it is safer than marking a possibly-running container offline,
+		// which would stop its disk limit from being enforced.
+		e.log().WithField("error", err).Error("could not inspect container after losing its stream, terminating it")
+		e.terminateUnmanaged()
+		return false
+	}
+	if c.State == nil || !c.State.Running {
+		return false
+	}
+
+	e.mu.Lock()
+	if time.Since(e.reattachedAt) > time.Minute*5 {
+		e.reattachedAt = time.Now()
+		e.reattachedCount = 0
+	}
+	e.reattachedCount++
+	count := e.reattachedCount
+	e.mu.Unlock()
+
+	if count <= 3 {
+		e.log().Warn("lost the attached stream for a running container, attaching again")
+		err := e.Attach(ctx)
+		if err == nil {
+			return true
+		}
+		// The container may have only just stopped, or been removed, in which case
+		// it is handled like any other stop so that crash detection still applies.
+		if c, ierr := e.ContainerInspect(ctx); errdefs.IsNotFound(ierr) || (ierr == nil && c.State != nil && !c.State.Running) {
+			return false
+		}
+		e.log().WithField("error", err).Error("failed to attach to running container")
+	}
+
+	e.log().Error("unable to stay attached to running container, terminating it")
+	e.terminateUnmanaged()
+	return false
+}
+
+// inspectForReattach inspects the container, retrying a transient error a few
+// times so that a single failed inspect does not decide the container stopped.
+func (e *Environment) inspectForReattach(ctx context.Context) (container.InspectResponse, error) {
+	var c container.InspectResponse
+	var err error
+	for attempt := 0; attempt < 3; attempt++ {
+		if c, err = e.ContainerInspect(ctx); err == nil || errdefs.IsNotFound(err) {
+			return c, err
+		}
+		select {
+		case <-ctx.Done():
+			return c, err
+		case <-time.After(time.Second):
+		}
+	}
+	return c, err
+}
+
+// terminateUnmanagedMaxBackoff is the longest terminateUnmanaged waits between
+// attempts to kill the container.
+const terminateUnmanagedMaxBackoff = 30 * time.Second
+
+// terminateUnmanaged SIGKILLs a container that can no longer be managed, and
+// only returns once the container is known to have stopped or to no longer
+// exist. Docker may be unresponsive for a while, so the kill is retried with a
+// backoff, each attempt with a fresh timeout since attaching may have used up
+// the time allowed by the caller's context.
+//
+// It never gives up: marking the server offline while its container may still
+// be running would leave it without a console, stats or disk limit, and treating
+// it as running would do the same. Until the kill succeeds, the server stays in
+// the stopping state that Terminate sets before it sends the signal.
+func (e *Environment) terminateUnmanaged() {
+	backoff := time.Second
+	for attempt := 1; ; attempt++ {
+		tctx, tcancel := context.WithTimeout(context.Background(), time.Second*30)
+		err := e.Terminate(tctx, "SIGKILL")
+		tcancel()
+		if err == nil {
+			return
+		}
+		e.log().WithField("error", err).WithField("attempt", attempt).Error("failed to terminate container that could not be managed, retrying")
+		time.Sleep(backoff)
+		backoff = min(backoff*2, terminateUnmanagedMaxBackoff)
+	}
+}
+
 // InSituUpdate performs an in-place update of the Docker container's resource
 // limits without actually making any changes to the operational state of the
 // container. This allows memory, cpu, and IO limitations to be adjusted on the
@@ -108,28 +239,36 @@ func (e *Environment) InSituUpdate() error {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
 	defer cancel()
 
-	if _, err := e.ContainerInspect(ctx); err != nil {
+	c, err := e.ContainerInspect(ctx)
+	if err != nil {
 		// If the container doesn't exist for some reason there really isn't anything
 		// we can do to fix that in this process (it doesn't make sense at least). In those
 		// cases just return without doing anything since we still want to save the configuration
 		// to the disk.
 		//
 		// We'll let a boot process make modifications to the container if needed at this point.
-		if client.IsErrNotFound(err) {
+		if errdefs.IsNotFound(err) {
 			return nil
 		}
 		return errors.Wrap(err, "environment/docker: could not inspect container")
+	}
+
+	// The kernel rejects a CFS quota lower than the current burst, so remove the
+	// burst before updating the limits and re-apply it afterwards.
+	if c.State != nil {
+		e.clearCpuBurst(c.ID, c.State.Pid)
 	}
 
 	// CPU pinning cannot be removed once it is applied to a container. The same is true
 	// for removing memory limits, a container must be re-created.
 	//
 	// @see https://github.com/moby/moby/issues/41946
-	if _, err := e.client.ContainerUpdate(ctx, e.Id, container.UpdateConfig{
-		Resources: e.Configuration.Limits().AsContainerResources(),
+	if _, err := e.client.ContainerUpdate(ctx, e.Id, client.ContainerUpdateOptions{
+		Resources: new(e.Configuration.Limits().AsContainerResources()),
 	}); err != nil {
 		return errors.Wrap(err, "environment/docker: could not update container")
 	}
+	e.applyCpuBurst(ctx)
 	return nil
 }
 
@@ -144,7 +283,7 @@ func (e *Environment) Create() error {
 	// container anyways.
 	if _, err := e.ContainerInspect(ctx); err == nil {
 		return nil
-	} else if !client.IsErrNotFound(err) {
+	} else if !errdefs.IsNotFound(err) {
 		return errors.WrapIf(err, "environment/docker: failed to inspect container")
 	}
 
@@ -156,6 +295,16 @@ func (e *Environment) Create() error {
 	cfg := config.Get()
 	a := e.Configuration.Allocations()
 	evs := e.Configuration.EnvironmentVariables()
+
+	portBindings, err := a.DockerBindings()
+	if err != nil {
+		return errors.WithStackIf(err)
+	}
+	// Ports DockerBindings removes (ISPN loopback-only) are not exposed either.
+	exposedPorts := network.PortSet{}
+	for port := range portBindings {
+		exposedPorts[port] = struct{}{}
+	}
 
 	// If port is 0 then we have a server with no allocation and this should stay 127.0.0.1 and not the docker network interface ip.
 	if a.DefaultMapping.Port != 0 {
@@ -186,7 +335,7 @@ func (e *Environment) Create() error {
 		AttachStderr: true,
 		OpenStdin:    true,
 		Tty:          true,
-		ExposedPorts: a.Exposed(),
+		ExposedPorts: exposedPorts,
 		Image:        strings.TrimPrefix(e.meta.Image, "~"),
 		Env:          e.Configuration.EnvironmentVariables(),
 		Labels:       labels,
@@ -208,12 +357,12 @@ func (e *Environment) Create() error {
 			networkName := "ip-" + strings.ReplaceAll(strings.ReplaceAll(a.DefaultMapping.Ip, ".", "-"), ":", "-")
 			networkMode = container.NetworkMode(networkName)
 
-			if _, err := e.client.NetworkInspect(ctx, networkName, network.InspectOptions{}); err != nil {
-				if !client.IsErrNotFound(err) {
+			if _, err := e.client.NetworkInspect(ctx, networkName, client.NetworkInspectOptions{}); err != nil {
+				if !errdefs.IsNotFound(err) {
 					return err
 				}
 
-				if _, err := e.client.NetworkCreate(ctx, networkName, network.CreateOptions{
+				if _, err := e.client.NetworkCreate(ctx, networkName, client.NetworkCreateOptions{
 					Driver:     "bridge",
 					EnableIPv6: &enableIPv6,
 					Internal:   false,
@@ -235,7 +384,7 @@ func (e *Environment) Create() error {
 	}
 
 	hostConf := &container.HostConfig{
-		PortBindings: a.DockerBindings(),
+		PortBindings: portBindings,
 
 		// Configure the mounts for this container. First mount the server data directory
 		// into the container as an r/w bind.
@@ -251,7 +400,7 @@ func (e *Environment) Create() error {
 		// from the Panel.
 		Resources: e.Configuration.Limits().AsContainerResources(),
 
-		DNS: cfg.Docker.Network.Dns,
+		DNS: cfg.Docker.Network.DnsAddrs(),
 
 		// Configure logging for the container to make it easier on the Daemon to grab
 		// the server output. Ensure that we don't use too much space on the host machine
@@ -270,25 +419,23 @@ func (e *Environment) Create() error {
 		UsernsMode:  container.UsernsMode(cfg.Docker.UsernsMode),
 	}
 
-	var netConf *network.NetworkingConfig = nil //In case when no networking config is needed set nil
-	var serverNetConfig = config.Get().Docker.Network
-	if "macvlan" == serverNetConfig.Driver { //Generate networking config for macvlan driver
-		var defaultMapping = e.Config().Allocations().DefaultMapping
+	var netConf *network.NetworkingConfig // nil when no networking config is needed
+	if serverNetConfig := config.Get().Docker.Network; serverNetConfig.Driver == "macvlan" {
+		defaultMapping := e.Config().Allocations().DefaultMapping
 		e.log().Debug("Set macvlan " + serverNetConfig.Name + " IP to " + defaultMapping.Ip)
-		netConf = &network.NetworkingConfig{
-			EndpointsConfig: map[string]*network.EndpointSettings{
-				serverNetConfig.Name: { //Get network name from wings config
-					IPAMConfig: &network.EndpointIPAMConfig{
-						IPv4Address: defaultMapping.Ip,
-					},
-					IPAddress: defaultMapping.Ip, //Use default mapping ip address (wings support only one network per server)
-					Gateway:   serverNetConfig.Interfaces.V4.Gateway,
-				},
-			},
+		nc, err := MacvlanNetworkingConfig(serverNetConfig.Name, defaultMapping.Ip, serverNetConfig.Interfaces.V4.Gateway)
+		if err != nil {
+			return err
 		}
+		netConf = nc
 	}
 	// Pass the networkings configuration or nil if none required
-	if _, err := e.client.ContainerCreate(ctx, conf, hostConf, netConf, nil, e.Id); err != nil {
+	if _, err := e.client.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Config:           conf,
+		HostConfig:       hostConf,
+		NetworkingConfig: netConf,
+		Name:             e.Id,
+	}); err != nil {
 		return errors.Wrap(err, "environment/docker: failed to create container")
 	}
 
@@ -301,7 +448,7 @@ func (e *Environment) Destroy() error {
 	// We set it to stopping than offline to prevent crash detection from being triggered.
 	e.SetState(environment.ProcessStoppingState)
 
-	err := e.client.ContainerRemove(context.Background(), e.Id, container.RemoveOptions{
+	_, err := e.client.ContainerRemove(context.Background(), e.Id, client.ContainerRemoveOptions{
 		RemoveVolumes: true,
 		RemoveLinks:   false,
 		Force:         true,
@@ -313,7 +460,7 @@ func (e *Environment) Destroy() error {
 	// exist on the system. We're just a step ahead of ourselves in that case.
 	//
 	// @see https://github.com/pterodactyl/panel/issues/2001
-	if err != nil && client.IsErrNotFound(err) {
+	if err != nil && errdefs.IsNotFound(err) {
 		return nil
 	}
 
@@ -324,30 +471,87 @@ func (e *Environment) Destroy() error {
 // instance. There is no confirmation that this data is sent successfully, only
 // that it gets pushed into the stdin.
 func (e *Environment) SendCommand(c string) error {
-	if !e.IsAttached() {
-		return errors.Wrap(ErrNotAttached, "environment/docker: cannot send command to container")
+	// The container has a TTY, so control characters are interpreted rather than
+	// passed to the process: ^C, ^\ and ^Z would signal the process directly.
+	// Commands may not contain them, other than tabs and line endings.
+	if strings.ContainsFunc(c, func(r rune) bool {
+		return (r < 0x20 && r != '\t' && r != '\n' && r != '\r') || r == 0x7f
+	}) {
+		return ErrCommandControlCharacters
 	}
 
+	// Only one command may set the deadline and write at a time; otherwise a
+	// second command could push the deadline forward for a write that is already
+	// blocked, keeping it alive indefinitely. Bound how long a command waits for
+	// its turn, so that commands do not queue without limit behind a write that is
+	// stuck because the process never reads its input (the HTTP command and stop
+	// paths are not rate limited like the websocket). Taking the lock before
+	// reading the stream also means a command that waited here, for example while
+	// the stream was being replaced during console recovery, writes to the current
+	// stream rather than one that has since been closed.
+	deadline := time.Now().Add(commandWriteTimeout)
+	for !e.sendMu.TryLock() {
+		if time.Now().After(deadline) {
+			return ErrCommandWriteTimeout
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	defer e.sendMu.Unlock()
+
 	e.mu.RLock()
-	defer e.mu.RUnlock()
+	stream := e.stream
+	stop := e.meta.Stop
+	e.mu.RUnlock()
+	if stream == nil {
+		return errors.Wrap(ErrNotAttached, "environment/docker: cannot send command to container")
+	}
 
 	// If the command being processed is the same as the process stop command then we
 	// want to mark the server as entering the stopping state otherwise the process will
 	// stop and Wings will think it has crashed and attempt to restart it.
-	if e.meta.Stop.Type == "command" && c == e.meta.Stop.Value {
+	if stop.Type == "command" && containsStopCommand(c, stop.Value) {
 		e.SetState(environment.ProcessStoppingState)
 	}
 
-	_, err := e.stream.Conn.Write([]byte(c + "\n"))
+	// The process may never read its input, so don't wait forever for there to be
+	// room for the command.
+	_ = stream.Conn.SetWriteDeadline(time.Now().Add(commandWriteTimeout))
+	if _, err := stream.Conn.Write([]byte(c + "\n")); err != nil {
+		// A write that hit the deadline must carry the same timeout identity as
+		// the admission wait above, so that a stuck stop command still trips
+		// WaitForStop's forced-termination fallback.
+		if errors.Is(err, os.ErrDeadlineExceeded) {
+			return ErrCommandWriteTimeout
+		}
+		return errors.Wrap(err, "environment/docker: could not write to container stream")
+	}
 
-	return errors.Wrap(err, "environment/docker: could not write to container stream")
+	return nil
+}
+
+// containsStopCommand reports whether any line of the command is the stop
+// command. A command can hold several lines, each of which the process reads as
+// its own command, so "x\nstop" stops the server just as "stop" does.
+func containsStopCommand(c, stop string) bool {
+	if stop == "" {
+		return false
+	}
+	if c == stop {
+		return true
+	}
+	for _, line := range strings.FieldsFunc(c, func(r rune) bool { return r == '\n' || r == '\r' }) {
+		if line == stop {
+			return true
+		}
+	}
+	return false
 }
 
 // Readlog reads the log file for the server. This does not care if the server
 // is running or not, it will simply try to read the last X bytes of the file
 // and return them.
 func (e *Environment) Readlog(lines int) ([]string, error) {
-	r, err := e.client.ContainerLogs(context.Background(), e.Id, container.LogsOptions{
+	r, err := e.client.ContainerLogs(context.Background(), e.Id, client.ContainerLogsOptions{
 		ShowStdout: true,
 		ShowStderr: true,
 		Tail:       strconv.Itoa(lines),
@@ -395,8 +599,10 @@ func (e *Environment) ensureImageExists(image string) error {
 		log.WithField("registry", registry).Debug("using authentication for registry")
 	}
 
-	// Get the ImagePullOptions.
-	imagePullOptions := dockerImage.PullOptions{All: false, Platform: runtime.GOOS + "/" + runtime.GOARCH}
+	imagePullOptions := client.ImagePullOptions{
+		All:       false,
+		Platforms: []ocispec.Platform{{OS: runtime.GOOS, Architecture: runtime.GOARCH}},
+	}
 	if registryAuth != nil {
 		b64, err := registryAuth.Base64()
 		if err != nil {
@@ -407,25 +613,22 @@ func (e *Environment) ensureImageExists(image string) error {
 		imagePullOptions.RegistryAuth = b64
 	}
 
-	out, err := e.client.ImagePull(ctx, image, imagePullOptions)
-	if err != nil {
-		images, ierr := e.client.ImageList(ctx, dockerImage.ListOptions{})
-		if ierr != nil {
-			// Well damn, something has gone really wrong here, just go ahead and abort there
-			// isn't much anything we can do to try and self-recover from this.
-			return errors.Wrap(ierr, "environment/docker: failed to list images")
+	fallbackToLocal := func(pullErr error) error {
+		images, err := e.client.ImageList(ctx, client.ImageListOptions{})
+		if err != nil {
+			return errors.Wrap(err, "environment/docker: failed to list images")
 		}
 
-		for _, img := range images {
-			for _, t := range img.RepoTags {
-				if t != image {
+		for _, img := range images.Items {
+			for _, tag := range img.RepoTags {
+				if tag != image {
 					continue
 				}
 
 				log.WithFields(log.Fields{
 					"image":        image,
 					"container_id": e.Id,
-					"err":          err.Error(),
+					"err":          pullErr.Error(),
 				}).Warn("unable to pull requested image from remote source, however the image exists locally")
 
 				// Okay, we found a matching container image, in that case just go ahead and return
@@ -434,30 +637,49 @@ func (e *Environment) ensureImageExists(image string) error {
 			}
 		}
 
-		return errors.Wrapf(err, "environment/docker: failed to pull \"%s\" image for server", image)
+		return errors.Wrapf(pullErr, "environment/docker: failed to pull %q image for server", image)
+	}
+
+	out, err := e.client.ImagePull(ctx, image, imagePullOptions)
+	if err != nil {
+		return fallbackToLocal(err)
 	}
 	defer out.Close()
 
 	log.WithField("image", image).Debug("pulling docker image... this could take a bit of time")
 
-	// I'm not sure what the best approach here is, but this will block execution until the image
-	// is done being pulled, which is what we need.
-	scanner := bufio.NewScanner(out)
+	decoder := json.NewDecoder(out)
+	for {
+		var msg imagePullMessage
+		if err := decoder.Decode(&msg); err != nil {
+			if errors.Cause(err) == io.EOF || err == io.EOF {
+				break
+			}
+			return errors.Wrap(err, "environment/docker: failed to read image pull progress")
+		}
 
-	for scanner.Scan() {
-		b := scanner.Bytes()
-		status, _ := jsonparser.GetString(b, "status")
-		progress, _ := jsonparser.GetString(b, "progress")
+		if msg.ErrorDetail != nil && msg.ErrorDetail.Message != "" {
+			return fallbackToLocal(fmt.Errorf("%s", msg.ErrorDetail.Message))
+		}
+		if msg.Error != "" {
+			return fallbackToLocal(fmt.Errorf("%s", msg.Error))
+		}
+		if msg.ErrorDetail != nil {
+			return fallbackToLocal(fmt.Errorf("image pull failed without an error message"))
+		}
 
-		e.Events().Publish(environment.DockerImagePullStatus, status+" "+progress)
-	}
+		progress := msg.Progress
+		if p := msg.ProgressDetail; p != nil {
+			progress = formatDockerProgress(p.Current, p.Total, p.Units)
+		}
 
-	if err := scanner.Err(); err != nil {
-		return err
+		status := strings.TrimSpace(strings.Join([]string{msg.ID, msg.Status, progress}, " "))
+		if status != "" {
+			e.Events().Publish(environment.DockerImagePullStatus, status)
+		}
 	}
 
 	log.WithField("image", image).Debug("completed docker image pull")
-
 	return nil
 }
 
@@ -473,4 +695,82 @@ func (e *Environment) convertMounts() []mount.Mount {
 		}
 	}
 	return out
+}
+
+type imagePullMessage struct {
+	ID             string `json:"id"`
+	Status         string `json:"status"`
+	Progress       string `json:"progress"` // Fallback for older daemons
+	ProgressDetail *struct {
+		Current int64  `json:"current"`
+		Total   int64  `json:"total"`
+		Units   string `json:"units"`
+	} `json:"progressDetail"`
+	Error       string `json:"error"`
+	ErrorDetail *struct {
+		Message string `json:"message"`
+	} `json:"errorDetail"`
+}
+
+func formatDockerProgress(current, total int64, units string) string {
+	const width = 30
+
+	if current < 0 {
+		current = 0
+	}
+
+	if units == "s" {
+		return fmt.Sprintf("%ds elapsed", current)
+	}
+	if units != "" && units != "bytes" {
+		return fmt.Sprintf("%d %s", current, units)
+	}
+	if total <= 0 {
+		if current > 0 {
+			return humanize.IBytes(uint64(current))
+		}
+		return ""
+	}
+	if current > total {
+		current = total
+	}
+
+	ratio := float64(current) / float64(total)
+	filled := int(ratio * width)
+	bar := strings.Repeat("=", filled)
+	if filled < width {
+		bar += ">" + strings.Repeat(" ", width-filled-1)
+	}
+
+	return fmt.Sprintf("[%s] %d%% (%s/%s)",
+		bar, int(ratio*100),
+		humanize.IBytes(uint64(current)),
+		humanize.IBytes(uint64(total)),
+	)
+}
+
+// MacvlanNetworkingConfig returns the endpoint configuration that pins a
+// container to ip on the named macvlan network. Wings only supports a single
+// network per server, so the server's default allocation IP is used.
+func MacvlanNetworkingConfig(networkName, ip, gateway string) (*network.NetworkingConfig, error) {
+	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if err != nil {
+		return nil, errors.Wrapf(err, "environment/docker: invalid macvlan IP address %q", ip)
+	}
+
+	settings := &network.EndpointSettings{
+		IPAMConfig: &network.EndpointIPAMConfig{IPv4Address: addr},
+		IPAddress:  addr,
+	}
+	if gateway = strings.TrimSpace(gateway); gateway != "" {
+		gw, err := netip.ParseAddr(gateway)
+		if err != nil {
+			return nil, errors.Wrapf(err, "environment/docker: invalid macvlan gateway %q", gateway)
+		}
+		settings.Gateway = gw
+	}
+
+	return &network.NetworkingConfig{
+		EndpointsConfig: map[string]*network.EndpointSettings{networkName: settings},
+	}, nil
 }

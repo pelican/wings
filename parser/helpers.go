@@ -7,7 +7,6 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
-	"github.com/buger/jsonparser"
 	"github.com/iancoleman/strcase"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -34,6 +33,20 @@ var configMatchRegex = regexp.MustCompile(`{{\s?config\.([\w.-]+)\s?}}`)
 //
 // noinspection RegExpRedundantEscape
 var xmlValueMatchRegex = regexp.MustCompile(`^\[([\w]+)='(.*)'\]$`)
+
+// jsonNumberRegex matches a canonical JSON number exactly as defined by the JSON
+// grammar. We deliberately use this instead of gjson.Parse/json.Valid, which
+// accept lax forms such as "007", "+5", "1.20.1" or "25565x". A value is only
+// written unquoted via sjson.SetRaw when it matches this pattern, guaranteeing
+// the result is valid JSON and the exact literal (including large integers) is
+// preserved.
+var jsonNumberRegex = regexp.MustCompile(`^-?(?:0|[1-9]\d*)(?:\.\d+)?(?:[eE][+-]?\d+)?$`)
+
+// isJSONNumber reports whether s is a canonical JSON number that is safe to write
+// unquoted into a document.
+func isJSONNumber(s string) bool {
+	return jsonNumberRegex.MatchString(s)
+}
 
 // Iterate over an unstructured JSON/YAML/etc. interface and set all of the required
 // key/value pairs for the configuration file.
@@ -156,34 +169,39 @@ func (cfr *ConfigurationFileReplacement) setValueWithSjson(jsonStr string, path 
 	}
 
 	var setValue interface{}
-	if cfr.ReplaceWith.Type() == jsonparser.Boolean {
+	switch {
+	case cfr.ReplaceWith.Type() == BooleanValue:
 		// Explicit boolean type declared in the egg definition.
-		v, err := strconv.ParseBool(value)
-		if err != nil {
-			log.WithFields(log.Fields{"value": value, "path": path, "match": cfr.Match}).Warn("cannot parse replacement as boolean, falling back to string value")
-			return sjson.Set(jsonStr, path, value)
-		}
-		setValue = v
-	} else {
-		// Mirror the type already present in the document so booleans and numbers
-		// survive template expansion (panel always sends values as JSON strings).
+		return cfr.setBool(jsonStr, path, value)
+	case cfr.ReplaceWith.Type() == NumberValue:
+		// Explicit numeric type declared in the egg definition.
+		return cfr.setNumber(jsonStr, path, value)
+	default:
+		// The panel expands template variables and sends every value as a JSON
+		// string, so mirror the type already present in the document where possible
+		// to keep booleans and numbers unquoted.
 		existing := gjson.Get(jsonStr, path)
-		switch existing.Type {
-		case gjson.True, gjson.False:
-			v, err := strconv.ParseBool(value)
-			if err != nil {
-				log.WithFields(log.Fields{"value": value, "path": path, "match": cfr.Match}).Warn("cannot parse replacement as boolean, falling back to string value")
-				return sjson.Set(jsonStr, path, value)
-			}
-			setValue = v
-		case gjson.Number:
+		switch {
+		case existing.Type == gjson.True || existing.Type == gjson.False:
+			return cfr.setBool(jsonStr, path, value)
+		case existing.Type == gjson.Number && isJSONNumber(value):
 			// Write the numeric literal as-is via SetRaw to avoid float64 precision
-			// loss for large integers (> 2^53). Fall back to string if the incoming
-			// value is not a valid JSON number.
-			if gjson.Parse(value).Type == gjson.Number {
+			// loss for large integers (> 2^53).
+			return sjson.SetRaw(jsonStr, path, value)
+		case !existing.Exists():
+			// The key does not exist yet. This is the common case when a server is
+			// first created and its configuration file is generated from scratch:
+			// there is no existing type to mirror. Infer the natural type from the
+			// value itself so numeric values such as ports are written unquoted
+			// (e.g. `server-port: 25565` instead of `server-port: "25565"`).
+			switch {
+			case value == "true" || value == "false":
+				setValue = value == "true"
+			case isJSONNumber(value):
 				return sjson.SetRaw(jsonStr, path, value)
+			default:
+				setValue = value
 			}
-			setValue = value
 		default:
 			setValue = value
 		}
@@ -192,12 +210,37 @@ func (cfr *ConfigurationFileReplacement) setValueWithSjson(jsonStr string, path 
 	return sjson.Set(jsonStr, path, setValue)
 }
 
+// setBool parses value as a boolean and writes it to path unquoted. If value is
+// not a valid boolean it logs a warning and falls back to writing the raw string,
+// keeping the explicit-type and mirror-existing-type boolean paths in sync.
+func (cfr *ConfigurationFileReplacement) setBool(jsonStr, path, value string) (string, error) {
+	v, err := strconv.ParseBool(value)
+	if err != nil {
+		log.WithFields(log.Fields{"value": value, "path": path, "match": cfr.Match}).Warn("cannot parse replacement as boolean, falling back to string value")
+		return sjson.Set(jsonStr, path, value)
+	}
+	return sjson.Set(jsonStr, path, v)
+}
+
+// setNumber writes a canonical JSON number to path unquoted via SetRaw to avoid
+// float64 precision loss for large integers (> 2^53). If value is not a canonical
+// JSON number it logs a warning and falls back to writing the raw string, so a
+// misconfigured egg that declares a numeric type for a non-numeric value is
+// diagnosable (mirroring setBool).
+func (cfr *ConfigurationFileReplacement) setNumber(jsonStr, path, value string) (string, error) {
+	if !isJSONNumber(value) {
+		log.WithFields(log.Fields{"value": value, "path": path, "match": cfr.Match}).Warn("cannot parse replacement as number, falling back to string value")
+		return sjson.Set(jsonStr, path, value)
+	}
+	return sjson.SetRaw(jsonStr, path, value)
+}
+
 // Looks up a configuration value on the Daemon given a dot-notated syntax.
 func (f *ConfigurationFile) LookupConfigurationValue(cfr ConfigurationFileReplacement) (result string, err error) {
 	// If this is not something that we can do a regex lookup on then just continue
 	// on our merry way. If the value isn't a string, we're not going to be doing anything
 	// with it anyways.
-	if cfr.ReplaceWith.Type() != jsonparser.String || !configMatchRegex.Match(cfr.ReplaceWith.Value()) {
+	if cfr.ReplaceWith.Type() != StringValue || !configMatchRegex.Match(cfr.ReplaceWith.Value()) {
 		return cfr.ReplaceWith.String(), nil
 	}
 
@@ -216,22 +259,24 @@ func (f *ConfigurationFile) LookupConfigurationValue(cfr ConfigurationFileReplac
 		}
 
 		// Look for the key in the Wings configuration and substitute the placeholder.
-		match, dataType, _, err := jsonparser.Get(f.configuration, path...)
-		if err != nil {
-			if err != jsonparser.KeyPathNotFoundError {
-				return placeholder
-			}
+		// The parts come from strcase.ToSnake on [\w.-] input, so they never
+		// contain gjson path syntax and can be joined without escaping.
+		match := gjson.GetBytes(f.configuration, strings.Join(path, "."))
+		if !match.Exists() {
 			log.WithFields(log.Fields{"path": path, "filename": f.FileName}).Debug("attempted to load a configuration value that does not exist")
 			// Leave placeholder intact so the misconfiguration is visible.
 			return placeholder
 		}
 
 		// Only substitute scalar values, not whole objects or arrays.
-		if dataType == jsonparser.Object || dataType == jsonparser.Array {
+		if match.IsObject() || match.IsArray() {
 			return placeholder
 		}
 
-		return string(match)
+		if match.Type == gjson.String {
+			return match.Str
+		}
+		return match.Raw
 	})
 
 	return result, err

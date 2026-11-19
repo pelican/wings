@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 
 	"github.com/apex/log"
 	"github.com/gin-gonic/gin"
@@ -167,6 +168,14 @@ func postCreateServer(c *gin.Context) {
 		return
 	}
 
+	// A server can only exist once on an instance.
+	if _, ok := manager.Get(details.UUID); ok {
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "A server with this identifier already exists on this instance.",
+		})
+		return
+	}
+
 	install, err := installer.New(c.Request.Context(), manager, details)
 	if err != nil {
 		if installer.IsValidationError(err) {
@@ -182,7 +191,13 @@ func postCreateServer(c *gin.Context) {
 
 	// Plop that server instance onto the request so that it can be referenced in
 	// requests from here-on out.
-	manager.Add(install.Server())
+	if !manager.AddIfMissing(install.Server()) {
+		install.Server().Discard()
+		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+			"error": "A server with this identifier already exists on this instance.",
+		})
+		return
+	}
 
 	// Begin the installation process in the background to not block the request
 	// cycle. If there are any errors they will be logged and communicated back
@@ -219,8 +234,20 @@ type postUpdateConfigurationResponse struct {
 	Applied bool `json:"applied"`
 }
 
+// updateConfigMu serializes the whole configuration update, from reading the
+// current config through writing it to disk, setting it globally and rotating
+// the Panel client credentials. Without it, overlapping requests can leave the
+// global config on one token while the shared client uses another.
+var updateConfigMu sync.Mutex
+
+// maxPanelConfigurationSize is the largest configuration update that is read
+// from the Panel.
+const maxPanelConfigurationSize = 1 << 20
+
 // Updates the running configuration for this Wings instance.
 func postUpdateConfiguration(c *gin.Context) {
+	updateConfigMu.Lock()
+	defer updateConfigMu.Unlock()
 	cfg := config.Get()
 
 	if cfg.IgnorePanelConfigUpdates {
@@ -230,7 +257,18 @@ func postUpdateConfiguration(c *gin.Context) {
 		return
 	}
 
-	if err := c.BindJSON(&cfg); err != nil {
+	// Only the values the Panel is allowed to set are read from the request, and
+	// all of them are validated before anything is applied (GHSA-8rw4-fw83-3rv7).
+	// Values missing from the request keep their current value.
+	c.Request.Body = http.MaxBytesReader(c.Writer, c.Request.Body, maxPanelConfigurationSize)
+	var update config.PanelConfiguration
+	if err := c.BindJSON(&update); err != nil {
+		return
+	}
+	if err := update.Validate(); err != nil {
+		c.AbortWithStatusJSON(http.StatusUnprocessableEntity, gin.H{
+			"error": "The configuration provided by the Panel is not valid: " + err.Error(),
+		})
 		return
 	}
 
@@ -239,10 +277,34 @@ func postUpdateConfiguration(c *gin.Context) {
 	// want to override that.
 	//
 	// If you pass through manual locations in the API call this logic will be skipped.
-	if strings.HasPrefix(cfg.Api.Ssl.KeyFile, "/etc/letsencrypt/live/") {
-		cfg.Api.Ssl.KeyFile = config.Get().Api.Ssl.KeyFile
-		cfg.Api.Ssl.CertificateFile = config.Get().Api.Ssl.CertificateFile
+	if v := update.Api.Ssl.KeyFile; v != nil && strings.HasPrefix(*v, "/etc/letsencrypt/live/") {
+		update.Api.Ssl.KeyFile = nil
+		update.Api.Ssl.CertificateFile = nil
 	}
+	cfg.ApplyPanelConfiguration(update)
+
+	// The token that everything authenticates against is a derived value that is
+	// not part of the payload sent by the Panel, so it has to be re-resolved from
+	// the new token values.
+	if err := cfg.ResolveToken(true); err != nil {
+		if !errors.Is(err, config.ErrTokenEnvMismatch) {
+			middleware.CaptureAndAbort(c, err)
+			return
+		}
+		// An environment override pins the credentials and keeps winning at
+		// runtime. Rejecting the push would leave the Panel and Wings permanently
+		// out of sync after a token reset, so accept and persist the Panel's
+		// configuration and tell the operator that the override is stale.
+		log.WithField("error", err).Warn("the Panel pushed a token that differs from the WINGS_TOKEN/WINGS_TOKEN_ID environment override; the override is still in use, update or remove it to use the new token")
+	}
+
+	// Refuse to go any further with a token we could never authenticate against.
+	if cfg.Token.ID == "" || cfg.Token.Token == "" {
+		middleware.CaptureAndAbort(c, errors.New("config: refusing to apply an update with an empty authentication token"))
+		return
+	}
+
+	tokenId, token := cfg.Token.ID, cfg.Token.Token
 
 	// Try to write this new configuration to the disk before updating our global
 	// state with it.
@@ -253,6 +315,11 @@ func postUpdateConfiguration(c *gin.Context) {
 	// Since we wrote it to the disk successfully now update the global configuration
 	// state to use this new configuration struct.
 	config.Set(cfg)
+
+	// Requests we make back to the Panel use credentials that were captured when
+	// the client was created at boot, so they have to be rotated explicitly.
+	middleware.ExtractManager(c).Client().SetCredentials(tokenId, token)
+
 	c.JSON(http.StatusOK, postUpdateConfigurationResponse{
 		Applied: true,
 	})
@@ -268,19 +335,21 @@ func postDeauthorizeUser(c *gin.Context) {
 		return
 	}
 
-	// todo: disconnect websockets more gracefully
 	m := middleware.ExtractManager(c)
+	// Deny the user's tokens before disconnecting them, so that a reconnect racing
+	// the disconnect cannot authenticate with a token issued before the revocation.
 	if len(data.Servers) > 0 {
 		for _, uuid := range data.Servers {
 			if s, ok := m.Get(uuid); ok {
-				s.Websockets().CancelAll()
-				s.Sftp().Cancel(data.User)
 				tokens.DenyForServer(s.ID(), data.User)
+				s.Websockets().CancelUser(data.User)
+				s.Sftp().Cancel(data.User)
 			}
 		}
 	} else {
 		for _, s := range m.All() {
-			s.Websockets().CancelAll()
+			tokens.DenyForServer(s.ID(), data.User)
+			s.Websockets().CancelUser(data.User)
 			s.Sftp().Cancel(data.User)
 		}
 	}

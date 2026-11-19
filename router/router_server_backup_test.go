@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -19,6 +20,7 @@ import (
 	"github.com/pelican/wings/internal/models"
 	"github.com/pelican/wings/remote"
 	wserver "github.com/pelican/wings/server"
+	"github.com/pelican/wings/server/filesystem"
 )
 
 func init() {
@@ -27,6 +29,7 @@ func init() {
 
 type backupTestRemoteClient struct {
 	restoreStatus chan string
+	credentials   chan [2]string
 }
 
 func (c backupTestRemoteClient) GetBackupRemoteUploadURLs(context.Context, string, int64) (remote.BackupRemoteUploadResponse, error) {
@@ -83,9 +86,14 @@ func (c backupTestRemoteClient) SendActivityLogs(context.Context, []models.Activ
 	return nil
 }
 
-
 func (c backupTestRemoteClient) PushServerStateChange(context.Context, string, remote.ServerStateChange) error {
 	return nil
+}
+
+func (c backupTestRemoteClient) SetCredentials(id, token string) {
+	if c.credentials != nil {
+		c.credentials <- [2]string{id, token}
+	}
 }
 
 type backupTestEnvironment struct{}
@@ -195,6 +203,23 @@ func TestPostServerRestoreBackupRejectsLoopbackDownloadURL(t *testing.T) {
 	}
 }
 
+func TestPostServerBackupRejectsInvalidIgnoreList(t *testing.T) {
+	client := backupTestRemoteClient{}
+	backupID := "11111111-1111-1111-1111-111111111111"
+	ignore := strings.Repeat("*a", filesystem.MaxIgnorePatternWildcards+1)
+	c, w, s := newBackupRestoreContext(t, client, backupID, fmt.Sprintf(`{"adapter":"wings","uuid":%q,"ignore":%q}`, backupID, ignore))
+	defer s.CtxCancel()
+
+	postServerBackup(c)
+
+	if c.Writer.Status() != http.StatusBadRequest {
+		t.Fatalf("expected invalid ignore list to be rejected, got status %d body %s", c.Writer.Status(), w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), "wildcards") {
+		t.Fatalf("expected error to describe the wildcard limit, got body %s", w.Body.String())
+	}
+}
+
 func TestPostServerRestoreBackupRejectsNonUuidBackupID(t *testing.T) {
 	client := backupTestRemoteClient{restoreStatus: make(chan string, 1)}
 	c, w, s := newBackupRestoreContext(t, client, "../target/archive", `{"adapter":"s3","download_url":"https://example.com/archive.tar.gz"}`)
@@ -228,6 +253,48 @@ func TestPostServerRestoreBackupRejectsBadDownloadStatus(t *testing.T) {
 	}
 }
 
+func TestPostServerRestoreBackupRejectsConcurrentRestore(t *testing.T) {
+	client := backupTestRemoteClient{restoreStatus: make(chan string, 1)}
+	backupID := "11111111-1111-1111-1111-111111111111"
+	c, w, s := newBackupRestoreContext(t, client, backupID, `{"adapter":"s3","download_url":"https://example.com/archive.tar.gz"}`)
+	defer s.CtxCancel()
+	s.SetRestoring(true)
+
+	postServerRestoreBackup(c)
+
+	if c.Writer.Status() != http.StatusConflict {
+		t.Fatalf("expected a second restore to be rejected, got status %d body %s", c.Writer.Status(), w.Body.String())
+	}
+	if !s.IsRestoring() {
+		t.Fatal("expected the running restore to stay marked as restoring")
+	}
+}
+
+func TestOpenRestoreArchiveGivesUpOnSilentBody(t *testing.T) {
+	previous := restoreProbeTimeout
+	restoreProbeTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { restoreProbeTimeout = previous })
+
+	body, writer := io.Pipe()
+	defer writer.Close()
+	res := &http.Response{Header: http.Header{"Content-Type": {"application/octet-stream"}}, Body: body}
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := openRestoreArchive(res)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Fatal("expected a link that sends no data to be rejected")
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("expected the probe to give up on a link that sends no data")
+	}
+}
+
 func TestBackupRestoreContentTypeValidation(t *testing.T) {
 	tests := map[string]bool{
 		"application/gzip":                   true,
@@ -244,6 +311,51 @@ func TestBackupRestoreContentTypeValidation(t *testing.T) {
 		if got := isSupportedBackupRestoreContentType(contentType); got != expected {
 			t.Fatalf("expected content type %q support to be %v, got %v", contentType, expected, got)
 		}
+	}
+}
+
+// Archives served as generic binary data are accepted when they are gzip, which
+// is how GitHub releases, CDNs and many object stores serve .tar.gz files.
+func TestOpenRestoreArchive(t *testing.T) {
+	gzipBody := "\x1f\x8b\x08\x00rest-of-archive"
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+		accepted    bool
+	}{
+		{"gzip content type", "application/x-gzip", "anything", true},
+		{"octet-stream gzip", "application/octet-stream", gzipBody, true},
+		{"binary/octet-stream gzip", "binary/octet-stream", gzipBody, true},
+		{"missing content type gzip", "", gzipBody, true},
+		{"octet-stream not gzip", "application/octet-stream", "<html>login</html>", false},
+		{"octet-stream empty", "application/octet-stream", "", false},
+		{"html even if gzip", "text/html; charset=utf-8", gzipBody, false},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			res := &http.Response{Header: http.Header{}, Body: io.NopCloser(strings.NewReader(test.body))}
+			if test.contentType != "" {
+				res.Header.Set("Content-Type", test.contentType)
+			}
+
+			archive, err := openRestoreArchive(res)
+			if (err == nil) != test.accepted {
+				t.Fatalf("expected accepted=%v, got error %v", test.accepted, err)
+			}
+			if err != nil {
+				return
+			}
+			// The bytes peeked at are still read by the restore.
+			read, err := io.ReadAll(archive)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(read) != test.body {
+				t.Fatalf("expected the whole body to be read, got %q", read)
+			}
+		})
 	}
 }
 
@@ -322,7 +434,7 @@ func TestBackupRestoreDestinationAllowlist(t *testing.T) {
 }
 
 func TestBackupRestoreHTTPClientDoesNotLimitResponseBodyRead(t *testing.T) {
-	client := backupRestoreHttpClient()
+	client := backupRestoreHttpClient(false)
 	if client.Timeout != 0 {
 		t.Fatalf("expected restore client not to set total request timeout, got %s", client.Timeout)
 	}

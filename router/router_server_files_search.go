@@ -2,13 +2,13 @@ package router
 
 import (
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/gin-gonic/gin"
 
 	"github.com/pelican/wings/config"
-	"github.com/pelican/wings/internal/ufs"
 	"github.com/pelican/wings/router/middleware"
 	"github.com/pelican/wings/server"
 	"github.com/pelican/wings/server/filesystem"
@@ -16,7 +16,7 @@ import (
 
 // Structs needed to respond with the matched files and all their info
 type customFileInfo struct {
-	ufs.FileInfo
+	os.FileInfo
 	newName string
 }
 
@@ -25,7 +25,7 @@ func (cfi customFileInfo) Name() string {
 }
 
 // Helper function to append matched entries
-func appendMatchedEntry(matchedEntries *[]filesystem.Stat, fileInfo ufs.FileInfo, fullPath string, fileType string) {
+func appendMatchedEntry(matchedEntries *[]filesystem.Stat, fileInfo os.FileInfo, fullPath string, fileType string) {
 	*matchedEntries = append(*matchedEntries, filesystem.Stat{
 		FileInfo: customFileInfo{
 			FileInfo: fileInfo,

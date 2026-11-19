@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -23,6 +24,7 @@ const (
 	PermissionFileCreate      = "file.create"
 	PermissionFileUpdate      = "file.update"
 	PermissionFileDelete      = "file.delete"
+	sftpAttributeExtended     = 1 << 31
 )
 
 type Handler struct {
@@ -33,11 +35,53 @@ type Handler struct {
 	permissions []string
 	logger      *log.Entry
 	ro          bool
+	// open counts the files the session has open, see maxOpenFiles.
+	open atomic.Int32
+}
+
+// maxOpenFiles is the number of files a session may have open at once.
+const maxOpenFiles = 64
+
+// openFile returns a slot for a file opened by the session, or nil if the
+// session already has the most files open that it may.
+func (h *Handler) openFile() *openFile {
+	if h.open.Add(1) > maxOpenFiles {
+		h.open.Add(-1)
+		return nil
+	}
+	return &openFile{release: func() { h.open.Add(-1) }}
+}
+
+// openFile is a session's slot for an open file, released when it is closed.
+type openFile struct {
+	once    sync.Once
+	release func()
+}
+
+func (f *openFile) close() {
+	if f != nil {
+		f.once.Do(f.release)
+	}
+}
+
+// readerAt is a file opened for reading by a session.
+type readerAt struct {
+	io.ReaderAt
+	slot *openFile
+}
+
+func (r readerAt) Close() error {
+	r.slot.close()
+	if c, ok := r.ReaderAt.(io.Closer); ok {
+		return c.Close()
+	}
+	return nil
 }
 
 type quotaWriterAt struct {
 	io.WriterAt
 	server *server.Server
+	slot   *openFile
 }
 
 func (w quotaWriterAt) WriteAt(p []byte, off int64) (int, error) {
@@ -53,6 +97,7 @@ func (w quotaWriterAt) WriteAt(p []byte, off int64) (int, error) {
 }
 
 func (w quotaWriterAt) Close() error {
+	w.slot.close()
 	if c, ok := w.WriterAt.(io.Closer); ok {
 		return c.Close()
 	}
@@ -101,20 +146,26 @@ func (h *Handler) Fileread(request *sftp.Request) (io.ReaderAt, error) {
 	if !h.can(PermissionFileReadContent) {
 		return nil, sftp.ErrSSHFxPermissionDenied
 	}
+	slot := h.openFile()
+	if slot == nil {
+		return nil, sftp.ErrSSHFxFailure
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if err := h.fs.IsIgnored(request.Filepath); err != nil {
+		slot.close()
 		return nil, err
-	}	
+	}
 	f, _, err := h.fs.File(request.Filepath)
 	if err != nil {
+		slot.close()
 		if !errors.Is(err, os.ErrNotExist) {
 			h.logger.WithField("error", err).Error("error processing readfile request")
 			return nil, sftp.ErrSSHFxFailure
 		}
 		return nil, sftp.ErrSSHFxNoSuchFile
 	}
-	return f, nil
+	return readerAt{ReaderAt: f, slot: slot}, nil
 }
 
 // Filewrite handles the write actions for a file on the system.
@@ -134,7 +185,7 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 
 	if err := h.fs.IsIgnored(request.Filepath); err != nil {
 		return nil, err
-	}	
+	}
 	// The specific permission required to perform this action. If the file exists on the
 	// system already it only needs to be an update, otherwise we'll check for a create.
 	permission := PermissionFileUpdate
@@ -152,8 +203,13 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 	if !h.can(permission) {
 		return nil, sftp.ErrSSHFxPermissionDenied
 	}
-	f, err := h.fs.Touch(request.Filepath, os.O_RDWR|os.O_TRUNC)
+	slot := h.openFile()
+	if slot == nil {
+		return nil, sftp.ErrSSHFxFailure
+	}
+	f, err := h.fs.Touch(request.Filepath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
+		slot.close()
 		l.WithField("flags", request.Flags).WithField("error", err).Error("failed to open existing file on system")
 		return nil, sftp.ErrSSHFxFailure
 	}
@@ -165,7 +221,30 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 		event = server.ActivitySftpCreate
 	}
 	h.events.MustLog(event, FileAction{Entity: request.Filepath})
-	return quotaWriterAt{WriterAt: f, server: h.server}, nil
+	return quotaWriterAt{WriterAt: f, server: h.server, slot: slot}, nil
+}
+
+func setstatMode(request *sftp.Request) (os.FileMode, error) {
+	// pkg/sftp allocates the client-provided extended attribute count before
+	// validating the remaining packet length. Reject it before parsing to avoid
+	// allowing a small packet to request an effectively unbounded allocation.
+	if request.Flags&sftpAttributeExtended != 0 {
+		return 0, sftp.ErrSSHFxBadMessage
+	}
+	attrs := request.Attributes()
+	if attrs == nil {
+		return 0, sftp.ErrSSHFxBadMessage
+	}
+	mode := attrs.FileMode().Perm()
+	// If the client passes an invalid FileMode just use the default 0644.
+	if mode == 0o000 {
+		mode = os.FileMode(0o644)
+	}
+	// Force directories to be 0755.
+	if attrs.FileMode().IsDir() {
+		mode = 0o755
+	}
+	return mode, nil
 }
 
 // Filecmd hander for basic SFTP system calls related to files, but not anything to do with reading
@@ -178,10 +257,27 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 	if request.Target != "" {
 		l = l.WithField("target", request.Target)
 	}
-	
-	if err := h.fs.IsIgnored(request.Filepath); err != nil {
+
+	// Enforce the egg file denylist before performing any operation. Without this,
+	// a user with file.update/file.delete could modify, rename, delete or symlink
+	// denylisted files. Renaming and deleting act on the entry itself, so a symlink
+	// at the end of the path is not followed: a link to a denylisted file can still
+	// be removed.
+	check := h.fs.IsIgnored
+	if request.Method == "Rename" || request.Method == "Rmdir" || request.Method == "Remove" {
+		check = h.fs.IsIgnoredNoFollow
+	}
+	if err := check(request.Filepath); err != nil {
 		return err
-	}	
+	}
+
+	// Also check the target path (Rename/Symlink). Otherwise a file could be renamed
+	// or linked onto a denylisted path, bypassing the Fileread/Filewrite checks.
+	if request.Target != "" {
+		if err := check(request.Target); err != nil {
+			return err
+		}
+	}
 
 	switch request.Method {
 	// Allows a user to make changes to the permissions of a given file or directory
@@ -190,14 +286,9 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		if !h.can(PermissionFileUpdate) {
 			return sftp.ErrSSHFxPermissionDenied
 		}
-		mode := request.Attributes().FileMode().Perm()
-		// If the client passes an invalid FileMode just use the default 0644.
-		if mode == 0o000 {
-			mode = os.FileMode(0o644)
-		}
-		// Force directories to be 0755.
-		if request.Attributes().FileMode().IsDir() {
-			mode = 0o755
+		mode, err := setstatMode(request)
+		if err != nil {
+			return err
 		}
 		if err := h.fs.Chmod(request.Filepath, mode); err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -300,14 +391,23 @@ func (h *Handler) Filelist(request *sftp.Request) (sftp.ListerAt, error) {
 
 	switch request.Method {
 	case "List":
-		entries, err := h.fs.ReadDirStat(request.Filepath)
+		d, err := h.fs.ReadDir(request.Filepath)
 		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				return nil, sftp.ErrSSHFxNoSuchFile
+			}
 			h.logger.WithField("source", request.Filepath).WithField("error", err).Error("error while listing directory")
 			return nil, sftp.ErrSSHFxFailure
 		}
-		return ListerAt(entries), nil
+		files := make([]os.FileInfo, 0, len(d))
+		for _, entry := range d {
+			if i, err := entry.Info(); err == nil {
+				files = append(files, i)
+			}
+		}
+		return ListerAt(files), nil
 	case "Stat":
-		st, err := h.fs.Stat(request.Filepath)
+		st, err := h.fs.Stat2(request.Filepath)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				return nil, sftp.ErrSSHFxNoSuchFile
@@ -315,7 +415,7 @@ func (h *Handler) Filelist(request *sftp.Request) (sftp.ListerAt, error) {
 			h.logger.WithField("source", request.Filepath).WithField("error", err).Error("error performing stat on file")
 			return nil, sftp.ErrSSHFxFailure
 		}
-		return ListerAt([]os.FileInfo{st.FileInfo}), nil
+		return ListerAt([]os.FileInfo{st}), nil
 	default:
 		return nil, sftp.ErrSSHFxOpUnsupported
 	}

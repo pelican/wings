@@ -40,6 +40,11 @@ func LocateLocal(client remote.Client, uuid string, suuid string) (*LocalBackup,
 	if err := b.validateIdentifier(); err != nil {
 		return nil, nil, err
 	}
+	// Backups created before local backups were stored per server are moved
+	// into place when they are first accessed.
+	if err := b.MigrateLegacy(); err != nil {
+		return nil, nil, err
+	}
 	st, err := os.Stat(b.Path())
 	if err != nil {
 		return nil, nil, err
@@ -85,19 +90,21 @@ func (b *LocalBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem,
 	if err := b.validateIdentifier(); err != nil {
 		return nil, err
 	}
-	a := &filesystem.Archive{
-		Filesystem: fsys,
-		Ignore:     ignore,
+	a, err := fsys.NewArchive(".", b.archiveOptions(ignore)...)
+	if err != nil {
+		return nil, errors.WrapIf(err, "server/backup: failed to create archive")
 	}
 
 	b.log().WithField("path", b.Path()).Info("creating backup for server")
-	if _, err := os.Stat(filepath.Dir(b.Path())); os.IsNotExist(err) {
-		err := os.Mkdir(filepath.Dir(b.Path()), 0o700)
-		if err != nil {
-			return nil, err
-		}
+	if err := os.MkdirAll(filepath.Dir(b.Path()), 0o700); err != nil {
+		return nil, errors.Wrap(err, "server/backup: failed to create backup directory")
 	}
-	if err := a.Create(ctx, b.Path()); err != nil {
+	f, err := os.OpenFile(b.Path(), os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, errors.Wrap(err, "server/backup: failed to open file for writing")
+	}
+	defer f.Close()
+	if err := a.Create(ctx, f); err != nil {
 		return nil, err
 	}
 	b.log().Info("created backup successfully")
@@ -109,23 +116,34 @@ func (b *LocalBackup) Generate(ctx context.Context, fsys *filesystem.Filesystem,
 	return ad, nil
 }
 
-// Restore will walk over the archive and call the callback function for each
-// file encountered.
-func (b *LocalBackup) Restore(ctx context.Context, _ io.Reader, callback RestoreCallback) error {
+// Open opens the backup's archive for reading. A restore that reads the archive
+// more than once can hold it open, so that deleting the backup part way through
+// cannot take it away.
+func (b *LocalBackup) Open() (*os.File, error) {
 	if err := b.validateIdentifier(); err != nil {
-		return err
+		return nil, err
 	}
-	f, err := os.Open(b.Path())
-	if err != nil {
-		return err
-	}
-	defer f.Close()
+	return os.Open(b.Path())
+}
 
-	var reader io.Reader = f
+// Restore will walk over the archive and call the callback function for each
+// file encountered. The archive is read from r if it is given, such as one
+// returned by Open, and otherwise opened from the backup's path.
+func (b *LocalBackup) Restore(ctx context.Context, r io.Reader, callback RestoreCallback) error {
+	if r == nil {
+		f, err := b.Open()
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		r = f
+	}
+
+	reader := r
 	// Steal the logic we use for making backups which will be applied when restoring
 	// this specific backup. This allows us to prevent overloading the disk unintentionally.
 	if writeLimit := int64(config.Get().System.Backups.WriteLimit * 1024 * 1024); writeLimit > 0 {
-		reader = ratelimit.Reader(f, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
+		reader = ratelimit.Reader(r, ratelimit.NewBucketWithRate(float64(writeLimit), writeLimit))
 	}
 	if err := format.Extract(ctx, reader, func(ctx context.Context, f archives.FileInfo) error {
 		r, err := f.Open()
@@ -134,7 +152,7 @@ func (b *LocalBackup) Restore(ctx context.Context, _ io.Reader, callback Restore
 		}
 		defer r.Close()
 
-		return callback(f.NameInArchive, f.FileInfo, r)
+		return callback(f.NameInArchive, f, r)
 	}); err != nil {
 		return err
 	}

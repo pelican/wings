@@ -2,14 +2,17 @@ package config
 
 import (
 	"encoding/base64"
+	"net/netip"
 	"net/url"
 	"sort"
-	"strings"		
+	"strings"
+	"sync"
 
+	"github.com/apex/log"
 	"github.com/distribution/reference"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/api/types/registry"
 	"github.com/goccy/go-json"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/registry"
 )
 
 type dockerNetworkInterfaces struct {
@@ -45,6 +48,26 @@ type DockerNetworkConfiguration struct {
 	Interfaces dockerNetworkInterfaces `yaml:"interfaces"`
 }
 
+var warnedDns sync.Map
+
+// DnsAddrs returns the configured DNS servers as addresses for the Docker API.
+// Entries that are not valid IP addresses are logged and skipped.
+func (c DockerNetworkConfiguration) DnsAddrs() []netip.Addr {
+	out := make([]netip.Addr, 0, len(c.Dns))
+	for _, v := range c.Dns {
+		addr, err := netip.ParseAddr(strings.TrimSpace(v))
+		if err != nil {
+			// This runs on every container create, so only warn once per value.
+			if _, seen := warnedDns.LoadOrStore(v, struct{}{}); !seen {
+				log.WithField("dns", v).WithField("error", err).Warn("skipping invalid DNS server in docker network configuration")
+			}
+			continue
+		}
+		out = append(out, addr)
+	}
+	return out
+}
+
 // DockerConfiguration defines the docker configuration used by the daemon when
 // interacting with containers and networks on the system.
 type DockerConfiguration struct {
@@ -78,6 +101,28 @@ type DockerConfiguration struct {
 		Cpu    int64 `default:"100" json:"cpu" yaml:"cpu"`
 	} `json:"installer_limits" yaml:"installer_limits"`
 
+	// CpuPeriod is the length of a CFS scheduling window in microseconds. Server
+	// quotas scale with it, so the configured CPU limits stay the same. A shorter
+	// period reduces the worst case throttle latency at the cost of additional
+	// scheduler overhead.
+	CpuPeriod int64 `default:"100000" json:"cpu_period" yaml:"cpu_period"`
+
+	// CpuBurst allows containers to bank unused CFS quota within a period and spend
+	// it on short spikes without raising their long term CPU limit. Percent sizes the
+	// burst relative to a server's quota and is capped at 100 by the kernel. Requires
+	// Linux 5.14 or newer, it is skipped silently otherwise.
+	CpuBurst struct {
+		Enabled bool  `default:"true" json:"enabled" yaml:"enabled"`
+		Percent int64 `default:"100" json:"percent" yaml:"percent"`
+	} `json:"cpu_burst" yaml:"cpu_burst"`
+
+	// CpuShares is the relative CFS weight of server containers when the host is
+	// fully saturated, it limits nothing on an idle host. Zero leaves containers
+	// at the engine default. Wings historically set 1024, which cgroup v2 converts
+	// to less than half of the default weight, set that value to restore the old
+	// bias towards host system services.
+	CpuShares int64 `default:"0" json:"cpu_shares" yaml:"cpu_shares"`
+
 	// Overhead controls the memory overhead given to all containers to circumvent certain
 	// software such as the JVM not staying below the maximum memory limit.
 	Overhead Overhead `json:"overhead" yaml:"overhead"`
@@ -95,10 +140,53 @@ type DockerConfiguration struct {
 	// Sets the IPS that the user is able to bind to
 	SystemIps []string `default:"[]" json:"system_ips" yaml:"system_ips"`
 
-	LogConfig struct {
-		Type   string            `default:"local" json:"type" yaml:"type"`
-		Config map[string]string `default:"{\"max-size\":\"5m\",\"max-file\":\"1\",\"compress\":\"false\",\"mode\":\"non-blocking\"}" json:"config" yaml:"config"`
-	} `json:"log_config" yaml:"log_config"`
+	LogConfig DockerLogConfiguration `json:"log_config" yaml:"log_config"`
+}
+
+// DockerLogConfiguration is the Docker logging driver, and its options, used for
+// server and installation containers.
+type DockerLogConfiguration struct {
+	Type   string            `default:"local" json:"type" yaml:"type"`
+	Config map[string]string `default:"{\"max-size\":\"5m\",\"max-file\":\"1\",\"compress\":\"false\",\"mode\":\"non-blocking\"}" json:"config" yaml:"config"`
+}
+
+// UnmarshalYAML decodes the logging configuration without leaking the default
+// options of the "local" driver into the options of a different driver. Those
+// defaults are populated before the configuration file is decoded, and decoding
+// into the existing map would merge them with the user's options, which other
+// drivers (fluentd, loki, ...) reject as unknown log options.
+//
+// Options for the "local" driver are still merged with the defaults so existing
+// configurations that only override some of them keep working.
+func (l *DockerLogConfiguration) UnmarshalYAML(unmarshal func(interface{}) error) error {
+	raw := struct {
+		Type   string            `yaml:"type"`
+		Config map[string]string `yaml:"config"`
+	}{Type: l.Type}
+	if err := unmarshal(&raw); err != nil {
+		return err
+	}
+
+	if raw.Type == "local" {
+		merged := make(map[string]string, len(l.Config)+len(raw.Config))
+		for k, v := range l.Config {
+			merged[k] = v
+		}
+		for k, v := range raw.Config {
+			merged[k] = v
+		}
+		l.Config = merged
+	} else {
+		l.Config = raw.Config
+	}
+	l.Type = raw.Type
+	return nil
+}
+
+// CpuPeriodMicroseconds returns the configured CFS period clamped to the range
+// the kernel accepts.
+func (c DockerConfiguration) CpuPeriodMicroseconds() int64 {
+	return min(max(c.CpuPeriod, 1_000), 1_000_000)
 }
 
 func (c DockerConfiguration) ContainerLogConfig() container.LogConfig {
@@ -111,6 +199,7 @@ func (c DockerConfiguration) ContainerLogConfig() container.LogConfig {
 		Config: c.LogConfig.Config,
 	}
 }
+
 // RegistryCredentialsForImage returns registry credentials for an image only
 // when the configured registry and image reference share the same registry
 // identity.
