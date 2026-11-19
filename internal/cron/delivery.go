@@ -29,9 +29,11 @@ type batchItem struct {
 }
 
 // deliver sends the items to the Panel and returns the IDs of the rows that no
-// longer need to be kept. If the Panel refuses a batch as invalid, it is split
-// to find the items it refuses, which are dropped so that they do not stop the
-// rest from ever being sent.
+// longer need to be kept. If the Panel refuses a batch, it is split to find the
+// items it refuses so that the rest are still sent. Refused items are kept, not
+// deleted, and are sent again on a later run: the refusal may come from a Panel
+// bug or a proxy rather than from the activity itself. Stored activity is
+// bounded by pruneActivity.
 func deliver(ctx context.Context, client remote.Client, items []batchItem) ([]int, error) {
 	if len(items) == 0 {
 		return nil, nil
@@ -57,8 +59,8 @@ func deliver(ctx context.Context, client remote.Client, items []batchItem) ([]in
 			WithField("event", items[0].activity.Event).
 			WithField("server", items[0].activity.Server).
 			WithField("error", err).
-			Warn("dropping activity event refused by the Panel")
-		return items[0].ids, nil
+			Warn("Panel refused activity event, keeping it to retry later")
+		return nil, nil
 	}
 
 	mid := len(items) / 2
@@ -70,8 +72,9 @@ func deliver(ctx context.Context, client remote.Client, items []batchItem) ([]in
 	return append(done, rest...), err
 }
 
-// isRefused reports whether the Panel refused a request because of its contents,
-// in which case sending it again cannot succeed.
+// isRefused reports whether the Panel refused a request because of its contents.
+// Smaller requests may then succeed, so the batch is split, and whatever is still
+// refused is kept to be sent again later.
 func isRefused(err error) bool {
 	rerr := remote.AsRequestError(err)
 	if rerr == nil {

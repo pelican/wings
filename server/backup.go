@@ -12,6 +12,7 @@ import (
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/mholt/archives"
 
+	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
 	"github.com/pelican/wings/remote"
 	"github.com/pelican/wings/server/backup"
@@ -175,7 +176,18 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser, t
 		}
 	}
 
+	// The archive is read from here. It is the reader given, unless that has to
+	// be saved to a file first so that it can be read more than once.
+	var source io.Reader = reader
 	if truncate {
+		// Check the whole archive can be read before deleting anything, so that a
+		// corrupt or incomplete backup leaves the server's files in place.
+		var cleanup func()
+		if source, cleanup, err = s.verifyRestoreArchive(b, reader); err != nil {
+			return err
+		}
+		defer cleanup()
+
 		s.Log().Info("deleting server files before restoring backup")
 		if err = s.Filesystem().TruncateRootDirectory(); err != nil {
 			return errors.WrapIf(err, "server/backup: restore: failed to delete server files")
@@ -196,7 +208,7 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser, t
 	}
 	var dirs []restoredDir
 
-	err = b.Restore(s.Context(), reader, func(file string, info fs.FileInfo, r io.ReadCloser) error {
+	err = b.Restore(s.Context(), source, func(file string, info fs.FileInfo, r io.ReadCloser) error {
 		defer r.Close()
 		if file == "." {
 			return nil
@@ -251,4 +263,59 @@ func (s *Server) RestoreBackup(b backup.BackupInterface, reader io.ReadCloser, t
 	}
 
 	return nil
+}
+
+// verifyRestoreArchive reads every entry in the backup to check that it can be
+// restored in full, and returns the reader to restore it from.
+//
+// A local backup is read from its file each time it is restored, so reader is
+// nil and is returned as it is. A remote backup arrives as a download that can
+// only be read once, so it is saved to a temporary file in the backup directory
+// first, and that file is returned to restore from. The returned function
+// removes the file and must always be called.
+func (s *Server) verifyRestoreArchive(b backup.BackupInterface, reader io.Reader) (io.Reader, func(), error) {
+	noop := func() {}
+	var source io.Reader = reader
+	var spool *os.File
+	cleanup := noop
+	if reader != nil {
+		f, err := os.CreateTemp(config.Get().System.BackupDirectory, ".restore-*.tmp")
+		if err != nil {
+			return nil, noop, errors.Wrap(err, "server/backup: restore: failed to create temporary file for backup")
+		}
+		cleanup = func() {
+			_ = f.Close()
+			_ = os.Remove(f.Name())
+		}
+		s.Log().Info("downloading backup to verify it before deleting server files")
+		if _, err := io.Copy(f, reader); err != nil {
+			cleanup()
+			return nil, noop, errors.Wrap(err, "server/backup: restore: failed to download backup")
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			cleanup()
+			return nil, noop, errors.WithStack(err)
+		}
+		spool = f
+		source = f
+	}
+
+	s.Log().Info("verifying backup archive before deleting server files")
+	err := b.Restore(s.Context(), source, func(_ string, _ fs.FileInfo, r io.ReadCloser) error {
+		defer r.Close()
+		_, err := io.Copy(io.Discard, r)
+		return err
+	})
+	if err != nil {
+		cleanup()
+		return nil, noop, errors.WrapIf(err, "server/backup: restore: backup archive is invalid, server files were not deleted")
+	}
+
+	if spool != nil {
+		if _, err := spool.Seek(0, io.SeekStart); err != nil {
+			cleanup()
+			return nil, noop, errors.WithStack(err)
+		}
+	}
+	return source, cleanup, nil
 }

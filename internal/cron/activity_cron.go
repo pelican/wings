@@ -36,11 +36,17 @@ func (ac *activityCron) Run(ctx context.Context) error {
 
 	// Keep sending batches until the stored activity has been sent, so that it is
 	// sent as quickly as it is created.
+	// Activity the Panel refuses stays stored, so each batch starts after the
+	// last row read rather than at the oldest row. Otherwise a batch full of
+	// refused activity would be read again and again, and newer activity never
+	// sent. The next run starts from the beginning to retry what was refused.
+	var after int
 	for i := 0; i < maxBatchesPerRun; i++ {
-		n, err := ac.sendBatch(ctx)
+		n, last, err := ac.sendBatch(ctx, after)
 		if err != nil || n < ac.batchSize() {
 			return err
 		}
+		after = last
 	}
 	return nil
 }
@@ -52,21 +58,23 @@ func (ac *activityCron) batchSize() int {
 	return ac.max
 }
 
-// sendBatch sends the oldest stored activity to the Panel and returns how many
-// rows were read.
-func (ac *activityCron) sendBatch(ctx context.Context) (int, error) {
+// sendBatch sends the oldest stored activity with an ID greater than after to
+// the Panel, and returns how many rows were read and the ID of the last one.
+func (ac *activityCron) sendBatch(ctx context.Context, after int) (int, int, error) {
 	var activity []models.Activity
 	tx := database.Instance().WithContext(ctx).
 		Where("event NOT LIKE ?", "server:sftp.%").
+		Where("id > ?", after).
 		Order("id ASC").
 		Limit(ac.batchSize()).
 		Find(&activity)
 	if tx.Error != nil {
-		return 0, errors.WithStack(tx.Error)
+		return 0, after, errors.WithStack(tx.Error)
 	}
 	if len(activity) == 0 {
-		return 0, nil
+		return 0, after, nil
 	}
+	last := activity[len(activity)-1].ID
 
 	// ids of activity to delete without sending it.
 	var invalid []int
@@ -83,10 +91,10 @@ func (ac *activityCron) sendBatch(ctx context.Context) (int, error) {
 
 	done, err := deliver(ctx, ac.manager.Client(), items)
 	if derr := deleteActivity(ctx, append(invalid, done...)); derr != nil {
-		return 0, derr
+		return 0, last, derr
 	}
 	if err != nil {
-		return 0, errors.WrapIf(err, "cron: failed to send activity events to Panel")
+		return 0, last, errors.WrapIf(err, "cron: failed to send activity events to Panel")
 	}
-	return len(activity), nil
+	return len(activity), last, nil
 }

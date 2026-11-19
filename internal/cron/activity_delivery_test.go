@@ -79,6 +79,9 @@ type fakePanel struct {
 	attempts  [][]string
 	delivered []string
 	sizes     []int
+	// status, when set, is returned for every request, as from a proxy that
+	// refuses them.
+	status int
 }
 
 func (p *fakePanel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -90,6 +93,11 @@ func (p *fakePanel) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		} `json:"data"`
 	}
 	_ = json.Unmarshal(raw, &body)
+
+	if p.status != 0 {
+		w.WriteHeader(p.status)
+		return
+	}
 
 	ips := make([]string, 0, len(body.Data))
 	valid := true
@@ -163,8 +171,8 @@ func TestSftpActivityWithUnparsableIPIsNotSent(t *testing.T) {
 	assert.Zero(t, storedActivity(t))
 }
 
-// Activity the Panel refuses is dropped so that it does not stop the rest of the
-// activity from being sent.
+// Activity the Panel refuses does not stop the rest of the activity from being
+// sent, and is kept so that it can be sent again later.
 func TestRefusedActivityDoesNotHoldBackOtherActivity(t *testing.T) {
 	setupDatabase(t)
 	panel := &fakePanel{}
@@ -180,7 +188,35 @@ func TestRefusedActivityDoesNotHoldBackOtherActivity(t *testing.T) {
 	require.NoError(t, ac.Run(context.Background()))
 
 	assert.Len(t, panel.deliveredIPs(), 9)
-	assert.Zero(t, storedActivity(t))
+	assert.Equal(t, int64(1), storedActivity(t))
+}
+
+// More than a batch of refused activity at the front of the queue does not stop
+// newer activity from being sent in the same run.
+func TestRefusedBatchDoesNotHoldBackNewerActivity(t *testing.T) {
+	setupDatabase(t)
+	panel := &fakePanel{}
+	ac, _ := newCrons(t, panel)
+	insertMany(t, 150, "server:console.command", models.ActivityMeta{"command": "refused"})
+	insertMany(t, 20, "server:console.command", models.ActivityMeta{"command": "say hi"})
+
+	require.NoError(t, ac.Run(context.Background()))
+
+	assert.Len(t, panel.deliveredIPs(), 20)
+	assert.Equal(t, int64(150), storedActivity(t))
+}
+
+// SFTP activity the Panel refuses is kept rather than deleted.
+func TestRefusedSftpActivityIsKept(t *testing.T) {
+	setupDatabase(t)
+	panel := &fakePanel{status: http.StatusRequestEntityTooLarge}
+	_, sc := newCrons(t, panel)
+	insertActivity(t, "server:sftp.write", validIP, "/a.txt")
+
+	require.NoError(t, sc.Run(context.Background()))
+
+	assert.Empty(t, panel.deliveredIPs())
+	assert.Equal(t, int64(1), storedActivity(t))
 }
 
 // The non-SFTP cron drops activity with an address that does not parse, and

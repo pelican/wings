@@ -173,6 +173,47 @@ func TestFilesystem_DeletePartialFailureReleasesFreedSpace(t *testing.T) {
 	}
 }
 
+// When emptying the server only partly succeeds, the usage is counted again even
+// though the last count is recent, so the space that was freed is released.
+func TestFilesystem_TruncatePartialFailureRecountsUsage(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can remove files from read-only directories")
+	}
+	fs := NewFs()
+	defer fs.reset()
+
+	if err := os.MkdirAll(filepath.Join(fs.rootPath, "a/locked"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fs.write("a/freed.bin", make([]byte, 4096))
+	fs.write("a/locked/kept.bin", make([]byte, 4096))
+	if err := os.Chmod(filepath.Join(fs.rootPath, "a/locked"), 0o555); err != nil {
+		t.Fatal(err)
+	}
+	defer os.Chmod(filepath.Join(fs.rootPath, "a/locked"), 0o755)
+
+	// This count is still fresh when the truncate fails.
+	before, err := fs.updateCachedDiskUsage()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := fs.TruncateRootDirectory(); err == nil {
+		t.Fatal("expected the truncate to fail on the read-only directory")
+	}
+	if _, err := os.Stat(filepath.Join(fs.rootPath, "a/freed.bin")); !os.IsNotExist(err) {
+		t.Fatalf("expected a/freed.bin to have been removed, got %v", err)
+	}
+	// The recount runs in the background.
+	deadline := time.Now().Add(5 * time.Second)
+	for fs.CachedUsage() > before-4096 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := fs.CachedUsage(); got > before-4096 {
+		t.Errorf("expected usage to drop by at least 4096 from %d, got %d", before, got)
+	}
+}
+
 // A link created inside a directory that is itself a symlink must not end up
 // pointing somewhere it cannot be followed.
 func TestFilesystem_SymlinkThroughSymlinkedParent(t *testing.T) {

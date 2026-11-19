@@ -131,6 +131,14 @@ func (fs *Filesystem) DiskUsage(allowStaleValue bool) (int64, error) {
 
 // Updates the currently used disk space for a server.
 func (fs *Filesystem) updateCachedDiskUsage() (int64, error) {
+	return fs.recalculateDiskUsage(false)
+}
+
+// recalculateDiskUsage walks the server's files to determine the disk space it
+// uses. Unless force is set, a lookup that another caller finished recently is
+// reused. Force is for callers that know the cached value is wrong even though
+// it is fresh, such as after a delete that only partly succeeded.
+func (fs *Filesystem) recalculateDiskUsage(force bool) (int64, error) {
 	// Obtain an exclusive lock on this process so that we don't unintentionally run it at the same
 	// time as another running process. Once the lock is available it'll read from the cache for the
 	// second call rather than hitting the disk in parallel.
@@ -140,7 +148,7 @@ func (fs *Filesystem) updateCachedDiskUsage() (int64, error) {
 	// Another caller may have finished a lookup while this one was waiting for the
 	// lock, in which case its result is still fresh and there is no need to walk
 	// the whole directory again.
-	if fs.lastLookupTime.Get().After(time.Now().Add(time.Second * fs.diskCheckInterval * -1)) {
+	if !force && fs.lastLookupTime.Get().After(time.Now().Add(time.Second*fs.diskCheckInterval*-1)) {
 		return fs.quota.Usage(), nil
 	}
 

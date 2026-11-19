@@ -7,6 +7,7 @@ import (
 	"net/url"
 	"os/exec"
 	"path"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -138,8 +139,20 @@ func redactReport(report string, cfg *config.Configuration, includeEndpoints boo
 		}
 		report = strings.ReplaceAll(report, s, "{redacted}")
 	}
+	// Websocket and download tokens are JWTs passed in the query string, and the
+	// logs record request URLs, so remove them however they appear.
+	report = tokenParamPattern.ReplaceAllString(report, "${1}{redacted}")
+	report = jwtPattern.ReplaceAllString(report, "{redacted}")
 	return report
 }
+
+var (
+	// tokenParamPattern matches the value of a token query string parameter.
+	tokenParamPattern = regexp.MustCompile(`([?&]token=)[^&\s"']+`)
+	// jwtPattern matches a JWT: a base64url header that starts with {" and a
+	// payload, followed by a signature that may be empty.
+	jwtPattern = regexp.MustCompile(`eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*`)
+)
 
 func getDockerInfo() (client.ServerVersionResult, dockerSystem.Info, error) {
 	cli, err := environment.Docker()

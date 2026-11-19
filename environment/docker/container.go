@@ -131,7 +131,8 @@ func (e *Environment) Attach(ctx context.Context) error {
 // reattach is called when the attached stream ends, and attaches to the
 // container again if it is still running, returning true if the container is
 // still running. If that keeps happening, or attaching fails, the container is
-// terminated rather than left running without being managed.
+// terminated rather than left running without being managed. In that case it
+// returns true only if the container was actually terminated.
 func (e *Environment) reattach() bool {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)
 	defer cancel()
@@ -146,8 +147,7 @@ func (e *Environment) reattach() bool {
 		// Terminating it is safer than marking a possibly-running container offline,
 		// which would stop its disk limit from being enforced.
 		e.log().WithField("error", err).Error("could not inspect container after losing its stream, terminating it")
-		e.terminateUnmanaged()
-		return true
+		return e.terminateUnmanaged()
 	}
 	if c.State == nil || !c.State.Running {
 		return false
@@ -177,8 +177,7 @@ func (e *Environment) reattach() bool {
 	}
 
 	e.log().Error("unable to stay attached to running container, terminating it")
-	e.terminateUnmanaged()
-	return true
+	return e.terminateUnmanaged()
 }
 
 // inspectForReattach inspects the container, retrying a transient error a few
@@ -199,14 +198,35 @@ func (e *Environment) inspectForReattach(ctx context.Context) (container.Inspect
 	return c, err
 }
 
-// terminateUnmanaged SIGKILLs a container that can no longer be managed. Attaching
-// may have used up the time allowed by the caller's context, which would leave the
-// container running without being managed, so a fresh timeout is used.
-func (e *Environment) terminateUnmanaged() {
-	tctx, tcancel := context.WithTimeout(context.Background(), time.Second*30)
-	defer tcancel()
-	if err := e.Terminate(tctx, "SIGKILL"); err != nil {
-		e.log().WithField("error", err).Error("failed to terminate container")
+// terminateUnmanagedAttempts is how many times terminateUnmanaged tries to kill
+// the container before giving up.
+const terminateUnmanagedAttempts = 5
+
+// terminateUnmanaged SIGKILLs a container that can no longer be managed, and
+// returns true once it is known to have stopped. Docker may be briefly
+// unresponsive, so the kill is retried with a backoff, each attempt with a fresh
+// timeout since attaching may have used up the time allowed by the caller's
+// context.
+//
+// When every attempt fails it returns false, so the server is marked offline
+// rather than shown as running with no console, stats or disk limit. The
+// container may still be running at that point, which is logged.
+func (e *Environment) terminateUnmanaged() bool {
+	backoff := time.Second
+	for attempt := 1; ; attempt++ {
+		tctx, tcancel := context.WithTimeout(context.Background(), time.Second*30)
+		err := e.Terminate(tctx, "SIGKILL")
+		tcancel()
+		if err == nil {
+			return true
+		}
+		if attempt >= terminateUnmanagedAttempts {
+			e.log().WithField("error", err).Error("failed to terminate container that could not be managed, it may still be running")
+			return false
+		}
+		e.log().WithField("error", err).WithField("attempt", attempt).Warn("failed to terminate container, retrying")
+		time.Sleep(backoff)
+		backoff *= 2
 	}
 }
 

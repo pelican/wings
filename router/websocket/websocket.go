@@ -467,6 +467,17 @@ func (h *Handler) HandleInbound(ctx context.Context, m Message) error {
 				return nil
 			}
 
+			if errors.Is(err, system.ErrLockerDestroyed) {
+				m, _ := h.GetErrorMessage("this server is being deleted and can no longer accept power actions")
+
+				_ = h.SendJson(Message{
+					Event: ErrorEvent,
+					Args:  []string{m},
+				})
+
+				return nil
+			}
+
 			if err == nil {
 				h.server.SaveActivity(h.activity(j), models.Event(server.ActivityPowerPrefix+action), nil)
 			}

@@ -655,7 +655,11 @@ func (fs *Filesystem) Copy(p string) error {
 			err = cerr
 		}
 		if err != nil {
-			_ = root.Remove(dst)
+			// The partial copy was counted against the quota as it was written, so
+			// release that space once it has been removed.
+			if rerr := root.Remove(dst); rerr == nil {
+				fs.adjustDisk(-qf.size)
+			}
 			return errors.Wrap(err, "server/filesystem: copy: failed to write file")
 		}
 		return nil
@@ -817,8 +821,9 @@ func (fs *Filesystem) TruncateRootDirectory() error {
 	if err != nil {
 		go func() {
 			// If there was an error, re-calculate the disk usage right away to account
-			// for any partially removed files.
-			_, _ = fs.updateCachedDiskUsage()
+			// for any partially removed files. The cached value may still look fresh,
+			// so the recount is forced.
+			_, _ = fs.recalculateDiskUsage(true)
 		}()
 
 		return errors.Wrap(err, "server/filesystem: truncate: failed to remove root directory contents")

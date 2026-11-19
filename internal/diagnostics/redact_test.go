@@ -43,6 +43,29 @@ func TestRedactReportRemovesEndpointsEverywhere(t *testing.T) {
 	}
 }
 
+// Tokens passed in request URLs, and JWTs anywhere else, are never included.
+func TestRedactReportRemovesQueryTokens(t *testing.T) {
+	jwt := "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzZXJ2ZXJfdXVpZCI6IngifQ.c2lnbmF0dXJl"
+	report := strings.Join([]string{
+		`GET /api/servers/x/ws?token=` + jwt + `&foo=1 200`,
+		`GET /download/backup?a=b&token=opaque-value-123 200`,
+		`bearer ` + jwt,
+	}, "\n")
+	for _, include := range []bool{true, false} {
+		got := redactReport(report, redactTestConfig(), include)
+		for _, s := range []string{jwt, "opaque-value-123", "eyJ"} {
+			if strings.Contains(got, s) {
+				t.Errorf("includeEndpoints=%v: expected %q to be redacted, got:\n%s", include, s, got)
+			}
+		}
+		for _, s := range []string{"&foo=1 200", "?a=b&token={redacted} 200"} {
+			if !strings.Contains(got, s) {
+				t.Errorf("includeEndpoints=%v: expected %q to be kept, got:\n%s", include, s, got)
+			}
+		}
+	}
+}
+
 // The node token is never included.
 func TestRedactReportAlwaysRemovesToken(t *testing.T) {
 	report := "debug: Authorization: Bearer node-secret-token-value"
