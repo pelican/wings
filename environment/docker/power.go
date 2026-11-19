@@ -124,7 +124,7 @@ func (e *Environment) Start(ctx context.Context) error {
 		return errors.WrapIf(err, "environment/docker: failed to start container")
 	}
 	e.applyCpuBurst(actx)
-	
+
 	// No errors, good to continue through.
 	sawError = false
 	return nil
@@ -233,7 +233,7 @@ func (e *Environment) WaitForStop(ctx context.Context, duration time.Duration, t
 
 	// We pass through the timed context for this stop action so that if one of the
 	// internal docker calls fails to ever finish before we've exhausted the time limit
-	// the resources get cleaned up, and the exection is stopped.
+	// the resources get cleaned up, and the execution is stopped.
 	if err := e.Stop(tctx); err != nil {
 		if terminate && errors.Is(err, context.DeadlineExceeded) {
 			return doTermination("stop")
@@ -342,7 +342,7 @@ func (e *Environment) Terminate(ctx context.Context, signal string) error {
 			e.log().WithFields(log.Fields{
 				"id": e.Id,
 			}).Debug("Sent SIGKILL to container: graceful shutdown timed out")
-			
+
 			// Update state to offline after SIGKILL.
 			e.SetState(environment.ProcessOfflineState)
 			return nil
