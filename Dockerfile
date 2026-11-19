@@ -22,4 +22,4 @@ COPY --from=builder /etc/os-release /etc/os-release
 COPY --from=builder /app/wings /usr/bin/
 CMD [ "/usr/bin/wings", "--config", "/etc/pelican/config.yml" ]
 
-EXPOSE 8080
+EXPOSE 80 8080 2022
