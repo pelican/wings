@@ -169,6 +169,17 @@ func (s *Server) IsRestoring() bool {
 	return s.restoring.Load()
 }
 
+// StartRestoring marks the server as restoring unless it already is, and reports
+// whether it did. Only one restore can run at a time, the flag of one would
+// otherwise be cleared by the other finishing.
+func (s *Server) StartRestoring() bool {
+	if !s.restoring.SwapIf(true) {
+		return false
+	}
+	s.Sftp().CancelAll()
+	return true
+}
+
 func (s *Server) SetRestoring(state bool) {
 	s.restoring.Store(state)
 	if state {
