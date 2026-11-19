@@ -8,8 +8,9 @@ import (
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
-	"github.com/docker/docker/api/types/container"
-	"github.com/docker/docker/client"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 
 	"github.com/pelican/wings/environment"
 	"github.com/pelican/wings/remote"
@@ -25,8 +26,8 @@ import (
 // is running does not result in the server becoming un-bootable.
 func (e *Environment) OnBeforeStart(ctx context.Context) error {
 	// Always destroy and re-create the server container to ensure that synced data from the Panel is used.
-	if err := e.client.ContainerRemove(ctx, e.Id, container.RemoveOptions{RemoveVolumes: true}); err != nil {
-		if !client.IsErrNotFound(err) {
+	if _, err := e.client.ContainerRemove(ctx, e.Id, client.ContainerRemoveOptions{RemoveVolumes: true}); err != nil {
+		if !cerrdefs.IsNotFound(err) {
 			return errors.WrapIf(err, "environment/docker: failed to remove container during pre-boot")
 		}
 	}
@@ -68,13 +69,14 @@ func (e *Environment) Start(ctx context.Context) error {
 		// Do nothing if the container is not found, we just don't want to continue
 		// to the next block of code here. This check was inlined here to guard against
 		// a nil-pointer when checking c.State below.
-		if !client.IsErrNotFound(err) {
+		if !cerrdefs.IsNotFound(err) {
 			return errors.WrapIf(err, "environment/docker: failed to inspect container")
 		}
 	} else {
 		// If the server is running update our internal state and continue on with the attach.
 		if c.State.Running {
 			e.SetState(environment.ProcessRunningState)
+			e.applyCpuBurst(ctx)
 
 			return e.Attach(ctx)
 		}
@@ -118,10 +120,11 @@ func (e *Environment) Start(ctx context.Context) error {
 		return errors.WrapIf(err, "environment/docker: failed to attach to container")
 	}
 
-	if err := e.client.ContainerStart(actx, e.Id, container.StartOptions{}); err != nil {
+	if _, err := e.client.ContainerStart(actx, e.Id, client.ContainerStartOptions{}); err != nil {
 		return errors.WrapIf(err, "environment/docker: failed to start container")
 	}
-
+	e.applyCpuBurst(actx)
+	
 	// No errors, good to continue through.
 	sawError = false
 	return nil
@@ -185,10 +188,10 @@ func (e *Environment) Stop(ctx context.Context) error {
 	// rather than forcefully terminating it.  Value is in seconds, but -1 is
 	// treated as indefinitely.
 	timeout := -1
-	if err := e.client.ContainerStop(ctx, e.Id, container.StopOptions{Timeout: &timeout}); err != nil {
+	if _, err := e.client.ContainerStop(ctx, e.Id, client.ContainerStopOptions{Timeout: &timeout}); err != nil {
 		// If the container does not exist just mark the process as stopped and return without
 		// an error.
-		if client.IsErrNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			e.SetStream(nil)
 			e.SetState(environment.ProcessOfflineState)
 			return nil
@@ -241,7 +244,8 @@ func (e *Environment) WaitForStop(ctx context.Context, duration time.Duration, t
 	// Block the return of this function until the container as been marked as no
 	// longer running. If this wait does not end by the time seconds have passed,
 	// attempt to terminate the container, or return an error.
-	ok, errChan := e.client.ContainerWait(tctx, e.Id, container.WaitConditionNotRunning)
+	wait := e.client.ContainerWait(tctx, e.Id, client.ContainerWaitOptions{Condition: container.WaitConditionNotRunning})
+	ok, errChan := wait.Result, wait.Error
 	select {
 	case <-ctx.Done():
 		if err := ctx.Err(); err != nil {
@@ -253,7 +257,7 @@ func (e *Environment) WaitForStop(ctx context.Context, duration time.Duration, t
 	case err := <-errChan:
 		// If the error stems from the container not existing there is no point in wasting
 		// CPU time to then try and terminate it.
-		if err == nil || client.IsErrNotFound(err) {
+		if err == nil || cerrdefs.IsNotFound(err) {
 			return nil
 		}
 		if terminate {
@@ -275,7 +279,7 @@ func (e *Environment) Terminate(ctx context.Context, signal string) error {
 	if err != nil {
 		// Treat missing containers as an okay error state, means it is obviously
 		// already terminated at this point.
-		if client.IsErrNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return nil
 		}
 		return errors.WithStack(err)
@@ -297,7 +301,7 @@ func (e *Environment) Terminate(ctx context.Context, signal string) error {
 	e.SetState(environment.ProcessStoppingState)
 
 	// Send the initial signal to the container.
-	if err := e.client.ContainerKill(ctx, e.Id, signal); err != nil && !client.IsErrNotFound(err) {
+	if _, err := e.client.ContainerKill(ctx, e.Id, client.ContainerKillOptions{Signal: signal}); err != nil && !cerrdefs.IsNotFound(err) {
 		return errors.WithStack(err)
 	}
 
@@ -316,7 +320,7 @@ func (e *Environment) Terminate(ctx context.Context, signal string) error {
 			// Re-inspect the container to check its state.
 			c, err := e.ContainerInspect(ctx)
 			if err != nil {
-				if client.IsErrNotFound(err) {
+				if cerrdefs.IsNotFound(err) {
 					// Container is gone, consider it stopped.
 					e.SetState(environment.ProcessOfflineState)
 					return nil
@@ -332,7 +336,7 @@ func (e *Environment) Terminate(ctx context.Context, signal string) error {
 
 		case <-timeLimit:
 			// Timeout reached, send SIGKILL as a last resort.
-			if err := e.client.ContainerKill(ctx, e.Id, "SIGKILL"); err != nil && !client.IsErrNotFound(err) {
+			if _, err := e.client.ContainerKill(ctx, e.Id, client.ContainerKillOptions{Signal: "SIGKILL"}); err != nil && !cerrdefs.IsNotFound(err) {
 				return errors.WithStack(err)
 			}
 			e.log().WithFields(log.Fields{

@@ -3,20 +3,37 @@ package filesystem
 import (
 	"io"
 	"math"
+	"os"
 	"sync"
-
-	"github.com/pelican/wings/internal/ufs"
 )
 
+// File is the handle returned by [Filesystem.Touch]. Writes made through it are
+// accounted against the disk quota of the Filesystem that opened it.
+type File interface {
+	io.Reader
+	io.ReaderAt
+	io.Writer
+	io.WriterAt
+	io.Seeker
+	io.Closer
+	io.ReaderFrom
+	Name() string
+	Stat() (os.FileInfo, error)
+	Truncate(size int64) error
+	Sync() error
+}
+
+var _ File = (*quotaFile)(nil)
+
 type quotaFile struct {
-	ufs.File
+	*os.File
 
 	fs   *Filesystem
 	mu   sync.Mutex
 	size int64
 }
 
-func newQuotaFile(fs *Filesystem, file ufs.File, size int64) ufs.File {
+func newQuotaFile(fs *Filesystem, file *os.File, size int64) *quotaFile {
 	return &quotaFile{File: file, fs: fs, size: size}
 }
 
@@ -49,6 +66,12 @@ func (f *quotaFile) WriteAt(p []byte, off int64) (int, error) {
 	return f.writeAtLocked(p, off, func() (int, error) {
 		return f.File.WriteAt(p, off)
 	})
+}
+
+// WriteString makes sure io.WriteString goes through the quota accounting
+// instead of the method promoted from the embedded *os.File.
+func (f *quotaFile) WriteString(s string) (int, error) {
+	return f.Write([]byte(s))
 }
 
 func (f *quotaFile) writeAtLocked(p []byte, off int64, write func() (int, error)) (int, error) {
@@ -92,8 +115,38 @@ func quotaWriteEnd(off int64, size int) (int64, bool) {
 	return off + int64(size), true
 }
 
+// ReadFrom must be implemented so that io.Copy does not bypass the quota by
+// using the io.ReaderFrom implementation of the embedded *os.File.
 func (f *quotaFile) ReadFrom(r io.Reader) (int64, error) {
 	return io.Copy(quotaFileWriter{file: f}, r)
+}
+
+// Truncate changes the size of the file, accounting for the change against
+// the quota. Growing a file is checked against the limit like any other write.
+func (f *quotaFile) Truncate(size int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if size < 0 {
+		return f.File.Truncate(size)
+	}
+	growth := size - f.size
+	if growth > 0 {
+		if err := f.fs.reserveDisk(growth); err != nil {
+			return err
+		}
+	}
+	if err := f.File.Truncate(size); err != nil {
+		if growth > 0 {
+			f.fs.adjustDisk(-growth)
+		}
+		return err
+	}
+	if growth < 0 {
+		f.fs.adjustDisk(growth)
+	}
+	f.size = size
+	return nil
 }
 
 func (f *quotaFile) Close() error {
@@ -111,6 +164,8 @@ func (f *quotaFile) Close() error {
 	return closeErr
 }
 
+// quotaFileWriter hides every method of quotaFile except Write so that io.Copy
+// does not recurse back into quotaFile.ReadFrom.
 type quotaFileWriter struct {
 	file *quotaFile
 }

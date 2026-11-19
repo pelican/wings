@@ -327,18 +327,18 @@ func (s *Server) ReadLogfile(len int) ([]string, error) {
 	return s.Environment.Readlog(len)
 }
 
-// Initializes a server instance. This will run through and ensure that the environment
-// for the server is setup, and that all of the necessary files are created.
+// CreateEnvironment Initializes a server instance. This will run through and ensure that the environment
+// for the server is set up, and that all of the necessary files are created.
 func (s *Server) CreateEnvironment() error {
 	// Ensure the data directory exists before getting too far through this process.
-	if err := s.EnsureDataDirectoryExists(); err != nil {
+	if _, err := s.EnsureDataDirectoryExists(); err != nil {
 		return err
 	}
 
 	// create the machine-id file on install
 	if config.Get().System.MachineID.Enable {
 		if err := s.CreateMachineID(); err != nil {
-			return err
+			return errors.Wrap(err, "server: failed to write machine-id to disk")
 		}
 	}
 
@@ -378,23 +378,27 @@ func (s *Server) Filesystem() *filesystem.Filesystem {
 	return s.fs
 }
 
-// EnsureDataDirectoryExists ensures that the data directory for the server
-// instance exists.
-func (s *Server) EnsureDataDirectoryExists() error {
-	if _, err := os.Lstat(s.fs.Path()); err != nil {
-		if os.IsNotExist(err) {
-			s.Log().Debug("server: creating root directory and setting permissions")
-			if err := os.MkdirAll(s.fs.Path(), 0o700); err != nil {
-				return errors.WithStack(err)
-			}
-			if err := s.fs.Chown("/"); err != nil {
-				s.Log().WithField("error", err).Warn("server: failed to chown server data directory")
-			}
-		} else {
-			return errors.WrapIf(err, "server: failed to stat server root directory")
+// EnsureDataDirectoryExists ensures that the data directory for the server instance exists.
+// This path is controlled by the system and not available to a user.
+func (s *Server) EnsureDataDirectoryExists() (string, error) {
+	c := *config.Get()
+	serverPath := filepath.Join(c.System.Data, s.ID())
+
+	if _, err := os.Lstat(serverPath); err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			return serverPath, errors.Wrap(err, "server: failed to stat server root directory")
+		}
+
+		if err := os.MkdirAll(serverPath, 0o700); err != nil {
+			return serverPath, errors.Wrap(err, "server: failed to create root directory")
+		}
+
+		if err := os.Chown(serverPath, c.System.User.Uid, c.System.User.Gid); err != nil {
+			s.Log().WithField("error", err).Warn("server: failed to chown server data directory")
 		}
 	}
-	return nil
+
+	return serverPath, nil
 }
 
 // OnStateChange sets the state of the server internally. This function handles crash detection as

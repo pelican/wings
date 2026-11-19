@@ -1,18 +1,24 @@
 package filesystem
 
 import (
+	"bytes"
 	"encoding/json"
 	"testing"
 	"time"
 )
 
 func TestStatCTime(t *testing.T) {
-	fs, rfs := NewFs()
+	fs := NewFs()
 	defer func() { _ = fs.TruncateRootDirectory() }()
 
-	if err := rfs.CreateServerFileFromString("ctime_test.txt", "hello"); err != nil {
+	r := bytes.NewReader([]byte("hello"))
+
+	if err := fs.Writefile("ctime_test.txt", r); err != nil {
 		t.Fatal(err)
 	}
+	// if err := fs.CreateServerFileFromString("ctime_test.txt", "hello"); err != nil {
+	// 	t.Fatal(err)
+	// }
 
 	st, err := fs.Stat("ctime_test.txt")
 	if err != nil {
@@ -29,12 +35,18 @@ func TestStatCTime(t *testing.T) {
 }
 
 func TestStatMarshalJSON(t *testing.T) {
-	fs, rfs := NewFs()
+	fs := NewFs()
 	defer func() { _ = fs.TruncateRootDirectory() }()
 
-	if err := rfs.CreateServerFileFromString("json_test.txt", "hello world"); err != nil {
+	r := bytes.NewReader([]byte("hello world"))
+
+	if err := fs.Writefile("json_test.txt", r); err != nil {
 		t.Fatal(err)
 	}
+
+	// if err := fs.CreateServerFileFromString("json_test.txt", "hello world"); err != nil {
+	// 	t.Fatal(err)
+	// }
 
 	st, err := fs.Stat("json_test.txt")
 	if err != nil {

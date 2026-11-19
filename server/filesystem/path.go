@@ -1,43 +1,135 @@
 package filesystem
 
 import (
-	"path/filepath"
+	"os"
+	"path"
 	"strings"
 
 	"emperror.dev/errors"
 )
 
+// maxSymlinkHops is how many symlinks resolveInRoot follows before giving up,
+// the same limit Linux uses (MAXSYMLINKS).
+const maxSymlinkHops = 40
+
 // Checks if the given file or path is in the server's file denylist. If so, an Error
 // is returned, otherwise nil is returned.
+//
+// The path is checked as provided, after being cleaned, and after being cleaned as
+// if it started at the server root. That way neither "foo/../config.yml" nor
+// "../config.yml" can be used to get around an anchored pattern like "/config.yml";
+// callers do not all clean a leading "/" off the same way before using the path.
+//
+// The path is also checked after resolving any symlinks in it, since os.Root
+// follows symlinks that stay inside the server directory. Without that a link
+// such as "notes -> config.yml" would give access to a denylisted file.
 func (fs *Filesystem) IsIgnored(paths ...string) error {
 	for _, p := range paths {
-		//sp, err := fs.SafePath(p)
-		//if err != nil {
-		//	return err
-		//}
-		// TODO: update logic to use unixFS
-		if fs.denylist.MatchesPath(p) {
-			return errors.WithStack(&Error{code: ErrCodeDenylistFile, path: p, resolved: p})
+		if fs.matchesDenylist(p) {
+			return errors.WithStack(&Error{code: ErrCodeDenylistFile, path: p, resolved: normalize(p)})
+		}
+		if err := fs.isIgnoredThroughLink(p); err != nil {
+			return err
 		}
 	}
 	return nil
 }
 
-// Generate a path to the file by cleaning it up and appending the root server path to it. This
-// DOES NOT guarantee that the file resolves within the server data directory. You'll want to use
-// the fs.unsafeIsInDataDirectory(p) function to confirm.
-func (fs *Filesystem) unsafeFilePath(p string) string {
-	// Calling filepath.Clean on the joined directory will resolve it to the absolute path,
-	// removing any ../ type of resolution arguments, and leaving us with a direct path link.
-	//
-	// This will also trim the existing root path off the beginning of the path passed to
-	// the function since that can get a bit messy.
-	return filepath.Clean(filepath.Join(fs.Path(), strings.TrimPrefix(p, fs.Path())))
+// IsIgnoredNoFollow is IsIgnored for operations that act on a directory entry
+// itself rather than on what it points to: deleting and renaming. Symlinks in the
+// parent directories are followed, since os.Root follows them too, but a symlink
+// at the end of the path is not, so a link to a denylisted file can still be
+// deleted or renamed without the file it points to being touched.
+func (fs *Filesystem) IsIgnoredNoFollow(paths ...string) error {
+	for _, p := range paths {
+		if fs.matchesDenylist(p) {
+			return errors.WithStack(&Error{code: ErrCodeDenylistFile, path: p, resolved: normalize(p)})
+		}
+		if !fs.hasDenylist {
+			continue
+		}
+		clean := normalize("/" + p)
+		if clean == "." {
+			continue
+		}
+		resolved := normalize("/" + path.Join(fs.resolveInRoot(path.Dir(clean)), path.Base(clean)))
+		if resolved != clean && fs.matchesDenylist(resolved) {
+			return errors.WithStack(&Error{code: ErrCodeDenylistFile, path: p, resolved: resolved})
+		}
+	}
+	return nil
 }
 
-// Check that that path string starts with the server data directory path. This function DOES NOT
-// validate that the rest of the path does not end up resolving out of this directory, or that the
-// targeted file or folder is not a symlink doing the same thing.
-func (fs *Filesystem) unsafeIsInDataDirectory(p string) bool {
-	return strings.HasPrefix(strings.TrimSuffix(p, "/")+"/", strings.TrimSuffix(fs.Path(), "/")+"/")
+// isIgnoredThroughLink returns an error if p, once its symlinks are resolved,
+// is a different path that is in the denylist. It does not check p itself.
+func (fs *Filesystem) isIgnoredThroughLink(p string) error {
+	if !fs.hasDenylist {
+		return nil
+	}
+	resolved := fs.resolveInRoot(p)
+	if resolved != normalize("/"+p) && fs.matchesDenylist(resolved) {
+		return errors.WithStack(&Error{code: ErrCodeDenylistFile, path: p, resolved: resolved})
+	}
+	return nil
+}
+
+func (fs *Filesystem) matchesDenylist(p string) bool {
+	return fs.denylist.MatchesPath(p) || fs.denylist.MatchesPath(normalize(p)) || fs.denylist.MatchesPath(normalize("/"+p))
+}
+
+// resolveInRoot returns the path, relative to the server root, that p refers to
+// once every symlink in it has been followed the way os.Root follows them.
+//
+// p itself is cleaned first, as every caller cleans a path before os.Root sees
+// it. A link's target is not: os.Root applies ".." in a target to the folder the
+// parts before it lead to, so "jump/../config.yml" with "jump -> sub/x" is
+// "sub/config.yml". The parts of a target are therefore resolved one at a time,
+// and ".." drops the last folder resolved so far, which is never a symlink.
+//
+// Resolving stops at the first part of the path that does not exist, at an
+// absolute symlink (os.Root refuses to follow those) and after maxSymlinkHops
+// links; whatever is left of the path is then joined on as it is. ".." at the
+// root stays at the root, as with every other path here, and os.Root refuses to
+// go above it anyway.
+func (fs *Filesystem) resolveInRoot(p string) string {
+	r, err := fs.openRoot()
+	if err != nil {
+		return normalize("/" + p)
+	}
+	rest := strings.Split(normalize("/"+p), "/")
+	var done []string
+	hops := 0
+	for len(rest) > 0 {
+		part := rest[0]
+		rest = rest[1:]
+		switch part {
+		case "", ".":
+			continue
+		case "..":
+			if len(done) > 0 {
+				done = done[:len(done)-1]
+			}
+			continue
+		}
+		cur := path.Join(append(done, part)...)
+		st, err := r.Lstat(cur)
+		if err != nil {
+			done = append(append(done, part), rest...)
+			break
+		}
+		if st.Mode()&os.ModeSymlink == 0 {
+			done = append(done, part)
+			continue
+		}
+		target, err := r.Readlink(cur)
+		hops++
+		if err != nil || path.IsAbs(target) || hops > maxSymlinkHops {
+			done = append(append(done, part), rest...)
+			break
+		}
+		// Carry on from the folder holding the link, with the target's parts,
+		// unresolved, in front of what is left.
+		rest = append(strings.Split(target, "/"), rest...)
+	}
+	return normalize("/" + path.Join(done...))
 }

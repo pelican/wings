@@ -59,30 +59,31 @@ func (s *S3Backup) Generate(ctx context.Context, fsys *filesystem.Filesystem, ig
 	}
 	defer s.Remove()
 
-	a := &filesystem.Archive{
-		Filesystem: fsys,
-		Ignore:     ignore,
+	a, err := fsys.NewArchive(".", filesystem.WithIgnored(ignore))
+	if err != nil {
+		return nil, errors.WrapIf(err, "backup: failed to create archive")
 	}
 
 	s.log().WithField("path", s.Path()).Info("creating backup for server")
-	if _, err := os.Stat(filepath.Dir(s.Path())); os.IsNotExist(err) {
-		err := os.Mkdir(filepath.Dir(s.Path()), 0o700)
-		if err != nil {
-			return nil, err
-		}
+	if err := os.MkdirAll(filepath.Dir(s.Path()), 0o700); err != nil {
+		return nil, errors.Wrap(err, "backup: failed to create backup directory")
 	}
-	if err := a.Create(ctx, s.Path()); err != nil {
+	f, err := os.OpenFile(s.Path(), os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o600)
+	if err != nil {
+		return nil, errors.Wrap(err, "backup: failed to open file for writing")
+	}
+	defer f.Close()
+	if err := a.Create(ctx, f); err != nil {
 		return nil, err
 	}
 	s.log().Info("created backup successfully")
 
-	rc, err := os.Open(s.Path())
-	if err != nil {
-		return nil, errors.Wrap(err, "backup: could not read archive from disk")
+	_ = f.Sync()
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return nil, errors.Wrap(err, "backup: failed to seek on file")
 	}
-	defer rc.Close()
 
-	parts, err := s.generateRemoteRequest(ctx, rc)
+	parts, err := s.generateRemoteRequest(ctx, f)
 	if err != nil {
 		return nil, err
 	}
@@ -114,7 +115,7 @@ func (s *S3Backup) Restore(ctx context.Context, r io.Reader, callback RestoreCal
 		}
 		defer r.Close()
 
-		return callback(f.NameInArchive, f.FileInfo, r)
+		return callback(f.NameInArchive, f, r)
 	}); err != nil {
 		return err
 	}

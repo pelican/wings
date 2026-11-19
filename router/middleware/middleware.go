@@ -14,6 +14,7 @@ import (
 
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/remote"
+	"github.com/pelican/wings/router/tokens"
 	"github.com/pelican/wings/server"
 	"github.com/pelican/wings/system"
 )
@@ -82,6 +83,14 @@ func CaptureErrors() gin.HandlerFunc {
 			return
 		}
 		captured := NewError(err.Err)
+		// A malformed, badly signed or expired token is a problem with the request's
+		// credentials, not with Wings. Answer 401 so the client fetches a new token,
+		// and log it at debug level instead of as a server error.
+		if errors.Is(err.Err, tokens.ErrInvalidToken) {
+			captured.SetMessage("The provided token is invalid or has expired.")
+			captured.Abort(c, http.StatusUnauthorized)
+			return
+		}
 		if status, msg := captured.asFilesystemError(); msg != "" {
 			c.AbortWithStatusJSON(status, gin.H{"error": msg, "request_id": c.Writer.Header().Get("X-Request-Id")})
 			return

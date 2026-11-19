@@ -82,6 +82,28 @@ func TestDockerRegistryCredentialsForImage(t *testing.T) {
 	}
 }
 
+func TestCpuPeriodMicroseconds(t *testing.T) {
+	tests := []struct {
+		name     string
+		period   int64
+		expected int64
+	}{
+		{name: "default period", period: 100_000, expected: 100_000},
+		{name: "shorter period", period: 20_000, expected: 20_000},
+		{name: "below kernel minimum", period: 500, expected: 1_000},
+		{name: "above kernel maximum", period: 5_000_000, expected: 1_000_000},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := DockerConfiguration{CpuPeriod: tt.period}
+			if v := cfg.CpuPeriodMicroseconds(); v != tt.expected {
+				t.Errorf("expected %d, got %d", tt.expected, v)
+			}
+		})
+	}
+}
+
 func TestDockerRegistryPathCredentialsDoNotMatchSiblingPath(t *testing.T) {
 	cfg := DockerConfiguration{
 		Registries: map[string]RegistryConfiguration{
@@ -95,5 +117,14 @@ func TestDockerRegistryPathCredentialsDoNotMatchSiblingPath(t *testing.T) {
 	_, registry := cfg.RegistryCredentialsForImage("registry.example.com/team-evil/image:latest")
 	if registry != nil {
 		t.Fatalf("expected no registry credentials, got username %q", registry.Username)
+	}
+}
+func TestDnsAddrsSkipsInvalidEntries(t *testing.T) {
+	c := DockerNetworkConfiguration{Dns: []string{"1.1.1.1", " 2606:4700::1111 ", "dns.example.com", ""}}
+	for range 2 { // second call exercises the already-warned path
+		got := c.DnsAddrs()
+		if len(got) != 2 || got[0].String() != "1.1.1.1" || got[1].String() != "2606:4700::1111" {
+			t.Fatalf("unexpected DNS addresses: %v", got)
+		}
 	}
 }
