@@ -64,6 +64,9 @@ jobs:
             VERSION=${{ steps.build_info.outputs.version_tag }}
           labels: ${{ steps.docker_meta.outputs.labels }}
           tags: ${{ steps.docker_meta.outputs.tags }}
+          # Read-only: reuse the layers main has cached. Cache written from a tag ref
+          # can only be restored by that same tag, so writing here would just use quota.
+          cache-from: type=gha
 
       - name: Build and Push (main)
         uses: docker/build-push-action@v7
