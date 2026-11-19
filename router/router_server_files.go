@@ -694,13 +694,12 @@ func handleFileUpload(p string, s *server.Server, r io.Reader, limit int64) erro
 		return err
 	}
 
-	n, err := s.Filesystem().WriteFrom(p, io.LimitReader(r, limit+1))
-	if err != nil {
+	// A refused or failed upload never replaces the existing file.
+	if _, err := s.Filesystem().WriteFrom(p, r, limit); err != nil {
+		if errors.Is(err, filesystem.ErrWriteTooLarge) {
+			return errUploadTooLarge
+		}
 		return err
-	}
-	if n > limit {
-		_ = s.Filesystem().Delete(p)
-		return errUploadTooLarge
 	}
 	return nil
 }

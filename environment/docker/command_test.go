@@ -105,3 +105,28 @@ func TestSendCommandTimeoutIsDeadlineExceeded(t *testing.T) {
 		}
 	})
 }
+
+// A command holding several lines stops the server if any of its lines is the
+// stop command, since the process reads each line as its own command.
+func TestContainsStopCommand(t *testing.T) {
+	cases := map[string]bool{
+		"stop":             true,
+		"x\nstop":          true,
+		"x\r\nstop":        true,
+		"stop\rx":          true,
+		"say hi\n\nstop\n": true,
+		"stopx":            false,
+		"x stop":           false,
+		" stop":            false,
+		"say stop\nsay hi": false,
+		"":                 false,
+	}
+	for c, want := range cases {
+		if got := containsStopCommand(c, "stop"); got != want {
+			t.Errorf("containsStopCommand(%q) = %v, want %v", c, got, want)
+		}
+	}
+	if containsStopCommand("x\n", "") {
+		t.Error("an empty stop command must never match")
+	}
+}

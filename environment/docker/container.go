@@ -508,7 +508,7 @@ func (e *Environment) SendCommand(c string) error {
 	// If the command being processed is the same as the process stop command then we
 	// want to mark the server as entering the stopping state otherwise the process will
 	// stop and Wings will think it has crashed and attempt to restart it.
-	if stop.Type == "command" && c == stop.Value {
+	if stop.Type == "command" && containsStopCommand(c, stop.Value) {
 		e.SetState(environment.ProcessStoppingState)
 	}
 
@@ -526,6 +526,24 @@ func (e *Environment) SendCommand(c string) error {
 	}
 
 	return nil
+}
+
+// containsStopCommand reports whether any line of the command is the stop
+// command. A command can hold several lines, each of which the process reads as
+// its own command, so "x\nstop" stops the server just as "stop" does.
+func containsStopCommand(c, stop string) bool {
+	if stop == "" {
+		return false
+	}
+	if c == stop {
+		return true
+	}
+	for _, line := range strings.FieldsFunc(c, func(r rune) bool { return r == '\n' || r == '\r' }) {
+		if line == stop {
+			return true
+		}
+	}
+	return false
 }
 
 // Readlog reads the log file for the server. This does not care if the server

@@ -3,6 +3,7 @@ package filesystem
 import (
 	"io"
 	fs2 "io/fs"
+	"math/rand/v2"
 	"os"
 	"path"
 	"path/filepath"
@@ -318,17 +319,8 @@ func (fs *Filesystem) touch(p string, flag int, mode os.FileMode) (*os.File, err
 // Deprecated: prefer the use of [Filesystem.Write], which checks that the file
 // fits within the disk limit before writing anything.
 func (fs *Filesystem) Writefile(p string, r io.Reader) error {
-	file, err := fs.Touch(p, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
-	if err != nil {
-		return err
-	}
-
-	_, err = io.Copy(file, r)
-	if cerr := file.Close(); err == nil {
-		err = cerr
-	}
-	if err != nil {
-		return errors.Wrap(err, "server/filesystem: writefile: failed to write file")
+	if _, err := fs.replaceFile(p, r, -1); err != nil {
+		return errors.WrapIf(err, "server/filesystem: writefile: failed to write file")
 	}
 	return nil
 }
@@ -477,18 +469,189 @@ func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode os.FileMo
 	return nil
 }
 
+// ErrWriteTooLarge is returned by WriteFrom when more than the allowed number of
+// bytes are read.
+var ErrWriteTooLarge = errors.Sentinel("server/filesystem: write is larger than the allowed size")
+
 // WriteFrom writes everything read from r to the file at p, replacing it if it
 // exists, and returns the number of bytes written. Unlike Write the size does not
 // need to be known up front: every write is checked against the disk limit as it
-// is made. If writing fails the file is removed.
-func (fs *Filesystem) WriteFrom(p string, r io.Reader) (int64, error) {
+// is made. If limit is zero or more and r holds more than limit bytes,
+// ErrWriteTooLarge is returned.
+//
+// The data is written to a temporary file that only replaces the file at p once
+// it has been written in full. If writing fails, the existing file is kept.
+func (fs *Filesystem) WriteFrom(p string, r io.Reader, limit int64) (int64, error) {
+	return fs.replaceFile(p, r, limit)
+}
+
+// replaceFile writes r to a temporary file next to p and renames it over p once
+// it has been written in full, so that a failed write never leaves p truncated
+// or removed. If limit is zero or more, more than limit bytes is a failure;
+// a negative limit means there is none.
+//
+// While the new file is written, both it and the file it replaces count against
+// the disk limit, since both are on the disk. The replaced file's space is
+// released once it has been unlinked by the rename.
+func (fs *Filesystem) replaceFile(p string, r io.Reader, limit int64) (int64, error) {
+	root, err := fs.openRoot()
+	if err != nil {
+		return 0, err
+	}
+	p = normalize(p)
+	if p == "." {
+		return 0, &Error{code: ErrCodeIsDirectory, resolved: p}
+	}
+
+	target := p
+	st, err := root.Lstat(p)
+	switch {
+	case errors.Is(err, os.ErrNotExist):
+		// Create the directories leading up to the file, so the temporary file
+		// can be made beside it.
+		if err := fs.mkdirAll(filepath.Dir(p), 0o755); err != nil {
+			return 0, errors.WrapIf(err, "server/filesystem: write: failed to create directory tree")
+		}
+	case err != nil:
+		return 0, errors.Wrap(err, "server/filesystem: write: failed to stat file")
+	case st.Mode()&os.ModeSymlink != 0:
+		// A symlink is written through, as before, so the file it points to is
+		// replaced rather than the link itself.
+		resolved, ok := fs.resolveLink(p)
+		if !ok {
+			// Leave errors such as a link that leaves the server directory, or one
+			// whose target does not exist, to the in-place write, which reports
+			// them and has no existing file to lose.
+			return fs.writeInPlace(p, r, limit)
+		}
+		target = resolved
+	case st.IsDir():
+		return 0, &Error{code: ErrCodeIsDirectory, resolved: p}
+	case !st.Mode().IsRegular():
+		return 0, &Error{code: ErrCodeNotRegular, resolved: p}
+	}
+
+	// Hold the file that is being replaced open, so the space it frees can be
+	// read from the file the rename actually unlinked.
+	var old *os.File
+	mode := os.FileMode(0o644)
+	if f, err := fs.openRegular(target); err == nil {
+		old = f
+		defer old.Close()
+		if ost, err := old.Stat(); err == nil {
+			mode = ost.Mode().Perm()
+		}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return 0, errors.WithStackIf(err)
+	}
+
+	tmp, f, err := fs.createTemp(filepath.Dir(target), mode)
+	if err != nil {
+		return 0, err
+	}
+	// The mode is applied after creation so the umask does not change it.
+	_ = f.Chmod(mode)
+	qf := newQuotaFile(fs, f, 0)
+	src := r
+	if limit >= 0 {
+		src = io.LimitReader(r, limit+1)
+	}
+	n, err := io.Copy(qf, src)
+	if cerr := qf.Close(); err == nil {
+		err = cerr
+	}
+	if err == nil && limit >= 0 && n > limit {
+		err = ErrWriteTooLarge
+	}
+	if err == nil {
+		err = root.Rename(tmp, target)
+	}
+	if err != nil {
+		if rerr := root.Remove(tmp); rerr == nil {
+			fs.adjustDisk(-qf.size)
+		}
+		return n, err
+	}
+
+	if old != nil {
+		if ost, err := old.Stat(); err == nil {
+			if s, ok := ost.Sys().(*syscall.Stat_t); ok && s.Nlink == 0 {
+				fs.adjustDisk(-ost.Size())
+			}
+		}
+	}
+	return n, nil
+}
+
+// createTemp exclusively creates a new, uniquely named temporary file in dir.
+func (fs *Filesystem) createTemp(dir string, mode os.FileMode) (string, *os.File, error) {
+	for attempt := 0; ; attempt++ {
+		name := path.Join(dir, ".wings-write-"+strconv.FormatUint(rand.Uint64(), 36)+".tmp")
+		f, err := fs.touch(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, mode)
+		if err == nil {
+			return name, f, nil
+		}
+		if !errors.Is(err, os.ErrExist) || attempt >= 10 {
+			return "", nil, errors.WrapIf(err, "server/filesystem: write: failed to create temporary file")
+		}
+	}
+}
+
+// resolveLink returns the path, relative to the server directory, of the
+// regular file that the symlink at p points to. It returns false if the link
+// cannot be followed, or does not lead to a regular file inside the server
+// directory.
+func (fs *Filesystem) resolveLink(p string) (string, bool) {
+	f, err := fs.openRegular(p)
+	if err != nil {
+		return "", false
+	}
+	defer f.Close()
+	root, err := fs.openRoot()
+	if err != nil {
+		return "", false
+	}
+	dir, err := root.Open(".")
+	if err != nil {
+		return "", false
+	}
+	defer dir.Close()
+
+	// Both are read from the open handles, so the result is right even if the
+	// server directory was moved since it was opened.
+	real, err := os.Readlink("/proc/self/fd/" + strconv.FormatUint(uint64(f.Fd()), 10))
+	if err != nil {
+		return "", false
+	}
+	base, err := os.Readlink("/proc/self/fd/" + strconv.FormatUint(uint64(dir.Fd()), 10))
+	if err != nil {
+		return "", false
+	}
+	rel, err := filepath.Rel(base, real)
+	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, "../") || filepath.IsAbs(rel) {
+		return "", false
+	}
+	return rel, true
+}
+
+// writeInPlace truncates and writes the file at p. It is only used when p is a
+// symlink that cannot be resolved, so there is no existing file to lose, and
+// its errors are the ones Touch reports for such links.
+func (fs *Filesystem) writeInPlace(p string, r io.Reader, limit int64) (int64, error) {
 	f, err := fs.Touch(p, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
 	if err != nil {
 		return 0, err
 	}
-	n, err := io.Copy(f, r)
+	src := r
+	if limit >= 0 {
+		src = io.LimitReader(r, limit+1)
+	}
+	n, err := io.Copy(f, src)
 	if cerr := f.Close(); err == nil {
 		err = cerr
+	}
+	if err == nil && limit >= 0 && n > limit {
+		err = ErrWriteTooLarge
 	}
 	if err != nil {
 		_ = fs.Delete(p)
