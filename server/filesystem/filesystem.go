@@ -379,8 +379,15 @@ func (fs *Filesystem) mkdirAll(p string, mode os.FileMode) error {
 	return nil
 }
 
-// Write writes a file to the disk.
+// Write writes a file to the disk. A negative newSize means the size is not
+// known ahead of time (chunked or transparently decompressed downloads), in
+// which case the data is written to a temporary file with the disk limit
+// enforced as it comes in, and only renamed over p once complete.
 func (fs *Filesystem) Write(p string, r io.Reader, newSize int64, mode os.FileMode) error {
+	if newSize < 0 {
+		_, err := fs.replaceFile(p, r, -1)
+		return err
+	}
 	root, err := fs.openRoot()
 	if err != nil {
 		return err
