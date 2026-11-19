@@ -3,14 +3,18 @@
 # target platform, instead of emulating the whole Go toolchain under QEMU.
 FROM --platform=$BUILDPLATFORM golang:1.27.4-alpine AS builder
 
-ARG VERSION
-ARG TARGETOS
-ARG TARGETARCH
 RUN apk add --update --no-cache git make
 WORKDIR /app/
 COPY go.mod go.sum /app/
 RUN go mod download
 COPY . /app/
+# Declare build args only where they're used: every RUN after an ARG gets it in
+# its environment, so declaring VERSION (dev-<sha>) earlier would invalidate the
+# cache for apk add / go mod download on every commit, and TARGETARCH would make
+# those layers differ per platform.
+ARG VERSION
+ARG TARGETOS
+ARG TARGETARCH
 RUN CGO_ENABLED=0 GOOS=$TARGETOS GOARCH=$TARGETARCH go build \
     -ldflags="-s -w -X github.com/pelican/wings/system.Version=$VERSION" \
     -v \
