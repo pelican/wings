@@ -89,8 +89,8 @@ func (fs *Filesystem) RestoreSymlink(name, target string) error {
 	}
 
 	// The replaced regular file no longer counts towards the disk usage.
-	if previous != nil && previous.Mode().IsRegular() {
-		fs.addDisk(-previous.Size())
+	if previous != nil {
+		fs.addDisk(-freedBy(previous))
 	}
 	return nil
 }

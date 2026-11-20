@@ -40,12 +40,17 @@ func (m *Manager) Add(transfer *Transfer) {
 	m.transfers[transfer.Server.ID()] = transfer
 }
 
-// Remove removes a transfer from the manager.
+// Remove removes a transfer from the manager. Nothing is removed if another
+// transfer of the same server has replaced it since, so that a transfer that
+// finishes late cannot remove the entry of a newer one.
 func (m *Manager) Remove(transfer *Transfer) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	delete(m.transfers, transfer.Server.ID())
+	id := transfer.Server.ID()
+	if m.transfers[id] == transfer {
+		delete(m.transfers, id)
+	}
 }
 
 // Get gets a transfer from the manager using a server ID.

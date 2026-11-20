@@ -253,8 +253,10 @@ func deleteServer(c *gin.Context) {
 		log.WithFields(log.Fields{"server_id": ID, "error": err}).Warn("failed to remove server install log during deletion process")
 	}
 
-	// Remove all server backups unless config setting is specified
-	if config.Get().System.Backups.RemoveBackupsOnServerDelete == true {
+	// Remove all server backups unless config setting is specified, or the Panel
+	// asks for them to be kept so new servers can be created from them later.
+	keepBackups, _ := strconv.ParseBool(c.Query("keep_backups"))
+	if config.Get().System.Backups.RemoveBackupsOnServerDelete && !keepBackups {
 		if err := s.RemoveAllServerBackups(); err != nil {
 			middleware.CaptureAndAbort(c, err)
 			return

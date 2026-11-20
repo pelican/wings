@@ -7,17 +7,21 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"emperror.dev/errors"
+	"github.com/apex/log"
 	"github.com/goccy/go-json"
 	"github.com/google/uuid"
 
 	"github.com/pelican/wings/config"
+	wnet "github.com/pelican/wings/internal/network"
 	"github.com/pelican/wings/server"
 )
 
@@ -26,33 +30,37 @@ var client *http.Client
 func init() {
 	dialer := &net.Dialer{
 		LocalAddr: nil,
+		Timeout:   time.Second * 30,
+		// Check every address immediately before connecting to it, since the
+		// destination is resolved again when dialing.
+		ControlContext: checkConnection,
 	}
 
 	trnspt := http.DefaultTransport.(*http.Transport).Clone()
+	// Always connect directly, so that every destination is checked. Through a
+	// proxy only the address of the proxy would be.
+	trnspt.Proxy = nil
+	// Store the file exactly as it is served. Asking for a compressed response
+	// would also hide the length of the file, which is needed to write it.
+	trnspt.DisableCompression = true
 	trnspt.DialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		c, err := dialer.DialContext(ctx, network, addr)
+		host, _, err := net.SplitHostPort(addr)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
-
-		ipStr, _, err := net.SplitHostPort(c.RemoteAddr().String())
-		if err != nil {
-			return c, errors.WithStack(err)
+		// Refuse the destination if any of its addresses are internal, or if it
+		// cannot be resolved, before connecting to anything.
+		ips, err := net.DefaultResolver.LookupNetIP(ctx, "ip", host)
+		if err != nil || len(ips) == 0 {
+			log.WithField("host", host).WithField("error", err).Debug("downloader: failed to resolve remote file host")
+			return nil, errors.WithStack(ErrInvalidIPAddress)
 		}
-		ip := net.ParseIP(ipStr)
-		if ip == nil {
-			return c, errors.WithStack(ErrInvalidIPAddress)
-		}
-		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() {
-			return c, errors.WithStack(ErrInternalResolution)
-		}
-		for _, block := range internalRanges {
-			if !block.Contains(ip) {
-				continue
+		for _, ip := range ips {
+			if isBlocked(host, ip) {
+				return nil, errors.WithStack(ErrInternalResolution)
 			}
-			return c, errors.WithStack(ErrInternalResolution)
 		}
-		return c, nil
+		return dialer.DialContext(context.WithValue(ctx, dialHostKey{}, host), network, addr)
 	}
 
 	client = &http.Client{
@@ -75,6 +83,37 @@ func init() {
 	}
 }
 
+// dialHostKey is the context key for the host name a connection is being made
+// to, which is checked against the allowlist when the connection is made.
+type dialHostKey struct{}
+
+// checkConnection is called with the address a connection is about to be made
+// to, and refuses to connect to any internal address.
+func checkConnection(ctx context.Context, _ string, address string, _ syscall.RawConn) error {
+	ipStr, _, err := net.SplitHostPort(address)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	ip, err := netip.ParseAddr(ipStr)
+	if err != nil {
+		return errors.WithStack(ErrInternalResolution)
+	}
+	host, _ := ctx.Value(dialHostKey{}).(string)
+	if isBlocked(host, ip) {
+		return errors.WithStack(ErrInternalResolution)
+	}
+	return nil
+}
+
+// isBlocked reports whether connecting to the address, resolved from the host,
+// is refused because it is internal and not allowed by the operator. Anything
+// other than a globally reachable unicast address is internal, including the
+// 0.0.0.0/8 range, which reaches the node itself on Linux, and NAT64 addresses
+// embedding an internal IPv4 address.
+func isBlocked(host string, ip netip.Addr) bool {
+	return wnet.IsInternal(ip) && !wnet.IsAllowed(config.Get().Api.RemoteDownload.Allowlist, host, ip)
+}
+
 var instance = &Downloader{
 	// Tracks all the active downloads.
 	downloadCache: make(map[string]*Download),
@@ -82,18 +121,6 @@ var instance = &Downloader{
 	// primarily used to make things quicker and keep the code a little more
 	// legible throughout here.
 	serverCache: make(map[string][]string),
-}
-
-// Internal IP ranges that should be blocked if the resource requested resolves within.
-var internalRanges = []*net.IPNet{
-	mustParseCIDR("127.0.0.1/8"),
-	mustParseCIDR("10.0.0.0/8"),
-	mustParseCIDR("172.16.0.0/12"),
-	mustParseCIDR("192.168.0.0/16"),
-	mustParseCIDR("169.254.0.0/16"),
-	mustParseCIDR("::1/128"),
-	mustParseCIDR("fe80::/10"),
-	mustParseCIDR("fc00::/7"),
 }
 
 const (
@@ -212,7 +239,10 @@ func (dl *Download) Execute() error {
 		req.Header.Set("User-Agent", "Pelican Panel (https://pelican.dev)")
 		res, err = client.Do(req)
 		if err != nil {
-			return errors.WrapIf(err, "downloader: failed to perform request")
+			if IsDownloadError(err) {
+				return err
+			}
+			return errors.WithStack(fmt.Errorf("%w: %w", ErrDownloadFailed, err))
 		}
 
 		if res.StatusCode >= http.StatusMultipleChoices && res.StatusCode < http.StatusBadRequest {
@@ -252,10 +282,6 @@ func (dl *Download) Execute() error {
 		return errors.New("downloader: got bad response status from endpoint: " + res.Status)
 	}
 
-	if res.ContentLength < 1 {
-		return errors.New("downloader: request is missing ContentLength")
-	}
-
 	if dl.req.UseHeader {
 		if contentDisposition := res.Header.Get("Content-Disposition"); contentDisposition != "" {
 			_, params, err := mime.ParseMediaType(contentDisposition)
@@ -281,12 +307,29 @@ func (dl *Download) Execute() error {
 		}
 	}
 
+	// Only use the name of the file, wherever it came from, so that it is saved in
+	// the directory that was asked for.
+	dl.path = baseName(dl.path)
+	if dl.path == "" {
+		return errors.New("downloader: could not determine a name for the downloaded file")
+	}
+
 	p := dl.Path()
+	// Remote downloads must not be able to create files the egg does not allow.
+	if err := dl.server.Filesystem().IsIgnored(p); err != nil {
+		return err
+	}
 	dl.server.Log().WithField("path", p).Debug("writing remote file to disk")
 
 	// Write the file while tracking the progress, Write will check that the
-	// size of the file won't exceed the disk limit.
-	r := io.TeeReader(res.Body, dl.counter(res.ContentLength))
+	// size of the file won't exceed the disk limit. The length is unknown (-1)
+	// for chunked responses and for responses that the HTTP client transparently
+	// decompressed, in which case Write enforces the limit as the data comes in
+	// and the progress stays at zero since there is nothing to measure it against.
+	var r io.Reader = res.Body
+	if res.ContentLength > 0 {
+		r = io.TeeReader(res.Body, dl.counter(res.ContentLength))
+	}
 	if err := dl.server.Filesystem().Write(p, r, res.ContentLength, 0o644); err != nil {
 		return errors.WrapIf(err, "downloader: failed to write file to server directory")
 	}
@@ -308,11 +351,22 @@ func (dl *Download) BelongsTo(s *server.Server) bool {
 }
 
 // Progress returns the current progress of the download as a float value between 0 and 1 where
-// 1 indicates that the download is completed.
+// 1 indicates that the download is completed. If the remote server did not report the size of
+// the file, the progress remains at 0 until the download finishes.
 func (dl *Download) Progress() float64 {
 	dl.mu.RLock()
 	defer dl.mu.RUnlock()
 	return dl.progress
+}
+
+// baseName returns the last element of the path, or an empty string if it does
+// not name a file.
+func baseName(p string) string {
+	name := filepath.Base(filepath.Clean("/" + p))
+	if name == "/" || name == "." || name == ".." {
+		return ""
+	}
+	return name
 }
 
 func (dl *Download) Path() string {
@@ -385,12 +439,11 @@ func (d *Downloader) remove(dlID string) {
 	}
 }
 
-func mustParseCIDR(ip string) *net.IPNet {
-	_, block, err := net.ParseCIDR(ip)
-	if err != nil {
-		panic(fmt.Errorf("downloader: failed to parse CIDR: %s", err))
-	}
-	return block
+// IsDownloadError reports whether the error is from the remote file failing to
+// download, such as the destination being refused or the connection failing,
+// rather than from Wings itself.
+func IsDownloadError(err error) bool {
+	return errors.Is(err, ErrDownloadFailed) || errors.Is(err, ErrInvalidIPAddress) || errors.Is(err, ErrInternalResolution)
 }
 
 func maxRedirectAttempts() int {

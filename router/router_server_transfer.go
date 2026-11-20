@@ -33,12 +33,13 @@ func postServerTransfer(c *gin.Context) {
 
 	s := ExtractServer(c)
 
-	// Check if the server is already being transferred.
-	// There will be another endpoint for resetting this value either by deleting the
-	// server, or by canceling the transfer.
-	if s.IsTransferring() {
+	// Mark the server as being transferred, which also blocks it from starting.
+	// This fails if a transfer is already in progress, or if the server is being
+	// installed or restored. There will be another endpoint for resetting this
+	// value either by deleting the server, or by canceling the transfer.
+	if !s.StartTransferring() {
 		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
-			"error": "A transfer is already in progress for this server.",
+			"error": "A transfer is already in progress for this server, or it is being installed or restored.",
 		})
 		return
 	}
@@ -56,9 +57,6 @@ func postServerTransfer(c *gin.Context) {
 		s.Events().Publish(server.TransferStatusEvent, "failure")
 		s.SetTransferring(false)
 	}
-
-	// Block the server from starting while we are transferring it.
-	s.SetTransferring(true)
 
 	// Ensure the server is offline. Sometimes a "No such container" error gets through
 	// which means the server is already stopped. We can ignore that.

@@ -52,6 +52,107 @@ const maxTextScanTokenSize = 64 * 1024 * 1024
 // maxConfigFileSize caps how large a configuration file we'll attempt to parse.
 const maxConfigFileSize = 64 * 1024 * 1024
 
+// maxXMLDepth is the deepest element nesting of an XML configuration file that
+// is rewritten. Real configuration files are far shallower than this.
+const maxXMLDepth = 512
+
+// xmlDepth returns the element nesting depth of the tree rooted at root,
+// without recursing, so that it cannot itself exhaust the stack.
+func xmlDepth(root *etree.Element) int {
+	if root == nil {
+		return 0
+	}
+	type frame struct {
+		e *etree.Element
+		d int
+	}
+	stack := []frame{{root, 1}}
+	depth := 0
+	for len(stack) > 0 {
+		f := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		if f.d > depth {
+			depth = f.d
+		}
+		for _, c := range f.e.ChildElements() {
+			stack = append(stack, frame{c, f.d + 1})
+		}
+	}
+	return depth
+}
+
+// xmlIndentationExceeds reports whether indenting the tree rooted at root with
+// the given number of spaces per level would add more than max bytes of
+// whitespace. etree's Indent inserts, before every non-character-data child
+// (elements, comments, directives and processing instructions) and before each
+// element's closing tag, a newline followed by depth*spaces spaces. On a
+// crafted document — very many such tokens nested deeply, for example a million
+// comments inside a deep element chain — that indentation alone can be orders
+// of magnitude larger than the input, exhausting memory inside Indent before
+// the serialized output is ever size-checked. It walks the tree iteratively,
+// like xmlDepth, and stops as soon as the budget is exceeded, so it never
+// allocates the indentation it is estimating.
+func xmlIndentationExceeds(root *etree.Element, spaces int, max int64) bool {
+	if root == nil {
+		return false
+	}
+	type frame struct {
+		e *etree.Element
+		d int
+	}
+	stack := []frame{{root, 0}}
+	var total int64
+	for len(stack) > 0 {
+		f := stack[len(stack)-1]
+		stack = stack[:len(stack)-1]
+		// Count every child token Indent would indent, not just elements, so a
+		// document padded with another indented token (comments, directives or
+		// processing instructions) cannot slip past the estimate. Only elements
+		// have children of their own to recurse into.
+		var indentable int64
+		for _, c := range f.e.Child {
+			if _, isCharData := c.(*etree.CharData); isCharData {
+				continue
+			}
+			indentable++
+			if ce, ok := c.(*etree.Element); ok {
+				stack = append(stack, frame{ce, f.d + 1})
+			}
+		}
+		if indentable > 0 {
+			// One indent token before each counted child, plus one before the
+			// closing tag; each is a newline and (d+1)*spaces spaces.
+			token := int64(1 + (f.d+1)*spaces)
+			total += token * (indentable + 1)
+			if total > max {
+				return true
+			}
+		}
+	}
+	return total > max
+}
+
+// limitedWriter writes through to w until more than max bytes have been
+// written, then fails with errConfigTooLarge rather than buffering an unbounded
+// amount. It lets a document be serialized without first materializing a copy
+// that could exhaust memory.
+type limitedWriter struct {
+	w   io.Writer
+	n   int64
+	max int64
+}
+
+var errConfigTooLarge = errors.Sentinel("parser: serialized configuration exceeds size limit")
+
+func (lw *limitedWriter) Write(p []byte) (int, error) {
+	if lw.n+int64(len(p)) > lw.max {
+		return 0, errConfigTooLarge
+	}
+	n, err := lw.w.Write(p)
+	lw.n += int64(n)
+	return n, err
+}
+
 // ValueType is the JSON type of a replacement value as written in the egg.
 type ValueType int
 
@@ -480,6 +581,21 @@ func (f *ConfigurationFile) parseXmlFile(file ConfigFile) error {
 	if _, err := doc.ReadFrom(io.LimitReader(file, maxConfigFileSize)); err != nil {
 		return err
 	}
+	// A configuration file has a single root element. etree is lenient and will
+	// parse several top-level elements, but the depth and indentation guards
+	// below, like doc.Root(), only inspect the first one, while doc.Indent would
+	// still indent them all. Refuse a multi-root document so a second, oversized
+	// tree cannot be indented past those checks. The server still boots with the
+	// file as it is, the same as for files over the size or depth limits.
+	if roots := doc.ChildElements(); len(roots) > 1 {
+		return errors.Errorf("parser: refusing to parse configuration file %q: document has %d root elements, expected one", file.Name(), len(roots))
+	}
+	// The file is controlled by the server, and a deeply nested document could
+	// exhaust the stack while it is rewritten. The server still boots with the
+	// file as it is, the same as for files over the size limit.
+	if depth := xmlDepth(doc.Root()); depth > maxXMLDepth {
+		return errors.Errorf("parser: refusing to parse configuration file %q: element nesting depth %d exceeds limit of %d", file.Name(), depth, maxXMLDepth)
+	}
 
 	// If there is no root we should create a basic start to the file. This isn't required though,
 	// and if it doesn't work correctly I'll just remove the code.
@@ -537,21 +653,28 @@ func (f *ConfigurationFile) parseXmlFile(file ConfigFile) error {
 		}
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
+	// Indenting the document inserts whitespace text nodes into the tree. On a
+	// crafted file with very many deeply nested elements that whitespace alone
+	// can be orders of magnitude larger than the input and exhaust memory, so
+	// refuse the rewrite before Indent allocates it. The server still boots with
+	// the file as it is, the same as for files over the size limit.
+	if xmlIndentationExceeds(doc.Root(), 2, maxConfigFileSize) {
+		return errors.Errorf("parser: refusing to write configuration file %q: indented result exceeds limit of %d bytes", file.Name(), maxConfigFileSize)
 	}
 
 	// Ensure the XML is indented properly.
 	doc.Indent(2)
 
-	// Write the XML to the file.
-	if _, err := doc.WriteTo(file); err != nil {
+	// Serialize through a writer bounded to the size limit so a document that
+	// still expands past it cannot buffer an unbounded copy in memory.
+	var buf bytes.Buffer
+	if _, err := doc.WriteTo(&limitedWriter{w: &buf, max: maxConfigFileSize}); err != nil {
+		if errors.Is(err, errConfigTooLarge) {
+			return errors.Errorf("parser: refusing to write configuration file %q: result exceeds limit of %d bytes", file.Name(), maxConfigFileSize)
+		}
 		return err
 	}
-	return nil
+	return rewrite(file, buf.Bytes())
 }
 
 // Parses an ini file.
@@ -624,17 +747,11 @@ func (f *ConfigurationFile) parseIniFile(file ConfigFile) error {
 		}
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
+	var buf bytes.Buffer
+	if _, err := cfg.WriteTo(&buf); err != nil {
 		return err
 	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
-	if _, err := cfg.WriteTo(file); err != nil {
-		return err
-	}
-	return nil
+	return rewrite(file, buf.Bytes())
 }
 
 // Parses a json file updating any matching key/value pairs. If a match is not found, the
@@ -651,13 +768,6 @@ func (f *ConfigurationFile) parseJsonFile(file ConfigFile) error {
 		return err
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
 	prettified := pretty.PrettyOptions(data, &pretty.Options{
 		Width:    80,
 		Prefix:   "",
@@ -665,8 +775,8 @@ func (f *ConfigurationFile) parseJsonFile(file ConfigFile) error {
 		SortKeys: false,
 	})
 
-	if _, err := io.Copy(file, bytes.NewReader(prettified)); err != nil {
-		return errors.Wrap(err, "parser: failed to write properties file to disk")
+	if err := rewrite(file, prettified); err != nil {
+		return err
 	}
 	return nil
 }
@@ -689,18 +799,7 @@ func (f *ConfigurationFile) parseYamlFile(file ConfigFile) error {
 		return nil
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
-	// Write the data to the file.
-	if _, err := io.Copy(file, bytes.NewReader(marshaled)); err != nil {
-		return errors.Wrap(err, "parser: failed to write properties file to disk")
-	}
-	return nil
+	return rewrite(file, marshaled)
 }
 
 // Parses a toml file and updates any matching key/value pairs before persisting
@@ -741,17 +840,7 @@ func (f *ConfigurationFile) parseTomlFile(file ConfigFile) error {
 		return err
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
-	if _, err := io.Copy(file, bytes.NewReader(marshaled)); err != nil {
-		return errors.Wrap(err, "parser: failed to write toml file to disk")
-	}
-	return nil
+	return rewrite(file, marshaled)
 }
 
 // normalizeYamlTypes converts json.Number values (produced by UseNumber()) into
@@ -848,23 +937,17 @@ func (f *ConfigurationFile) parseTextFile(file ConfigFile) error {
 			b.Write(line)
 		}
 		b.WriteByte('\n')
+		// Replacements can make the result much larger than the file that was
+		// read, so apply the same limit while building it.
+		if b.Len() > maxConfigFileSize {
+			return errors.Errorf("parser: refusing to write configuration file %q: result exceeds limit of %d bytes", file.Name(), maxConfigFileSize)
+		}
 	}
 	if err := s.Err(); err != nil {
 		return errors.Wrap(err, "parser: failed to scan text file for configuration update")
 	}
 
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return err
-	}
-	if err := file.Truncate(0); err != nil {
-		return err
-	}
-
-	// Write the data to the file.
-	if _, err := io.Copy(file, b); err != nil {
-		return errors.Wrap(err, "parser: failed to write properties file to disk")
-	}
-	return nil
+	return rewrite(file, b.Bytes())
 }
 
 // parsePropertiesFile parses a properties file and updates the values within it
@@ -953,16 +1036,30 @@ func (f *ConfigurationFile) parsePropertiesFile(file ConfigFile) error {
 		s.WriteString(key + "=" + strings.Trim(strconv.QuoteToASCII(value), "\"") + "\n")
 	}
 
+	return rewrite(file, s.Bytes())
+}
+
+// rewrite replaces the contents of file with data. The new contents are written
+// first and the old tail is trimmed afterwards, rather than truncating first, so
+// that a write the quota-tracked handle refuses (because the result would not fit
+// in the server's disk limit) leaves the original file intact instead of emptying
+// it. A shrinking replacement never needs to reserve space, so it cannot fail
+// that way either.
+func rewrite(file ConfigFile, data []byte) error {
+	if len(data) > maxConfigFileSize {
+		return errors.Errorf("parser: refusing to write configuration file %q: result exceeds limit of %d bytes", file.Name(), maxConfigFileSize)
+	}
+
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return err
 	}
-	if err := file.Truncate(0); err != nil {
-		return err
+	n, err := file.Write(data)
+	if err != nil {
+		return errors.Wrap(err, "parser: failed to write configuration file to disk")
 	}
-
-	// Write the data to the file.
-	if _, err := io.Copy(file, s); err != nil {
-		return errors.Wrap(err, "parser: failed to write properties file to disk")
+	// Remove any bytes of the old, longer contents left after the new ones.
+	if err := file.Truncate(int64(n)); err != nil {
+		return errors.Wrap(err, "parser: failed to trim configuration file on disk")
 	}
 	return nil
 }

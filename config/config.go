@@ -76,6 +76,15 @@ type SftpConfiguration struct {
 	ReadOnly bool `default:"false" yaml:"read_only"`
 	// If set to true users won't be able to login using their password.
 	KeyOnly bool `default:"false" yaml:"key_only"`
+	// The maximum number of connections a single user may have open to a single
+	// server at once, or zero to use the default of 32. A user with access to
+	// several servers may have this many to each of them.
+	MaxConnectionsPerUser int `json:"-" yaml:"max_connections_per_user"`
+	// The maximum number of connections from a single IP address, or IPv6 /64
+	// network, that may be authenticating at once, or zero to use the default of
+	// 16. Raise this if clients connect through a proxy, since they then all
+	// appear to come from the address of the proxy.
+	MaxAuthenticatingConnectionsPerIP int `json:"-" yaml:"max_authenticating_connections_per_ip"`
 }
 
 // ApiConfiguration defines the configuration for the internal API that is
@@ -103,6 +112,10 @@ type ApiConfiguration struct {
 	RemoteDownload struct {
 		// MaxRedirects controls how many HTTP redirects are followed when performing a remote download.
 		MaxRedirects int `default:"10" json:"max_redirects" yaml:"max_redirects"`
+		// Allowlist allows remote downloads to connect to otherwise blocked private
+		// or internal destinations. Entries may be hostnames, IP addresses or CIDR
+		// ranges. It can only be set in config.yml.
+		Allowlist []string `json:"-" yaml:"allowlist"`
 	} `json:"remote_download" yaml:"remote_download"`
 
 	// The maximum size for files uploaded through the Panel in MiB.
@@ -110,6 +123,13 @@ type ApiConfiguration struct {
 
 	// A list of IP address of proxies that may send a X-Forwarded-For header to set the true clients IP
 	TrustedProxies []string `json:"trusted_proxies" yaml:"trusted_proxies"`
+
+	// PanelAllowlist limits requests made with the node token, which only the Panel
+	// has, to these IP addresses or CIDR ranges. When it is empty, the default, the
+	// token is accepted from any address. When Wings is behind a reverse proxy, the
+	// proxy must be listed in trusted_proxies so that the Panel's own address is
+	// checked. It can only be set in config.yml.
+	PanelAllowlist []string `json:"-" yaml:"panel_allowlist"`
 }
 
 // RemoteQueryConfiguration defines the configuration settings for remote requests
@@ -288,11 +308,10 @@ type Backups struct {
 	//
 	// "none" -> no compression will be applied
 	// "best_speed" -> uses gzip level 1 for fast speed
-	// "best_compression" -> uses gzip level 9 for minimal disk space useage
+	// "best_compression" -> uses gzip level 9 for minimal disk space usage
 	//
 	// Defaults to "best_speed" (level 1)
 	CompressionLevel string `default:"best_speed" yaml:"compression_level"`
-
 
 	// RestoreHostAllowlist allows backup restore downloads to connect to otherwise blocked
 	// private/internal destinations. Entries may be hostnames, IP addresses, or CIDR ranges.
@@ -397,7 +416,7 @@ type Configuration struct {
 	// additional origins.
 	AllowedOrigins []string `json:"allowed_origins" yaml:"allowed_origins"`
 
-	// AllowCORSPrivateNetwork sets the `Access-Control-Request-Private-Network` header which
+	// AllowCORSPrivateNetwork sets the `Access-Control-Allow-Private-Network` header which
 	// allows client browsers to make requests to internal IP addresses over HTTP.  This setting
 	// is only required by users running Wings without SSL certificates and using internal IP
 	// addresses in order to connect. Most users should NOT enable this setting.
@@ -665,6 +684,7 @@ func FromFile(path string) error {
 	Set(c)
 	return nil
 }
+
 // ConfigureDirectories ensures that all the system directories exist on the
 // system. These directories are created so that only the owner can read the data,
 // and no other users.

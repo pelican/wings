@@ -11,6 +11,7 @@ import (
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
 	"github.com/pelican/wings/server/filesystem/quotas"
+	"github.com/pelican/wings/system"
 )
 
 type PowerAction string
@@ -144,6 +145,9 @@ func (s *Server) HandlePowerAction(action PowerAction, waitSeconds ...int) error
 		if err == nil {
 			log.Info("acquired exclusive lock on power actions, processing event...")
 			defer cleanup()
+		} else if errors.Is(err, system.ErrLockerDestroyed) {
+			// The server is being deleted, which already stops its container.
+			return err
 		} else {
 			log.Warn("failed to acquire exclusive lock, ignoring failure for termination event")
 		}
