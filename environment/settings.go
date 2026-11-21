@@ -110,17 +110,26 @@ func boolPtr(b bool) *bool {
 // that Docker understands.
 func (l Limits) AsContainerResources() container.Resources {
 	pids := l.ProcessLimit()
+
 	resources := container.Resources{
 		Memory:            l.BoundedMemoryLimit(),
 		MemoryReservation: l.MemoryLimit * 1024 * 1024,
 		MemorySwap:        l.ConvertedSwap(),
-		OomKillDisable:    boolPtr(!l.OOMKiller),
 		PidsLimit:         &pids,
 	}
 
 	// Only set the block IO weight when the host's cgroup hierarchy can honor it.
 	if blkioWeightSupported() {
 		resources.BlkioWeight = l.IoWeight
+	}
+
+	// If the user wants to disable the OOM killer, we need to handle it differently
+	// depending on the cgroup version. Docker rejects the OomKillDisable option on
+	// hosts running cgroup v2, so only send it when the legacy hierarchy is in use.
+	if !l.OOMKiller {
+		if _, err := os.Stat("/sys/fs/cgroup/cgroup.controllers"); err != nil {
+			resources.OomKillDisable = boolPtr(true)
+		}
 	}
 
 	// If the CPU Limit is not set, don't send any of these fields through. Providing
