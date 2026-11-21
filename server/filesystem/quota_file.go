@@ -157,6 +157,9 @@ func (f *quotaFile) Close() error {
 	closeErr := f.File.Close()
 	if statErr == nil {
 		f.fs.adjustDisk(st.Size() - f.size)
+		// Keep the size in line with what is now counted against the quota, so a
+		// caller that removes the file can release exactly that much.
+		f.size = st.Size()
 	}
 	if statErr != nil {
 		return statErr

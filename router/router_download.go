@@ -26,7 +26,6 @@ import (
 // Handle a download request for a server backup.
 func getDownloadBackup(c *gin.Context) {
 	client := middleware.ExtractApiClient(c)
-	manager := middleware.ExtractManager(c)
 
 	// Get the payload from the token.
 	token := tokens.BackupPayload{}
@@ -35,18 +34,27 @@ func getDownloadBackup(c *gin.Context) {
 		return
 	}
 
-	// Get the server using the UUID from the token.
-	if _, ok := manager.Get(token.ServerUuid); !ok || token.Denylisted() || !token.HasScope(tokens.BackupDownload) {
+	// The server does not have to exist on this node: backups kept after their
+	// server was deleted can still be downloaded, to create a new server from them.
+	// The token is signed by the Panel and the backup is looked up below.
+	if token.Denylisted() || !token.HasScope(tokens.BackupDownload) {
 		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
 			"error": "The requested resource was not found on this server.",
 		})
 		return
 	}
+	middleware.ClearDeadlines(c)
 
-	// Validate that the BackupUuid field is actually a UUID and not some random characters or a
-	// file path.
+	// Validate that the BackupUuid and ServerUuid fields are actually UUIDs and not some
+	// random characters or a file path, the server UUID is part of the backup's path.
 	if _, err := uuid.Parse(token.BackupUuid); err != nil {
 		middleware.CaptureAndAbort(c, err)
+		return
+	}
+	if !isCanonicalUuid(token.ServerUuid) {
+		c.AbortWithStatusJSON(http.StatusNotFound, gin.H{
+			"error": "The requested resource was not found on this server.",
+		})
 		return
 	}
 
@@ -73,7 +81,9 @@ func getDownloadBackup(c *gin.Context) {
 	}
 	defer f.Close()
 
-	serveDownload(c, f, st.Name(), st.ModTime())
+	// Backups are gzipped tarballs, which is also what a restore from this link
+	// accepts.
+	serveDownloadAs(c, f, st.Name(), st.ModTime(), "application/gzip")
 }
 
 // Handles downloading a specific file for a server.
@@ -92,6 +102,7 @@ func getDownloadFile(c *gin.Context) {
 		})
 		return
 	}
+	middleware.ClearDeadlines(c)
 
 	if err := s.Filesystem().IsIgnored(token.FilePath); err != nil {
 		middleware.CaptureAndAbort(c, err)
@@ -118,9 +129,14 @@ func getDownloadFile(c *gin.Context) {
 // and HEAD requests are handled by http.ServeContent, which allows clients to
 // resume an interrupted download or fetch it over multiple connections.
 func serveDownload(c *gin.Context, f io.ReadSeeker, name string, modTime time.Time) {
+	serveDownloadAs(c, f, name, modTime, "application/octet-stream")
+}
+
+// serveDownloadAs is serveDownload with the given content type.
+func serveDownloadAs(c *gin.Context, f io.ReadSeeker, name string, modTime time.Time, contentType string) {
 	c.Header("Content-Disposition", "attachment; filename="+strconv.Quote(name))
 	// Set explicitly so ServeContent does not sniff the content type.
-	c.Header("Content-Type", "application/octet-stream")
+	c.Header("Content-Type", contentType)
 
 	http.ServeContent(c.Writer, c.Request, name, modTime, f)
 }

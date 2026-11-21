@@ -11,6 +11,7 @@ import (
 	"github.com/pelican/wings/config"
 	"github.com/pelican/wings/environment"
 	"github.com/pelican/wings/server/filesystem/quotas"
+	"github.com/pelican/wings/system"
 )
 
 type PowerAction string
@@ -71,21 +72,32 @@ func (s *Server) LockForIncomingTransfer() (release func(), err error) {
 		return nil, errors.Wrap(err, "server: a power action is in progress")
 	}
 	switch {
-	case s.IsInstalling():
-		err = ErrServerIsInstalling
-	case s.IsRestoring():
-		err = ErrServerIsRestoring
-	case s.IsTransferring():
-		err = ErrServerIsTransferring
+	case s.IsInstalling() || s.IsRestoring() || s.IsTransferring():
+		err = s.lifecycleBusyError()
 	case s.Environment == nil || s.Environment.State() != environment.ProcessOfflineState:
 		err = ErrIsRunning
+	case !s.StartTransferring():
+		// An install or restore started after the checks above.
+		err = s.lifecycleBusyError()
 	}
 	if err != nil {
 		s.powerLock.Release()
 		return nil, err
 	}
-	s.SetTransferring(true)
 	return s.powerLock.Release, nil
+}
+
+// lifecycleBusyError returns the error for the lifecycle operation that is in
+// progress on the server, once StartTransferring has refused to start.
+func (s *Server) lifecycleBusyError() error {
+	switch {
+	case s.IsInstalling():
+		return ErrServerIsInstalling
+	case s.IsRestoring():
+		return ErrServerIsRestoring
+	default:
+		return ErrServerIsTransferring
+	}
 }
 
 // HandlePowerAction is a helper function that can receive a power action and then process the
@@ -173,6 +185,9 @@ func (s *Server) HandlePowerAction(action PowerAction, waitSeconds ...int) error
 		if err == nil {
 			log.Info("acquired exclusive lock on power actions, processing event...")
 			defer cleanup()
+		} else if errors.Is(err, system.ErrLockerDestroyed) {
+			// The server is being deleted, which already stops its container.
+			return err
 		} else {
 			log.Warn("failed to acquire exclusive lock, ignoring failure for termination event")
 		}

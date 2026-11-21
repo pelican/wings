@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"regexp"
 	"strconv"
 	"strings"
@@ -14,7 +13,6 @@ import (
 	"github.com/pelican/wings/system"
 
 	"github.com/pelican/wings/environment"
-	"github.com/pelican/wings/remote"
 )
 
 var dockerEvents = []string{
@@ -66,10 +64,11 @@ func (dsl *diskSpaceLimiter) Trigger() {
 // output lines to determine if the server is started yet, and if the output is
 // not being throttled, will send the data over to the websocket.
 func (s *Server) processConsoleOutputEvent(v []byte) {
-	// Always process the console output, but do this in a seperate thread since we
-	// don't really care about side-effects from this call, and don't want it to block
-	// the console sending logic.
-	go s.onConsoleOutput(v)
+	// Always check the console output, including lines that are throttled, so that
+	// the line marking the server as started is not missed. Lines are checked in
+	// the order they are read, and a server printing output quickly can no longer
+	// spawn an unbounded number of goroutines.
+	s.onConsoleOutput(v)
 
 	// If the console is being throttled, do nothing else with it, we don't want
 	// to waste time. This code previously terminated server instances after violating
@@ -159,7 +158,9 @@ func (s *Server) onConsoleOutput(data []byte) {
 	}
 
 	processConfiguration := s.ProcessConfiguration()
+	s.cfg.mu.RLock()
 	EggConfiguration := s.cfg.Egg.Features
+	s.cfg.mu.RUnlock()
 
 	// Make a copy of the data provided since it is by reference, otherwise you'll
 	// potentially introduce a race condition by modifying the value.
@@ -235,15 +236,9 @@ func (s *Server) onConsoleOutput(data []byte) {
 		}
 	}
 
-
-	// If the command sent to the server is one that should stop the server we will need to
-	// set the server to be in a stopping state, otherwise crash detection will kick in and
-	// cause the server to unexpectedly restart on the user.
-	if s.IsRunning() {
-		stop := processConfiguration.Stop
-
-		if stop.Type == remote.ProcessStopCommand && bytes.Equal(v, []byte(stop.Value)) {
-			s.Environment.SetState(environment.ProcessOfflineState)
-		}
-	}
+	// Output from the server process is never used to mark it as stopping or
+	// stopped, since the process controls what it prints. A server printing its own
+	// stop command could otherwise appear offline while still running, which stops
+	// its disk limit from being enforced. The environment marks the server as
+	// stopping when the stop command is actually sent to it.
 }

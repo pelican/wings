@@ -8,8 +8,9 @@ import (
 	"time"
 
 	"emperror.dev/errors"
-	"github.com/docker/docker/api/types/container"
 	"github.com/goccy/go-json"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/client"
 
 	"github.com/pelican/wings/environment"
 )
@@ -41,7 +42,7 @@ func (e *Environment) pollResources(ctx context.Context) error {
 	e.log().Info("starting resource polling for container")
 	defer e.log().Debug("stopped resource polling for container")
 
-	stats, err := e.client.ContainerStats(ctx, e.Id, true)
+	stats, err := e.client.ContainerStats(ctx, e.Id, client.ContainerStatsOptions{Stream: true})
 	if err != nil {
 		return err
 	}

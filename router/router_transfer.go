@@ -69,6 +69,11 @@ func isPooledTransfer(c *gin.Context) bool {
 	return remotePool.Enabled && remotePool.PoolName != "" && sourcePool != "" && strings.EqualFold(remotePool.PoolName, sourcePool)
 }
 
+// maxChecksumSize is the most that is read of a checksum sent with a transfer.
+// A SHA-256 checksum is 64 hexadecimal characters, so anything longer is
+// invalid, and reading it without a limit would let the sender use up memory.
+const maxChecksumSize = 128
+
 // postTransfers .
 func postTransfers(c *gin.Context) {
 	auth := strings.SplitN(c.GetHeader("Authorization"), " ", 2)
@@ -90,6 +95,7 @@ func postTransfers(c *gin.Context) {
 		c.AbortWithStatusJSON(http.StatusForbidden, gin.H{"error": "Forbidden."})
 		return
 	}
+	middleware.ClearDeadlines(c)
 
 	manager := middleware.ExtractManager(c)
 	u, err := uuid.Parse(token.Subject)
@@ -197,11 +203,18 @@ func postTransfers(c *gin.Context) {
 			middleware.CaptureAndAbort(c, err)
 			return
 		}
-		manager.Add(i.Server())
+		i.Server().SetTransferring(true)
+		if !manager.AddIfMissing(i.Server()) {
+			// The server was created on this node while the transfer was starting. Its
+			// files now belong to that server, so leave them alone.
+			i.Server().Discard()
+			c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+				"error": "This server already exists on this node.",
+			})
+			return
+		}
 		trnsfr.Server = i.Server()
 	}
-
-	trnsfr.Server.SetTransferring(true)
 
 	// We add the transfer to the list of transfers once we have a server instance to use.
 	transfer.Incoming().Add(trnsfr)
@@ -346,7 +359,7 @@ out:
 
 			case strings.HasPrefix(name, "checksum_archive"):
 				trnsfr.Log().Debug("received archive checksum")
-				checksumData, err := io.ReadAll(p)
+				checksumData, err := io.ReadAll(io.LimitReader(p, maxChecksumSize))
 				if err != nil {
 					middleware.CaptureAndAbort(c, err)
 					return
@@ -444,7 +457,7 @@ out:
 				backupName := strings.TrimPrefix(name, "checksum_backup_")
 				trnsfr.Log().WithField("backup", backupName).Debug("received backup checksum")
 
-				checksumData, err := io.ReadAll(p)
+				checksumData, err := io.ReadAll(io.LimitReader(p, maxChecksumSize))
 				if err != nil {
 					middleware.CaptureAndAbort(c, err)
 					return

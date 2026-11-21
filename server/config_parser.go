@@ -44,6 +44,13 @@ func (s *Server) UpdateConfigurationFiles() {
 		f := cf
 
 		pool.Submit(func() {
+			// A panic here would crash Wings, and the files are controlled by the
+			// server, so recover and log it instead.
+			defer func() {
+				if r := recover(); r != nil {
+					s.Log().WithField("file_name", f.FileName).WithField("panic", r).Error("recovered from panic while updating server configuration file")
+				}
+			}()
 			filename := replaceParserConfigPathVariables(f.FileName, s.Config().EnvVars)
 			file, err := func() (filesystem.File, error) {
 				if f.AllowCreateFile {

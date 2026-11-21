@@ -115,7 +115,8 @@ func configureCmdRun(cmd *cobra.Command, args []string) {
 		panic(err)
 	}
 
-	fmt.Printf("%+v %s\n", req.Header, req.URL.String())
+	// Never print the request headers, they contain the API key.
+	fmt.Printf("Fetching configuration from %s\n", req.URL.String())
 
 	res, err := c.Do(req)
 	if err != nil {
@@ -128,22 +129,38 @@ func configureCmdRun(cmd *cobra.Command, args []string) {
 		fmt.Println("The authentication credentials provided were not valid.")
 		os.Exit(1)
 	} else if res.StatusCode != http.StatusOK {
-		b, _ := io.ReadAll(res.Body)
+		b, _ := io.ReadAll(io.LimitReader(res.Body, maxConfigureResponseSize))
 
 		fmt.Println("An error occurred while processing this request.\n", string(b))
 		os.Exit(1)
 	}
 
-	b, err := io.ReadAll(res.Body)
+	b, err := io.ReadAll(io.LimitReader(res.Body, maxConfigureResponseSize+1))
+	if err != nil {
+		fmt.Println("Failed to read the configuration returned by the panel.\n", err.Error())
+		os.Exit(1)
+	}
+	if len(b) > maxConfigureResponseSize {
+		fmt.Println("The configuration returned by the panel is too large.")
+		os.Exit(1)
+	}
 
 	cfg, err := config.NewAtPath(configPath)
 	if err != nil {
 		panic(err)
 	}
 
-	if err := json.Unmarshal(b, cfg); err != nil {
+	// Only read the values the Panel is allowed to set, the same as when it pushes
+	// an update to a running node (GHSA-8rw4-fw83-3rv7).
+	var update config.PanelConfiguration
+	if err := json.Unmarshal(b, &update); err != nil {
 		panic(err)
 	}
+	if err := update.Validate(); err != nil {
+		fmt.Println("The configuration returned by the panel is not valid.\n", err.Error())
+		os.Exit(1)
+	}
+	cfg.ApplyPanelConfiguration(update)
 
 	// Manually specify the Panel URL as it won't be decoded from JSON.
 	cfg.PanelLocation = configureArgs.PanelURL
@@ -154,6 +171,10 @@ func configureCmdRun(cmd *cobra.Command, args []string) {
 
 	fmt.Println("Successfully configured wings.")
 }
+
+// maxConfigureResponseSize is the largest node configuration that is read from
+// the panel.
+const maxConfigureResponseSize = 1 << 20
 
 func getRequest() (*http.Request, error) {
 	u, err := url.Parse(configureArgs.PanelURL)

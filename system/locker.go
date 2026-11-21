@@ -7,7 +7,12 @@ import (
 	"emperror.dev/errors"
 )
 
-var ErrLockerLocked = errors.Sentinel("locker: cannot acquire lock, already locked")
+var (
+	ErrLockerLocked = errors.Sentinel("locker: cannot acquire lock, already locked")
+	// ErrLockerDestroyed is returned when the locker has been destroyed, which
+	// happens when its server is deleted.
+	ErrLockerDestroyed = errors.Sentinel("locker: cannot acquire lock, locker destroyed")
+)
 
 type Locker struct {
 	mu sync.RWMutex
@@ -43,7 +48,7 @@ func (l *Locker) Acquire() error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.destroyed {
-		return ErrLockerLocked
+		return ErrLockerDestroyed
 	}
 	select {
 	case l.ch <- true:
@@ -56,6 +61,13 @@ func (l *Locker) Acquire() error {
 // TryAcquire will attempt to acquire a power-lock until the context provided
 // is canceled or the locker is destroyed.
 func (l *Locker) TryAcquire(ctx context.Context) error {
+	// Check first, since a destroyed locker may also have its context canceled
+	// and select picks between ready cases at random.
+	select {
+	case <-l.done:
+		return ErrLockerDestroyed
+	default:
+	}
 	select {
 	case l.ch <- true:
 		// The locker may have been destroyed while we were waiting, a destroyed
@@ -65,11 +77,11 @@ func (l *Locker) TryAcquire(ctx context.Context) error {
 		l.mu.RUnlock()
 		if destroyed {
 			l.Release()
-			return ErrLockerLocked
+			return ErrLockerDestroyed
 		}
 		return nil
 	case <-l.done:
-		return ErrLockerLocked
+		return ErrLockerDestroyed
 	case <-ctx.Done():
 		if err := ctx.Err(); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
@@ -93,7 +105,7 @@ func (l *Locker) Release() {
 }
 
 // Destroy releases the power locker and stops it from being acquired again.
-// Anything waiting in TryAcquire returns ErrLockerLocked. It is safe to call
+// Anything waiting in TryAcquire returns ErrLockerDestroyed. It is safe to call
 // Destroy more than once, and to call it while other goroutines are acquiring
 // or releasing the lock.
 func (l *Locker) Destroy() {

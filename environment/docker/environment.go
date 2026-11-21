@@ -5,11 +5,12 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
-	"github.com/docker/docker/api/types"
-	"github.com/docker/docker/client"
+	cerrdefs "github.com/containerd/errdefs"
+	"github.com/moby/moby/client"
 
 	"github.com/pelican/wings/environment"
 	"github.com/pelican/wings/events"
@@ -43,7 +44,7 @@ type Environment struct {
 
 	// Controls the hijacked response stream which exists only when we're attached to
 	// the running container instance.
-	stream *types.HijackedResponse
+	stream *client.HijackedResponse
 
 	// Holds the stats stream used by the polling commands so that we can easily close it out.
 	stats io.ReadCloser
@@ -55,6 +56,17 @@ type Environment struct {
 
 	// Tracks the environment state.
 	st *system.AtomicString
+
+	// sendMu serializes writes of commands to the container stream, so that
+	// concurrent commands cannot each push the shared write deadline forward and
+	// keep a blocked write alive indefinitely. Each write is bounded by
+	// commandWriteTimeout, so a waiting command blocks for at most that long.
+	sendMu sync.Mutex
+
+	// reattachedAt and reattachedCount track how often the attached stream has
+	// been lost for a running container, see reattach. Guarded by mu.
+	reattachedAt    time.Time
+	reattachedCount int
 }
 
 // New creates a new base Docker environment. The ID passed through will be the
@@ -90,7 +102,7 @@ func (e *Environment) Type() string {
 // SetStream sets the current stream value from the Docker client. If a nil
 // value is provided we assume that the stream is no longer operational and the
 // instance is effectively offline.
-func (e *Environment) SetStream(s *types.HijackedResponse) {
+func (e *Environment) SetStream(s *client.HijackedResponse) {
 	e.mu.Lock()
 	e.stream = s
 	e.mu.Unlock()
@@ -119,7 +131,7 @@ func (e *Environment) Exists() (bool, error) {
 	if err != nil {
 		// If this error is because the container instance wasn't found via Docker we
 		// can safely ignore the error and just return false.
-		if client.IsErrNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return false, nil
 		}
 		return false, err
@@ -132,10 +144,7 @@ func (e *Environment) Exists() (bool, error) {
 // shouldn't be a case that ever happens under correctly developed
 // circumstances).
 //
-// You can confirm if the instance wasn't found by using client.IsErrNotFound
-// from the Docker API.
-//
-// @see docker/client/errors.go
+// You can confirm if the instance wasn't found by using cerrdefs.IsNotFound.
 func (e *Environment) IsRunning(ctx context.Context) (bool, error) {
 	c, err := e.ContainerInspect(ctx)
 	if err != nil {
@@ -158,7 +167,7 @@ func (e *Environment) ExitState() (uint32, bool, error) {
 		// so that's a mystery that will have to go unsolved.
 		//
 		// @see https://github.com/pterodactyl/panel/issues/2003
-		if client.IsErrNotFound(err) {
+		if cerrdefs.IsNotFound(err) {
 			return 1, false, nil
 		}
 		return 0, false, errors.WrapIf(err, "environment/docker: failed to inspect container")
