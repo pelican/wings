@@ -434,7 +434,7 @@ func TestBackupRestoreDestinationAllowlist(t *testing.T) {
 }
 
 func TestBackupRestoreHTTPClientDoesNotLimitResponseBodyRead(t *testing.T) {
-	client := backupRestoreHttpClient(false)
+	client := backupRestoreHttpClient(false, nil)
 	if client.Timeout != 0 {
 		t.Fatalf("expected restore client not to set total request timeout, got %s", client.Timeout)
 	}

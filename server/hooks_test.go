@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"testing"
@@ -241,5 +242,24 @@ func TestSyncWithEnvironmentConfiguresImageAndStop(t *testing.T) {
 	}
 	if env.stop.Type != remote.ProcessStopCommand || env.stop.Value != "stop" {
 		t.Fatalf("environment stop configuration = %+v, expected the server's", env.stop)
+	}
+}
+
+func TestWithRestoreTLSConfig(t *testing.T) {
+	if cfg := NewEmptyManager(nil).RestoreTLSConfig(); cfg != nil {
+		t.Fatalf("RestoreTLSConfig() = %v without the option, expected nil", cfg)
+	}
+	calls := 0
+	m := NewEmptyManager(nil, WithRestoreTLSConfig(func() *tls.Config {
+		calls++
+		return &tls.Config{ServerName: "gateway"}
+	}))
+	for i := 0; i < 2; i++ {
+		if cfg := m.RestoreTLSConfig(); cfg == nil || cfg.ServerName != "gateway" {
+			t.Fatalf("RestoreTLSConfig() = %v, expected the supplied configuration", cfg)
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("the configuration function was called %d times, expected once per restore", calls)
 	}
 }
