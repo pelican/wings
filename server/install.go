@@ -115,19 +115,45 @@ func (s *Server) Reinstall() error {
 	return s.install(true)
 }
 
+// Installer executes the installation script of a server. The default
+// implementation runs the script inside a Docker container; alternative
+// implementations are registered on the server manager with WithInstaller.
+//
+// Run is invoked with the server's installation lock held (IsInstalling
+// returns true) and must block until the script has finished. Returning an
+// error marks the installation as failed towards the Panel.
+type Installer interface {
+	Run(s *Server, script *remote.InstallationScript) error
+}
+
+// dockerInstaller is the default Installer and runs the installation script in
+// a Docker container using InstallationProcess.
+type dockerInstaller struct{}
+
+// Run runs the installation script in a Docker container and blocks until it
+// has finished.
+func (dockerInstaller) Run(s *Server, script *remote.InstallationScript) error {
+	p, err := NewInstallationProcess(s, script)
+	if err != nil {
+		return err
+	}
+	return p.Run()
+}
+
 // Internal installation function used to simplify reporting back to the Panel.
 func (s *Server) internalInstall() error {
 	script, err := s.client.GetInstallationScript(s.Context(), s.ID())
 	if err != nil {
 		return err
 	}
-	p, err := NewInstallationProcess(s, &script)
-	if err != nil {
-		return err
+
+	var installer Installer = dockerInstaller{}
+	if s.installer != nil {
+		installer = s.installer
 	}
 
 	s.Log().Info("beginning installation process for server")
-	if err := p.Run(); err != nil {
+	if err := installer.Run(s, &script); err != nil {
 		return err
 	}
 

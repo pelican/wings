@@ -126,14 +126,44 @@ func postTransfers(c *gin.Context) {
 	// can be used until they expire, and a repeated request would otherwise extract
 	// over the live server and, if it failed, delete it. Refusing an existing data
 	// directory also means that a failed transfer only removes what it created.
-	if _, exists := manager.Get(id); exists {
+	//
+	// A manager configured with WithTransfersIntoExistingServers fills a server it
+	// already has instead, as long as that server is offline, not busy and its data
+	// directory is empty. The transfer holds the server's power lock until it is
+	// done, so the server cannot be started while its files arrive. Nothing was in
+	// the data directory before, so a failed transfer empties it again and keeps
+	// the server itself.
+	existing, exists := manager.Get(id)
+	intoExisting := exists && manager.TransfersIntoExistingServers()
+	if exists && !intoExisting {
 		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
 			"error": "This server already exists on this node.",
 		})
 		return
 	}
+	if intoExisting {
+		release, err := existing.LockForIncomingTransfer()
+		if err != nil {
+			c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+				"error": "This server must be offline and not busy to receive a transfer.",
+			})
+			return
+		}
+		defer release()
+		if empty, err := isEmptyDirectory(filepath.Join(config.Get().System.Data, id)); err != nil || !empty {
+			existing.SetTransferring(false)
+			if err != nil {
+				middleware.CaptureAndAbort(c, fmt.Errorf("failed to check for existing server files: %w", err))
+				return
+			}
+			c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+				"error": "Files for this server already exist on this node.",
+			})
+			return
+		}
+	}
 	dataDir := filepath.Join(config.Get().System.Data, id)
-	if !pooled {
+	if !pooled && !intoExisting {
 		if _, err := os.Lstat(dataDir); err == nil {
 			log.WithField("server", id).WithField("path", dataDir).
 				Warn("refusing incoming transfer: files for this server already exist on this node")
@@ -153,37 +183,40 @@ func postTransfers(c *gin.Context) {
 	ctx, cancel := context.WithCancel(trnsfr.Context())
 	defer cancel()
 
-	i, err := installer.New(ctx, manager, installer.ServerDetails{
-		UUID:              id,
-		StartOnCompletion: false,
-	})
-	if err != nil {
-		trnsfr.Log().WithError(err).Error("failed to initialize transfer; no server instance created")
-		// Initializing the server can fail after its data directory and quota were
-		// created. Neither existed before (see above), so remove them again.
-		if _, statErr := os.Lstat(dataDir); !pooled && statErr == nil {
-			if !removeFailedTransferFiles(trnsfr.Log(), id, dataDir, false, nil, "") {
-				keepClaim = true
-				trnsfr.Log().Error("could not remove the files of a failed transfer; new transfers of this server are refused until Wings is restarted")
-			}
-		}
-		middleware.CaptureAndAbort(c, err)
-		return
-	}
-
-	i.Server().SetTransferring(true)
-	if !manager.AddIfMissing(i.Server()) {
-		// The server was created on this node while the transfer was starting. Its
-		// files now belong to that server, so leave them alone.
-		i.Server().Discard()
-		c.AbortWithStatusJSON(http.StatusConflict, gin.H{
-			"error": "This server already exists on this node.",
+	if intoExisting {
+		trnsfr.Server = existing
+	} else {
+		i, err := installer.New(ctx, manager, installer.ServerDetails{
+			UUID:              id,
+			StartOnCompletion: false,
 		})
-		return
+		if err != nil {
+			trnsfr.Log().WithError(err).Error("failed to initialize transfer; no server instance created")
+			// Initializing the server can fail after its data directory and quota were
+			// created. Neither existed before (see above), so remove them again.
+			if _, statErr := os.Lstat(dataDir); !pooled && statErr == nil {
+				if !removeFailedTransferFiles(trnsfr.Log(), id, dataDir, false, nil, "") {
+					keepClaim = true
+					trnsfr.Log().Error("could not remove the files of a failed transfer; new transfers of this server are refused until Wings is restarted")
+				}
+			}
+			middleware.CaptureAndAbort(c, err)
+			return
+		}
+		i.Server().SetTransferring(true)
+		if !manager.AddIfMissing(i.Server()) {
+			// The server was created on this node while the transfer was starting. Its
+			// files now belong to that server, so leave them alone.
+			i.Server().Discard()
+			c.AbortWithStatusJSON(http.StatusConflict, gin.H{
+				"error": "This server already exists on this node.",
+			})
+			return
+		}
+		trnsfr.Server = i.Server()
 	}
 
 	// We add the transfer to the list of transfers once we have a server instance to use.
-	trnsfr.Server = i.Server()
 	transfer.Incoming().Add(trnsfr)
 
 	// Any errors past this point (until the transfer is complete) will abort
@@ -208,7 +241,20 @@ func postTransfers(c *gin.Context) {
 		// Remove the transfer from the list of incoming transfers.
 		transfer.Incoming().Remove(trnsfr)
 
-		if !successful {
+		if !successful && intoExisting {
+			trnsfr.Server.Events().Publish(server.TransferStatusEvent, "failure")
+			// The server was here before the transfer and its data directory was
+			// empty: keep the server, and remove what the transfer wrote. If any of
+			// it is left, the server stays transferring, so it cannot be started on
+			// a partial copy, and the claim refuses a retry until Wings is restarted.
+			removeReceivedBackups(trnsfr.Log(), id, receivedBackups)
+			if emptyDirectory(trnsfr.Log(), filepath.Join(config.Get().System.Data, id)) {
+				trnsfr.Server.SetTransferring(false)
+			} else {
+				keepClaim = true
+				trnsfr.Log().Error("could not remove the files of a failed transfer; the server stays locked until Wings is restarted")
+			}
+		} else if !successful {
 			trnsfr.Server.Events().Publish(server.TransferStatusEvent, "failure")
 			// Only this request's instance can have this ID, see the checks above.
 			manager.Remove(func(match *server.Server) bool {
@@ -621,15 +667,7 @@ func removeFailedTransferFiles(l *log.Entry, id, dataDir string, pooled bool, re
 		}
 	}
 
-	for _, p := range receivedBackups {
-		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
-			l.WithField("backup", filepath.Base(p)).WithError(err).Warn("failed to delete a backup received by a failed transfer")
-		}
-	}
-	// Only removed when empty, so backups this node already had are kept.
-	if cfg.System.BackupDirectory != "" {
-		_ = os.Remove(filepath.Join(cfg.System.BackupDirectory, id))
-	}
+	removeReceivedBackups(l, id, receivedBackups)
 
 	if installLogPath != "" {
 		if err := os.Remove(installLogPath); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -643,5 +681,60 @@ func removeFailedTransferFiles(l *log.Entry, id, dataDir string, pooled bool, re
 	}
 
 	l.WithField("pooled", pooled).Info("removed the partial copy of a failed incoming transfer")
+	return ok
+}
+
+// removeReceivedBackups deletes the backup files a failed incoming transfer of the
+// server with the given ID created, and its backup directory if that is now empty.
+// Backups this node already had are kept.
+func removeReceivedBackups(l *log.Entry, id string, receivedBackups []string) {
+	for _, p := range receivedBackups {
+		if err := os.Remove(p); err != nil && !errors.Is(err, os.ErrNotExist) {
+			l.WithField("backup", filepath.Base(p)).WithError(err).Warn("failed to delete a backup received by a failed transfer")
+		}
+	}
+	// Only removed when empty, so backups this node already had are kept.
+	if dir := config.Get().System.BackupDirectory; dir != "" {
+		_ = os.Remove(filepath.Join(dir, id))
+	}
+}
+
+// isEmptyDirectory reports whether dir is missing or has no entries.
+func isEmptyDirectory(dir string) (bool, error) {
+	f, err := os.Open(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return true, nil
+	} else if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	if _, err := f.Readdirnames(1); errors.Is(err, io.EOF) {
+		return true, nil
+	} else if err != nil {
+		return false, err
+	}
+	return false, nil
+}
+
+// removeAll is os.RemoveAll, replaceable in tests.
+var removeAll = os.RemoveAll
+
+// emptyDirectory removes everything inside dir and keeps dir itself, which a
+// server's open filesystem root refers to. It reports whether dir is empty.
+func emptyDirectory(l *log.Entry, dir string) bool {
+	entries, err := os.ReadDir(dir)
+	if errors.Is(err, os.ErrNotExist) {
+		return true
+	} else if err != nil {
+		l.WithError(err).Warn("failed to list the server files of a failed transfer")
+		return false
+	}
+	ok := true
+	for _, e := range entries {
+		if err := removeAll(filepath.Join(dir, e.Name())); err != nil {
+			l.WithField("file", e.Name()).WithError(err).Warn("failed to delete a server file of a failed transfer")
+			ok = false
+		}
+	}
 	return ok
 }
