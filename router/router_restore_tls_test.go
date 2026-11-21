@@ -30,8 +30,14 @@ func TestBackupRestoreHTTPClientUsesRestoreTLSConfig(t *testing.T) {
 	}
 	pool := x509.NewCertPool()
 	pool.AddCert(srv.Certificate())
-	if err := get(&tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}); err != nil {
+	// The callback may return the same configuration for every restore, so the
+	// client must not write to it (HTTP/2 setup adds to NextProtos).
+	shared := &tls.Config{RootCAs: pool, MinVersion: tls.VersionTLS12}
+	if err := get(shared); err != nil {
 		t.Fatalf("the supplied configuration must be used: %v", err)
+	}
+	if len(shared.NextProtos) != 0 {
+		t.Fatalf("the supplied configuration was modified: NextProtos = %v", shared.NextProtos)
 	}
 
 	setBackupRestoreAllowlist(t, nil)

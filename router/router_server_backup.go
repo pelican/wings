@@ -399,11 +399,13 @@ func restoreTLSConfig(c *gin.Context) *tls.Config {
 
 // backupRestoreHttpClient returns the client a restore downloads its archive
 // with. A non-nil tlsConfig, from the manager's WithRestoreTLSConfig, replaces
-// the TLS configuration of http.DefaultTransport.
+// the TLS configuration of http.DefaultTransport. The transport gets a copy,
+// since it writes to its configuration (HTTP/2 adds to NextProtos) and the
+// manager may return the same one for every restore.
 func backupRestoreHttpClient(allowPrivate bool, tlsConfig *tls.Config) http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	if tlsConfig != nil {
-		transport.TLSClientConfig = tlsConfig
+		transport.TLSClientConfig = tlsConfig.Clone()
 	}
 	transport.Proxy = nil
 	transport.ResponseHeaderTimeout = 30 * time.Second
