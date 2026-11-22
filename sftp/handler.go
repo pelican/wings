@@ -207,7 +207,13 @@ func (h *Handler) Filewrite(request *sftp.Request) (io.WriterAt, error) {
 	if slot == nil {
 		return nil, sftp.ErrSSHFxFailure
 	}
-	f, err := h.fs.Touch(request.Filepath, os.O_RDWR|os.O_CREATE|os.O_TRUNC, 0o644)
+	// Only truncate the file when the client asks for it, a client resuming an
+	// upload opens the existing file without SSH_FXF_TRUNC and writes the rest.
+	flags := os.O_RDWR | os.O_CREATE
+	if request.Pflags().Trunc {
+		flags |= os.O_TRUNC
+	}
+	f, err := h.fs.Touch(request.Filepath, flags, 0o644)
 	if err != nil {
 		slot.close()
 		l.WithField("flags", request.Flags).WithField("error", err).Error("failed to open existing file on system")
