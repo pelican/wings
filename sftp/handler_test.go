@@ -4,7 +4,10 @@ import (
 	"encoding/binary"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/apex/log"
 	pkgsftp "github.com/pkg/sftp"
@@ -200,5 +203,73 @@ func TestSetstatMode(t *testing.T) {
 				t.Fatalf("expected mode %04o, got %04o", tt.expected, mode)
 			}
 		})
+	}
+}
+
+func TestSetstatAppliesTimes(t *testing.T) {
+	config.Set(&config.Configuration{AuthenticationToken: "test-token"})
+	srv, err := server.New(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := t.TempDir()
+	fs, err := filesystem.New(root, 0, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	h := Handler{
+		server:      srv,
+		fs:          fs,
+		permissions: []string{PermissionFileUpdate},
+		logger:      log.WithField("test", t.Name()),
+	}
+	p := filepath.Join(root, "test.txt")
+	if err := os.WriteFile(p, []byte("test"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(p, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	atime := time.Date(2020, 1, 2, 3, 4, 5, 0, time.UTC)
+	mtime := time.Date(2021, 6, 7, 8, 9, 10, 0, time.UTC)
+	request := pkgsftp.NewRequest("Setstat", "/test.txt")
+	request.Flags = 8 // SSH_FILEXFER_ATTR_ACMODTIME
+	request.Attrs = make([]byte, 8)
+	binary.BigEndian.PutUint32(request.Attrs[0:], uint32(atime.Unix()))
+	binary.BigEndian.PutUint32(request.Attrs[4:], uint32(mtime.Unix()))
+
+	if err := h.Filecmd(request); !errors.Is(err, pkgsftp.ErrSSHFxOk) {
+		t.Fatalf("expected setstat to succeed, got %v", err)
+	}
+	st, err := os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.ModTime().Equal(mtime) {
+		t.Fatalf("expected mtime %v, got %v", mtime, st.ModTime())
+	}
+	if st.Mode().Perm() != 0o755 {
+		t.Fatalf("expected mode 0755 to be kept, got %04o", st.Mode().Perm())
+	}
+
+	request.Flags = 4 | 8 // SSH_FILEXFER_ATTR_PERMISSIONS | SSH_FILEXFER_ATTR_ACMODTIME
+	request.Attrs = make([]byte, 12)
+	binary.BigEndian.PutUint32(request.Attrs[0:], 0o600)
+	binary.BigEndian.PutUint32(request.Attrs[4:], uint32(atime.Unix()))
+	binary.BigEndian.PutUint32(request.Attrs[8:], uint32(atime.Unix()))
+
+	if err := h.Filecmd(request); !errors.Is(err, pkgsftp.ErrSSHFxOk) {
+		t.Fatalf("expected setstat to succeed, got %v", err)
+	}
+	st, err = os.Stat(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.ModTime().Equal(atime) {
+		t.Fatalf("expected mtime %v, got %v", atime, st.ModTime())
+	}
+	if st.Mode().Perm() != 0o600 {
+		t.Fatalf("expected mode 0600, got %04o", st.Mode().Perm())
 	}
 }
