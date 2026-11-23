@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"fmt"
 	"io"
 	"os"
@@ -34,6 +35,9 @@ type Manager struct {
 	// transfersIntoExisting lets an incoming transfer fill a server the manager
 	// already has, see WithTransfersIntoExistingServers.
 	transfersIntoExisting bool
+	// restoreTLSConfig returns the TLS configuration of a backup restore
+	// download, see WithRestoreTLSConfig.
+	restoreTLSConfig func() *tls.Config
 }
 
 // ManagerOption configures optional behaviour of a Manager.
@@ -68,6 +72,27 @@ func WithTransfersIntoExistingServers() ManagerOption {
 	return func(m *Manager) {
 		m.transfersIntoExisting = true
 	}
+}
+
+// WithRestoreTLSConfig sets the TLS configuration a backup restore uses to
+// download its archive, for embedders whose download links lead to hosts that
+// a private CA certifies. f is called for every restore, so a configuration
+// that follows a CA bundle on disk is current for each download. When not set,
+// or when f returns nil, the restore client keeps http.DefaultTransport's TLS
+// configuration. The restore client's address checks apply either way.
+func WithRestoreTLSConfig(f func() *tls.Config) ManagerOption {
+	return func(m *Manager) {
+		m.restoreTLSConfig = f
+	}
+}
+
+// RestoreTLSConfig returns the TLS configuration for the next backup restore
+// download, or nil for the default, see WithRestoreTLSConfig.
+func (m *Manager) RestoreTLSConfig() *tls.Config {
+	if m.restoreTLSConfig == nil {
+		return nil
+	}
+	return m.restoreTLSConfig()
 }
 
 // TransfersIntoExistingServers reports whether an incoming transfer may fill a
