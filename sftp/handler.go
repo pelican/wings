@@ -304,6 +304,11 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 			}
 		}
 		if flags.Acmodtime {
+			// Chown walks directories and reading them can bump their atime, so it
+			// runs before the times are applied instead of after the switch.
+			if err := h.fs.Chown(request.Filepath); err != nil {
+				l.WithField("error", err).Warn("error chowning file")
+			}
 			attrs := request.Attributes()
 			atime := time.Unix(int64(attrs.Atime), 0)
 			mtime := time.Unix(int64(attrs.Mtime), 0)
@@ -314,6 +319,7 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 				l.WithField("error", err).Error("failed to perform setstat on item")
 				return sftp.ErrSSHFxFailure
 			}
+			return sftp.ErrSSHFxOk
 		}
 		break
 	// Support renaming a file (aka Move).
