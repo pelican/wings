@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"emperror.dev/errors"
 	"github.com/apex/log"
@@ -296,12 +297,35 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		if err != nil {
 			return err
 		}
-		if err := h.fs.Chmod(request.Filepath, mode); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return sftp.ErrSSHFxNoSuchFile
+		// Only apply the attributes the client actually sent, so a request that
+		// just sets the times doesn't also reset the mode, and the other way around.
+		flags := request.AttrFlags()
+		if flags.Permissions {
+			if err := h.fs.Chmod(request.Filepath, mode); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return sftp.ErrSSHFxNoSuchFile
+				}
+				l.WithField("error", err).Error("failed to perform setstat on item")
+				return sftp.ErrSSHFxFailure
 			}
-			l.WithField("error", err).Error("failed to perform setstat on item")
-			return sftp.ErrSSHFxFailure
+		}
+		if flags.Acmodtime {
+			// Chown walks directories and reading them can bump their atime, so it
+			// runs before the times are applied instead of after the switch.
+			if err := h.fs.Chown(request.Filepath); err != nil {
+				l.WithField("error", err).Warn("error chowning file")
+			}
+			attrs := request.Attributes()
+			atime := time.Unix(int64(attrs.Atime), 0)
+			mtime := time.Unix(int64(attrs.Mtime), 0)
+			if err := h.fs.Chtimes(request.Filepath, atime, mtime); err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return sftp.ErrSSHFxNoSuchFile
+				}
+				l.WithField("error", err).Error("failed to perform setstat on item")
+				return sftp.ErrSSHFxFailure
+			}
+			return sftp.ErrSSHFxOk
 		}
 		break
 	// Support renaming a file (aka Move).
