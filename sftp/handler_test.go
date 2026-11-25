@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -13,6 +14,7 @@ import (
 	pkgsftp "github.com/pkg/sftp"
 
 	"github.com/pelican/wings/config"
+	"github.com/pelican/wings/internal/database"
 	"github.com/pelican/wings/server"
 	"github.com/pelican/wings/server/filesystem"
 )
@@ -201,6 +203,94 @@ func TestSetstatMode(t *testing.T) {
 			}
 			if uint32(mode) != tt.expected {
 				t.Fatalf("expected mode %04o, got %04o", tt.expected, mode)
+			}
+		})
+	}
+}
+
+var (
+	testDatabaseOnce sync.Once
+	testDatabaseErr  error
+)
+
+// initTestDatabase opens the activity database that file writes are logged to,
+// which can only be opened once per process.
+func initTestDatabase(t *testing.T) {
+	t.Helper()
+	testDatabaseOnce.Do(func() {
+		dir, err := os.MkdirTemp("", "wings-sftp-test")
+		if err != nil {
+			testDatabaseErr = err
+			return
+		}
+		cfg := config.Get()
+		cfg.System.RootDirectory = dir
+		config.Set(cfg)
+		testDatabaseErr = database.Initialize()
+	})
+	if testDatabaseErr != nil {
+		t.Fatal(testDatabaseErr)
+	}
+}
+
+func TestFilewriteOnlyTruncatesWhenRequested(t *testing.T) {
+	tests := []struct {
+		name     string
+		flags    uint32
+		expected string
+	}{
+		// A resumed upload opens the existing file without SSH_FXF_TRUNC.
+		{name: "resume", flags: 0x02, expected: "hello WORLD"},
+		{name: "truncate", flags: 0x02 | 0x08 | 0x10, expected: "\x00\x00\x00\x00\x00\x00WORLD"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &config.Configuration{AuthenticationToken: "test-token"}
+			cfg.System.User.Uid = os.Getuid()
+			cfg.System.User.Gid = os.Getgid()
+			config.Set(cfg)
+			initTestDatabase(t)
+
+			srv, err := server.New(nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			root := t.TempDir()
+			if err := os.WriteFile(filepath.Join(root, "test.txt"), []byte("hello world"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			fs, err := filesystem.New(root, 0, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			h := Handler{
+				server:      srv,
+				fs:          fs,
+				events:      &eventHandler{},
+				permissions: []string{PermissionFileUpdate},
+				logger:      log.WithField("test", t.Name()),
+			}
+			request := pkgsftp.NewRequest("Put", "/test.txt")
+			request.Flags = tt.flags
+
+			w, err := h.Filewrite(request)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := w.WriteAt([]byte("WORLD"), 6); err != nil {
+				t.Fatal(err)
+			}
+			if err := w.(io.Closer).Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			b, err := os.ReadFile(filepath.Join(root, "test.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(b) != tt.expected {
+				t.Fatalf("expected %q, got %q", tt.expected, b)
 			}
 		})
 	}
