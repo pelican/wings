@@ -1,6 +1,7 @@
 package filesystem
 
 import (
+	fs2 "io/fs"
 	"os"
 	"path"
 	"strings"
@@ -58,6 +59,52 @@ func (fs *Filesystem) IsIgnoredNoFollow(paths ...string) error {
 		}
 	}
 	return nil
+}
+
+// IsIgnoredTree is IsIgnoredNoFollow for renaming or moving from to to, where
+// from may be a directory. Moving a directory moves everything inside it, so
+// every entry under from is checked both where it is now and where it would
+// end up under to. Otherwise renaming "plugins" would move a denylisted
+// "plugins/secret.yml" out of its protected path, and renaming a directory
+// onto "plugins" would put a file at that path.
+//
+// Like IsIgnoredNoFollow, a symlink is moved rather than followed, so a link to
+// a directory is checked as a single entry.
+func (fs *Filesystem) IsIgnoredTree(from, to string) error {
+	if err := fs.IsIgnoredNoFollow(from, to); err != nil {
+		return err
+	}
+	if !fs.hasDenylist {
+		return nil
+	}
+	root, err := fs.openRoot()
+	if err != nil {
+		return err
+	}
+	from = normalize("/" + from)
+	to = normalize("/" + to)
+	if from == "." {
+		return nil
+	}
+	st, err := root.Lstat(from)
+	if err != nil || !st.IsDir() {
+		// A missing source fails in the rename itself, and anything other than
+		// a directory was checked above.
+		return nil
+	}
+	return fs2.WalkDir(rootDirFS{root}, from, func(p string, _ fs2.DirEntry, err error) error {
+		if err != nil {
+			if errors.Is(err, fs2.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if p == from {
+			return nil
+		}
+		rel := strings.TrimPrefix(p, from+"/")
+		return fs.IsIgnoredNoFollow(p, path.Join(to, rel))
+	})
 }
 
 // isIgnoredThroughLink returns an error if p, once its symlinks are resolved,
