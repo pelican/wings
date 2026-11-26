@@ -333,7 +333,13 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		if !h.can(PermissionFileUpdate) {
 			return sftp.ErrSSHFxPermissionDenied
 		}
-		if err := h.fs.Rename(request.Filepath, request.Target); err != nil {
+		// Moving a directory moves everything in it, so its contents must not
+		// be denylisted where they are now or where they would end up.
+		if err := h.fs.CheckedRename(request.Filepath, request.Target); err != nil {
+			if filesystem.IsErrorCode(err, filesystem.ErrCodeDenylistFile) {
+				l.WithField("error", err).Debug("refusing to rename a denylisted file")
+				return sftp.ErrSSHFxPermissionDenied
+			}
 			if errors.Is(err, os.ErrNotExist) {
 				return sftp.ErrSSHFxNoSuchFile
 			}
@@ -349,13 +355,7 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		if !h.can(PermissionFileDelete) {
 			return sftp.ErrSSHFxPermissionDenied
 		}
-		p := filepath.Clean(request.Filepath)
-		if err := h.fs.Delete(p); err != nil {
-			l.WithField("error", err).Error("failed to remove directory")
-			return sftp.ErrSSHFxFailure
-		}
-		h.events.MustLog(server.ActivitySftpDelete, FileAction{Entity: request.Filepath})
-		return sftp.ErrSSHFxOk
+		return h.removeTree(l, filepath.Clean(request.Filepath), "failed to remove directory")
 	// Handle requests to create a new Directory.
 	case "Mkdir":
 		if !h.can(PermissionFileCreate) {
@@ -385,15 +385,9 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		if !h.can(PermissionFileDelete) {
 			return sftp.ErrSSHFxPermissionDenied
 		}
-		if err := h.fs.Delete(request.Filepath); err != nil {
-			if errors.Is(err, os.ErrNotExist) {
-				return sftp.ErrSSHFxNoSuchFile
-			}
-			l.WithField("error", err).Error("failed to remove a file")
-			return sftp.ErrSSHFxFailure
-		}
-		h.events.MustLog(server.ActivitySftpDelete, FileAction{Entity: request.Filepath})
-		return sftp.ErrSSHFxOk
+		// A client can send REMOVE for a directory too, so this goes through the
+		// same denylist-aware delete as RMDIR.
+		return h.removeTree(l, request.Filepath, "failed to remove a file")
 	default:
 		return sftp.ErrSSHFxOpUnsupported
 	}
@@ -409,6 +403,27 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		l.WithField("error", err).Warn("error chowning file")
 	}
 
+	return sftp.ErrSSHFxOk
+}
+
+// removeTree deletes a file or directory for RMDIR and REMOVE. Denylisted files
+// and directories inside it are left in place, as the HTTP delete endpoint does,
+// rather than removed with the rest of the tree. If anything had to be left
+// behind the client is told the request was denied, so it does not report the
+// directory as gone.
+func (h *Handler) removeTree(l *log.Entry, p string, msg string) error {
+	if err := h.fs.SafeDeleteRecursively(p); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return sftp.ErrSSHFxNoSuchFile
+		}
+		l.WithField("error", err).Error(msg)
+		return sftp.ErrSSHFxFailure
+	}
+	h.events.MustLog(server.ActivitySftpDelete, FileAction{Entity: p})
+	if _, err := h.fs.Stat2(p); err == nil || !errors.Is(err, os.ErrNotExist) {
+		l.Debug("left denylisted files in place while deleting")
+		return sftp.ErrSSHFxPermissionDenied
+	}
 	return sftp.ErrSSHFxOk
 }
 

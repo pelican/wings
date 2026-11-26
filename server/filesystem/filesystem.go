@@ -39,6 +39,11 @@ type Filesystem struct {
 	// over it, so that two replacements cannot both credit the same file.
 	replaceMu sync.Mutex
 
+	// renameMu is held by CheckedRename from its denylist check until the
+	// rename is done, so that no other user rename can change a directory
+	// between it being checked and it being moved.
+	renameMu sync.Mutex
+
 	// quota tracks the disk space used by this Filesystem instance along with
 	// the maximum amount of disk space (in bytes) that it is allowed to use.
 	quota diskQuota
@@ -763,7 +768,9 @@ func (fs *Filesystem) Rename(from string, to string) error {
 
 	// If the target file or directory already exists the rename function will
 	// fail, so just bail out now. Lstat is used so that a dangling symlink at
-	// the destination is not silently replaced.
+	// the destination is not silently replaced. Where it is supported the
+	// rename itself also refuses to replace anything, since rename(2) would
+	// otherwise replace a file or empty directory created after this check.
 	if _, err := root.Lstat(to); err == nil {
 		return os.ErrExist
 	}
@@ -774,7 +781,7 @@ func (fs *Filesystem) Rename(from string, to string) error {
 		return errors.Wrap(err, "server/filesystem: failed to create directory tree")
 	}
 
-	return root.Rename(from, to)
+	return renameNoReplace(root, from, to)
 }
 
 // Begin looping up to 50 times to try and create a unique file name. This will take an input

@@ -149,12 +149,9 @@ func putServerRenameFiles(c *gin.Context) {
 				return ctx.Err()
 			default:
 				fs := s.Filesystem()
-				// Ignore renames on a file that is on the denylist (both as the rename from or
-				// the rename to value).
-				if err := fs.IsIgnoredNoFollow(pf, pt); err != nil {
-					return err
-				}
-				if err := fs.Rename(pf, pt); err != nil {
+				// Refuse renames on a file that is on the denylist (both as the rename from or
+				// the rename to value), including anything inside a directory being moved.
+				if err := fs.CheckedRename(pf, pt); err != nil {
 					// Return nil if the error is an is not exists.
 					// NOTE: os.IsNotExist() does not work if the error is wrapped.
 					if errors.Is(err, os.ErrNotExist) {
