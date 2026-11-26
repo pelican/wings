@@ -1,7 +1,8 @@
 package filesystem
 
 import (
-	"fmt"
+	"crypto/rand"
+	"encoding/hex"
 	fs2 "io/fs"
 	"os"
 	"path"
@@ -127,8 +128,9 @@ func (fs *Filesystem) checkTree(root *os.Root, dir, a, b string) error {
 // the tree at that moment.
 var afterRenameCheck, afterRenameMove func()
 
-// maxRestoreAttempts is how many "<name>.restored-N" names undoRename tries.
-const maxRestoreAttempts = 100
+// maxRestoreAttempts is how many "<name>.restored-<random>" names undoRename
+// tries before giving up.
+const maxRestoreAttempts = 8
 
 // CheckedRename renames from to to for a user request, enforcing the denylist
 // on both paths and on everything inside a directory being moved.
@@ -181,11 +183,14 @@ func (fs *Filesystem) CheckedRename(from, to string) error {
 
 // undoRename moves to back to from. If something has been put at from since
 // the rename, it is left alone and to is moved beside it as
-// "<from>.restored-N" instead, so that to is always cleared.
+// "<from>.restored-<random>" instead, so that to is always cleared. The suffix
+// is random so that the names cannot all be taken in advance.
 func (fs *Filesystem) undoRename(to, from string) error {
 	err := fs.Rename(to, from)
-	for i := 1; i <= maxRestoreAttempts && errors.Is(err, os.ErrExist); i++ {
-		err = fs.Rename(to, fmt.Sprintf("%s.restored-%d", from, i))
+	for i := 0; i < maxRestoreAttempts && errors.Is(err, os.ErrExist); i++ {
+		b := make([]byte, 8)
+		_, _ = rand.Read(b)
+		err = fs.Rename(to, from+".restored-"+hex.EncodeToString(b))
 	}
 	return err
 }

@@ -1,8 +1,11 @@
 package filesystem
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -187,7 +190,10 @@ func TestFilesystem_CheckedRenameUndoesWhenSourceRecreated(t *testing.T) {
 	if err := os.Mkdir(filepath.Join(fs.rootPath, "staging"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	fs.writeAll("staging.restored-1/taken", []byte("x"))
+	// Names a user could take in advance must not get in the way.
+	for i := 1; i <= 100; i++ {
+		fs.writeAll(fmt.Sprintf("staging.restored-%d/taken", i), []byte("x"))
+	}
 	afterRenameCheck = func() {
 		afterRenameCheck = nil
 		fs.writeAll("staging/secret.yml", []byte("planted"))
@@ -207,7 +213,48 @@ func TestFilesystem_CheckedRenameUndoesWhenSourceRecreated(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(fs.rootPath, "staging/new.txt")); err != nil {
 		t.Errorf("expected the recreated staging/ to be left alone, got %v", err)
 	}
-	if _, err := os.Stat(filepath.Join(fs.rootPath, "staging.restored-2/secret.yml")); err != nil {
-		t.Errorf("expected the moved tree at staging.restored-2, got %v", err)
+	matches, err := filepath.Glob(filepath.Join(fs.rootPath, "staging.restored-*", "secret.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(matches) != 1 {
+		t.Errorf("expected the moved tree in one staging.restored-* folder, found %v", matches)
+	}
+}
+
+// The rename itself must not replace a file or an empty directory that was
+// created after Rename checked that the destination was free.
+func TestFilesystem_RenameNoReplace(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("renameat2 is only used on Linux")
+	}
+	fs := NewFs()
+	defer fs.reset()
+
+	root, err := fs.openRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fs.writeAll("src/file.txt", []byte("x"))
+	fs.writeAll("taken.txt", []byte("keep"))
+	fs.writeAll("a.txt", []byte("a"))
+	if err := os.Mkdir(filepath.Join(fs.rootPath, "empty"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := renameNoReplace(root, "src", "empty"); !errors.Is(err, os.ErrExist) {
+		t.Errorf("expected renaming onto an empty directory to fail with ErrExist, got %v", err)
+	}
+	if err := renameNoReplace(root, "a.txt", "taken.txt"); !errors.Is(err, os.ErrExist) {
+		t.Errorf("expected renaming onto a file to fail with ErrExist, got %v", err)
+	}
+	if b, _ := os.ReadFile(filepath.Join(fs.rootPath, "taken.txt")); string(b) != "keep" {
+		t.Errorf("expected taken.txt to be left alone, got %q", b)
+	}
+	if _, err := os.Stat(filepath.Join(fs.rootPath, "src/file.txt")); err != nil {
+		t.Errorf("expected src/ to be left in place, got %v", err)
+	}
+	if err := renameNoReplace(root, "src", "sub/../moved"); err != nil {
+		t.Errorf("expected a plain rename to work, got %v", err)
 	}
 }
