@@ -1,12 +1,14 @@
 package filesystem
 
 import (
+	"fmt"
 	fs2 "io/fs"
 	"os"
 	"path"
 	"strings"
 
 	"emperror.dev/errors"
+	"github.com/apex/log"
 )
 
 // maxSymlinkHops is how many symlinks resolveInRoot follows before giving up,
@@ -120,9 +122,13 @@ func (fs *Filesystem) checkTree(root *os.Root, dir, a, b string) error {
 	})
 }
 
-// afterRenameCheck, when set by a test, runs between CheckedRename's denylist
-// check and its rename, to stand in for another request changing the tree.
-var afterRenameCheck func()
+// afterRenameCheck and afterRenameMove, when set by a test, run just before and
+// just after CheckedRename's rename, to stand in for another request changing
+// the tree at that moment.
+var afterRenameCheck, afterRenameMove func()
+
+// maxRestoreAttempts is how many "<name>.restored-N" names undoRename tries.
+const maxRestoreAttempts = 100
 
 // CheckedRename renames from to to for a user request, enforcing the denylist
 // on both paths and on everything inside a directory being moved.
@@ -145,6 +151,9 @@ func (fs *Filesystem) CheckedRename(from, to string) error {
 	if err := fs.Rename(from, to); err != nil {
 		return err
 	}
+	if afterRenameMove != nil {
+		afterRenameMove()
+	}
 	if !fs.hasDenylist {
 		return nil
 	}
@@ -162,10 +171,23 @@ func (fs *Filesystem) CheckedRename(from, to string) error {
 	if verr == nil {
 		return nil
 	}
-	if err := fs.Rename(to, from); err != nil {
+	if err := fs.undoRename(to, from); err != nil {
+		log.WithFields(log.Fields{"from": from, "to": to, "error": err}).
+			Error("server/filesystem: failed to undo a rename that moved a denylisted file")
 		return errors.Wrap(err, "server/filesystem: failed to undo a rename that moved a denylisted file")
 	}
 	return verr
+}
+
+// undoRename moves to back to from. If something has been put at from since
+// the rename, it is left alone and to is moved beside it as
+// "<from>.restored-N" instead, so that to is always cleared.
+func (fs *Filesystem) undoRename(to, from string) error {
+	err := fs.Rename(to, from)
+	for i := 1; i <= maxRestoreAttempts && errors.Is(err, os.ErrExist); i++ {
+		err = fs.Rename(to, fmt.Sprintf("%s.restored-%d", from, i))
+	}
+	return err
 }
 
 // isIgnoredThroughLink returns an error if p, once its symlinks are resolved,

@@ -143,7 +143,7 @@ func TestFilesystem_CheckedRenameIsSerialized(t *testing.T) {
 		go func() { done <- fs.CheckedRename("evil/secret.yml", "staging/secret.yml") }()
 		select {
 		case err := <-done:
-			t.Errorf("expected the second rename to wait, it returned %v", err)
+			t.Fatalf("expected the second rename to wait, it returned %v", err)
 		case <-time.After(100 * time.Millisecond):
 		}
 	}
@@ -174,5 +174,40 @@ func TestFilesystem_CheckedRenameMovesDirectory(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(fs.rootPath, "moved/file.txt")); err != nil {
 		t.Errorf("expected moved/file.txt, got %v", err)
+	}
+}
+
+// If the source is recreated while a rename that has to be undone is under
+// way, the moved tree is put beside it rather than left at the protected path.
+func TestFilesystem_CheckedRenameUndoesWhenSourceRecreated(t *testing.T) {
+	fs := NewFs()
+	defer fs.reset()
+
+	fs.setDenylist("/plugins/secret.yml")
+	if err := os.Mkdir(filepath.Join(fs.rootPath, "staging"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fs.writeAll("staging.restored-1/taken", []byte("x"))
+	afterRenameCheck = func() {
+		afterRenameCheck = nil
+		fs.writeAll("staging/secret.yml", []byte("planted"))
+	}
+	afterRenameMove = func() {
+		afterRenameMove = nil
+		fs.writeAll("staging/new.txt", []byte("recreated"))
+	}
+	defer func() { afterRenameCheck, afterRenameMove = nil, nil }()
+
+	if err := fs.CheckedRename("staging", "plugins"); !IsErrorCode(err, ErrCodeDenylistFile) {
+		t.Fatalf("expected a denylist error, got %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(fs.rootPath, "plugins")); !os.IsNotExist(err) {
+		t.Errorf("expected plugins/ not to exist, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(fs.rootPath, "staging/new.txt")); err != nil {
+		t.Errorf("expected the recreated staging/ to be left alone, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(fs.rootPath, "staging.restored-2/secret.yml")); err != nil {
+		t.Errorf("expected the moved tree at staging.restored-2, got %v", err)
 	}
 }
