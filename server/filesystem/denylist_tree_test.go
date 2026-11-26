@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 // Renaming a directory must not move a denylisted file out of its protected
@@ -95,4 +96,83 @@ func (tfs *testFs) writeAll(name string, data []byte) {
 		panic(err)
 	}
 	tfs.write(name, data)
+}
+
+// A file written into a directory after CheckedRename checked it, but before
+// the directory was moved, must not end up at a denylisted path.
+func TestFilesystem_CheckedRenameUndoesPlantedFile(t *testing.T) {
+	fs := NewFs()
+	defer fs.reset()
+
+	fs.setDenylist("/plugins/secret.yml")
+	if err := os.Mkdir(filepath.Join(fs.rootPath, "staging"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	afterRenameCheck = func() {
+		afterRenameCheck = nil
+		fs.writeAll("staging/secret.yml", []byte("planted"))
+	}
+	defer func() { afterRenameCheck = nil }()
+
+	if err := fs.CheckedRename("staging", "plugins"); !IsErrorCode(err, ErrCodeDenylistFile) {
+		t.Fatalf("expected a denylist error, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(fs.rootPath, "staging/secret.yml")); err != nil {
+		t.Errorf("expected the rename to be undone, got %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(fs.rootPath, "plugins")); !os.IsNotExist(err) {
+		t.Errorf("expected plugins/ not to exist, got %v", err)
+	}
+}
+
+// A rename that would fill a directory another rename has already checked
+// waits until that rename is done.
+func TestFilesystem_CheckedRenameIsSerialized(t *testing.T) {
+	fs := NewFs()
+	defer fs.reset()
+
+	fs.setDenylist("/plugins/secret.yml")
+	if err := os.Mkdir(filepath.Join(fs.rootPath, "staging"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fs.writeAll("evil/secret.yml", []byte("planted"))
+
+	done := make(chan error, 1)
+	afterRenameCheck = func() {
+		afterRenameCheck = nil
+		go func() { done <- fs.CheckedRename("evil/secret.yml", "staging/secret.yml") }()
+		select {
+		case err := <-done:
+			t.Errorf("expected the second rename to wait, it returned %v", err)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+	defer func() { afterRenameCheck = nil }()
+
+	if err := fs.CheckedRename("staging", "plugins"); err != nil {
+		t.Fatalf("expected renaming the empty staging/ to succeed, got %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("expected the second rename to succeed, got %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(fs.rootPath, "plugins/secret.yml")); !os.IsNotExist(err) {
+		t.Errorf("expected plugins/secret.yml not to exist, got %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(fs.rootPath, "staging/secret.yml")); err != nil {
+		t.Errorf("expected the file at staging/secret.yml, got %v", err)
+	}
+}
+
+func TestFilesystem_CheckedRenameMovesDirectory(t *testing.T) {
+	fs := NewFs()
+	defer fs.reset()
+
+	fs.setDenylist("/plugins/secret.yml")
+	fs.writeAll("other/file.txt", []byte("x"))
+	if err := fs.CheckedRename("other", "moved"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(fs.rootPath, "moved/file.txt")); err != nil {
+		t.Errorf("expected moved/file.txt, got %v", err)
+	}
 }

@@ -39,6 +39,11 @@ type Filesystem struct {
 	// over it, so that two replacements cannot both credit the same file.
 	replaceMu sync.Mutex
 
+	// renameMu is held by CheckedRename from its denylist check until the
+	// rename is done, so that no other user rename can change a directory
+	// between it being checked and it being moved.
+	renameMu sync.Mutex
+
 	// quota tracks the disk space used by this Filesystem instance along with
 	// the maximum amount of disk space (in bytes) that it is allowed to use.
 	quota diskQuota

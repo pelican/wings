@@ -86,25 +86,86 @@ func (fs *Filesystem) IsIgnoredTree(from, to string) error {
 	if from == "." {
 		return nil
 	}
-	st, err := root.Lstat(from)
-	if err != nil || !st.IsDir() {
-		// A missing source fails in the rename itself, and anything other than
-		// a directory was checked above.
+	return fs.checkTree(root, from, from, to)
+}
+
+// checkTree walks the directory dir and returns a denylist error if, for any
+// entry under it, the same relative path is denylisted under a or under b. It
+// does nothing if dir does not exist or is not a directory: a missing path
+// fails in the rename itself, and anything other than a directory was checked
+// as a single entry already.
+func (fs *Filesystem) checkTree(root *os.Root, dir, a, b string) error {
+	st, err := root.Lstat(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return errors.Wrap(err, "server/filesystem: failed to stat directory")
+	}
+	if !st.IsDir() {
 		return nil
 	}
-	return fs2.WalkDir(rootDirFS{root}, from, func(p string, _ fs2.DirEntry, err error) error {
+	return fs2.WalkDir(rootDirFS{root}, dir, func(p string, _ fs2.DirEntry, err error) error {
 		if err != nil {
 			if errors.Is(err, fs2.ErrNotExist) {
 				return nil
 			}
 			return err
 		}
-		if p == from {
+		if p == dir {
 			return nil
 		}
-		rel := strings.TrimPrefix(p, from+"/")
-		return fs.IsIgnoredNoFollow(p, path.Join(to, rel))
+		rel := strings.TrimPrefix(p, dir+"/")
+		return fs.IsIgnoredNoFollow(path.Join(a, rel), path.Join(b, rel))
 	})
+}
+
+// afterRenameCheck, when set by a test, runs between CheckedRename's denylist
+// check and its rename, to stand in for another request changing the tree.
+var afterRenameCheck func()
+
+// CheckedRename renames from to to for a user request, enforcing the denylist
+// on both paths and on everything inside a directory being moved.
+//
+// Renames made this way are serialized, so one rename cannot change a
+// directory another has checked but not yet moved. Other writes, such as an
+// upload into the directory, are not, so once the rename is done the moved
+// tree is checked again; if something denylisted turns up it is moved back
+// and a denylist error is returned.
+func (fs *Filesystem) CheckedRename(from, to string) error {
+	fs.renameMu.Lock()
+	defer fs.renameMu.Unlock()
+
+	if err := fs.IsIgnoredTree(from, to); err != nil {
+		return err
+	}
+	if afterRenameCheck != nil {
+		afterRenameCheck()
+	}
+	if err := fs.Rename(from, to); err != nil {
+		return err
+	}
+	if !fs.hasDenylist {
+		return nil
+	}
+
+	root, err := fs.openRoot()
+	if err != nil {
+		return err
+	}
+	from = normalize("/" + from)
+	to = normalize("/" + to)
+	if from == to {
+		return nil
+	}
+	verr := fs.checkTree(root, to, from, to)
+	if verr == nil {
+		return nil
+	}
+	if err := fs.Rename(to, from); err != nil {
+		return errors.Wrap(err, "server/filesystem: failed to undo a rename that moved a denylisted file")
+	}
+	return verr
 }
 
 // isIgnoredThroughLink returns an error if p, once its symlinks are resolved,

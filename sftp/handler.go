@@ -335,11 +335,11 @@ func (h *Handler) Filecmd(request *sftp.Request) error {
 		}
 		// Moving a directory moves everything in it, so its contents must not
 		// be denylisted where they are now or where they would end up.
-		if err := h.fs.IsIgnoredTree(request.Filepath, request.Target); err != nil {
-			l.WithField("error", err).Debug("refusing to rename a directory holding a denylisted file")
-			return sftp.ErrSSHFxPermissionDenied
-		}
-		if err := h.fs.Rename(request.Filepath, request.Target); err != nil {
+		if err := h.fs.CheckedRename(request.Filepath, request.Target); err != nil {
+			if filesystem.IsErrorCode(err, filesystem.ErrCodeDenylistFile) {
+				l.WithField("error", err).Debug("refusing to rename a denylisted file")
+				return sftp.ErrSSHFxPermissionDenied
+			}
 			if errors.Is(err, os.ErrNotExist) {
 				return sftp.ErrSSHFxNoSuchFile
 			}
